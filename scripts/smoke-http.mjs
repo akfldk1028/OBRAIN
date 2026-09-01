@@ -68,13 +68,13 @@ async function oauthToken(base, passphrase) {
 }
 
 /** Connect an MCP client carrying the given bearer token; return listed note paths. */
-async function listNotesAs(base, token) {
+async function callToolAs(base, token, name, args) {
   const transport = new StreamableHTTPClientTransport(new URL(`${base}/mcp`), {
     requestInit: { headers: { Authorization: `Bearer ${token}` } },
   });
   const client = new Client({ name: "smoke-user", version: "1.0.0" });
   await client.connect(transport);
-  const res = await client.callTool({ name: "list_notes", arguments: {} });
+  const res = await client.callTool({ name, arguments: args });
   await client.close();
   return (res.content ?? []).map((c) => c.text).join("\n");
 }
@@ -136,22 +136,31 @@ try {
 
   const tools = await client.listTools();
   console.log("tools:", tools.tools.map((t) => t.name).join(", "));
-  assert(tools.tools.length === 9, "all 9 tools registered (read + write)");
+  const toolNames = tools.tools.map((tool) => tool.name).sort();
+  assert(toolNames.join(",") === [
+    "create_inbox_note", "get_note_links", "list_notes",
+    "list_vaults", "read_note", "search_notes",
+  ].sort().join(","), "exactly the 6 safe knowledge tools are registered");
 
-  show("write_note", await client.callTool({
-    name: "write_note",
-    arguments: { path: "Inbox/hello.md", content: "# Hi\nfrom the http smoke test\n" },
-  }));
-  const read = await client.callTool({ name: "read_note", arguments: { path: "Inbox/hello.md" } });
+  const created = await client.callTool({
+    name: "create_inbox_note",
+    arguments: { vault: "default", title: "HTTP smoke", content: "from the http smoke test" },
+  });
+  show("create_inbox_note", created);
+  const createdPath = JSON.parse(created.content[0].text).path;
+  const read = await client.callTool({
+    name: "read_note",
+    arguments: { vault: "default", path: createdPath },
+  });
   show("read_note", read);
   assert(read.content[0].text.includes("http smoke test"), "read_note round-trips the write");
 
   show("search_notes", await client.callTool({ name: "search_notes", arguments: { query: "smoke" } }));
-  show("list_notes", await client.callTool({ name: "list_notes", arguments: {} }));
+  show("list_notes", await client.callTool({ name: "list_notes", arguments: { vault: "default" } }));
 
   const traversal = await client.callTool({
     name: "read_note",
-    arguments: { path: "../../../../etc/passwd" },
+    arguments: { vault: "default", path: "../../../../etc/passwd" },
   });
   show("read_note ../etc/passwd (should error)", traversal);
   assert(traversal.isError === true, "path traversal is rejected over HTTP");
@@ -338,44 +347,46 @@ try {
   await stop(serverB);
   serverB = undefined;
 
-  // ---- Part D: multi-user vault routing (the reported bug) --------------
-  console.log(`\n=== Part D: two users route to their own vaults on :${PORT_D} ===`);
+  // ---- Part D: one owner can access multiple vaults ----------------------
+  console.log(`\n=== Part D: one owner searches two vaults on :${PORT_D} ===`);
   vaultAlpha = await mkdtemp(path.join(tmpdir(), "vault-alpha-"));
   vaultBravo = await mkdtemp(path.join(tmpdir(), "vault-bravo-"));
   await writeFile(path.join(vaultAlpha, "alpha-only.md"), "# Alpha\n");
   await writeFile(path.join(vaultBravo, "bravo-only.md"), "# Bravo\n");
-  const usersFile = path.join(vault, "users.json");
+  const configFile = path.join(vault, "knowledge-config.json");
   await writeFile(
-    usersFile,
+    configFile,
     JSON.stringify({
-      users: [
-        { id: "alpha", passphrase: "pass-alpha", vault: vaultAlpha },
-        { id: "bravo", passphrase: "pass-bravo", vault: vaultBravo },
+      dataDir: path.join(vault, "knowledge-data"),
+      owner: {
+        id: "owner",
+        passphrase: "smoke-owner-passphrase",
+        allowedVaults: ["alpha", "bravo"],
+      },
+      vaults: [
+        { id: "alpha", root: vaultAlpha },
+        { id: "bravo", root: vaultBravo },
       ],
     }),
+    { mode: 0o600 },
   );
 
   serverD = await startServer(vault, PORT_D, {
     MCP_JWT_SECRET: "smoke-secret-smoke-secret-smoke-secret",
     MCP_PUBLIC_URL: `http://127.0.0.1:${PORT_D}`,
-    MCP_USERS_FILE: usersFile,
+    MCP_CONFIG_FILE: configFile,
     MCP_CLIENTS_FILE: path.join(vault, ".smoke-clients-d.json"),
   });
   const baseD = `http://127.0.0.1:${PORT_D}`;
 
-  const tokenAlpha = await oauthToken(baseD, "pass-alpha");
-  const tokenBravo = await oauthToken(baseD, "pass-bravo");
-  assert(tokenAlpha && tokenBravo && tokenAlpha !== tokenBravo, "each passphrase yields a distinct token");
-
-  const alphaSees = await listNotesAs(baseD, tokenAlpha);
-  console.log(`alpha sees: ${alphaSees}`);
-  assert(alphaSees.includes("alpha-only.md"), "alpha sees their own note");
-  assert(!alphaSees.includes("bravo-only.md"), "alpha does NOT see bravo's note");
-
-  const bravoSees = await listNotesAs(baseD, tokenBravo);
-  console.log(`bravo sees: ${bravoSees}`);
-  assert(bravoSees.includes("bravo-only.md"), "bravo sees their own note");
-  assert(!bravoSees.includes("alpha-only.md"), "bravo does NOT see alpha's note");
+  const ownerToken = await oauthToken(baseD, "smoke-owner-passphrase");
+  assert(!!ownerToken, "owner OAuth flow returns a token");
+  const alphaSees = await callToolAs(baseD, ownerToken, "list_notes", { vault: "alpha" });
+  const bravoSees = await callToolAs(baseD, ownerToken, "list_notes", { vault: "bravo" });
+  assert(alphaSees.includes("alpha-only.md"), "owner sees the alpha vault");
+  assert(bravoSees.includes("bravo-only.md"), "owner sees the bravo vault");
+  const crossVault = await callToolAs(baseD, ownerToken, "search_notes", { query: "Alpha" });
+  assert(crossVault.includes("alpha-only.md"), "cross-vault search returns an indexed note");
 
   await stop(serverD);
   serverD = undefined;

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import type { Server } from "node:http";
 import path from "node:path";
 import express, { type RequestHandler } from "express";
 import cors from "cors";
@@ -9,20 +10,25 @@ import {
   getOAuthProtectedResourceMetadataUrl,
 } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
-import type { VaultFS } from "./vault.js";
-import { createMcpServer } from "./server-factory.js";
+import type { KnowledgeBase } from "./knowledge-base.js";
+import { createKnowledgeMcpServer } from "./server-factory.js";
 import { LoginError, VaultOAuthProvider } from "./oauth-provider.js";
 
-/** One user of the HTTP server: a login passphrase mapped to their own vault. */
+/** One HTTP owner whose knowledge base can contain multiple vaults. */
 export interface HttpUser {
   id: string;
   passphrase: string;
-  vault: VaultFS;
+  knowledge: KnowledgeBase;
 }
 
 export interface HttpOptions {
   port: number;
   host: string;
+}
+
+export interface HttpRuntime {
+  server: Server;
+  close(): Promise<void>;
 }
 
 const jsonRpcError = (code: number, message: string) => ({
@@ -42,7 +48,7 @@ const jsonRpcError = (code: number, message: string) => ({
  * Auth is on by default. Set MCP_NO_AUTH=1 to disable it — for LOCAL testing
  * only; it serves the first user's vault to everyone with no login.
  */
-export async function startHttp(users: HttpUser[], opts: HttpOptions): Promise<void> {
+export async function startHttp(users: HttpUser[], opts: HttpOptions): Promise<HttpRuntime> {
   if (!users.length) throw new Error("startHttp requires at least one user");
 
   const authEnabled = process.env.MCP_NO_AUTH !== "1";
@@ -52,8 +58,8 @@ export async function startHttp(users: HttpUser[], opts: HttpOptions): Promise<v
   );
   const resourceUrl = `${publicUrl}/mcp`;
 
-  const vaults = new Map(users.map((u) => [u.id, u.vault]));
-  const defaultVault = users[0].vault; // used only when auth is disabled
+  const knowledgeByUser = new Map(users.map((user) => [user.id, user.knowledge]));
+  const defaultKnowledge = users[0].knowledge;
 
   const app = express();
   app.disable("x-powered-by");
@@ -71,6 +77,8 @@ export async function startHttp(users: HttpUser[], opts: HttpOptions): Promise<v
   });
 
   let bearer: RequestHandler | undefined;
+  const failedLogins = new Map<string, { count: number; resetAt: number }>();
+  const loginWindowMs = 15 * 60 * 1000;
 
   if (authEnabled) {
     const jwtSecret = process.env.MCP_JWT_SECRET;
@@ -101,13 +109,26 @@ export async function startHttp(users: HttpUser[], opts: HttpOptions): Promise<v
       const ticket = typeof req.query.ticket === "string" ? req.query.ticket : "";
       res.type("html").send(provider.renderLoginPage(ticket));
     });
-    app.post("/login", express.urlencoded({ extended: false }), (req, res) => {
+    app.post("/login", express.urlencoded({ extended: false, limit: "16kb" }), (req, res) => {
+      const key = req.ip ?? req.socket.remoteAddress ?? "unknown";
+      const now = Date.now();
+      const existing = failedLogins.get(key);
+      const attempt = existing && existing.resetAt > now
+        ? existing
+        : { count: 0, resetAt: now + loginWindowMs };
+      if (attempt.count >= 10) {
+        res.status(429).type("text").send("Too many failed sign-in attempts. Try again later.");
+        return;
+      }
       const ticket = String(req.body.ticket ?? "");
       const passphraseInput = String(req.body.passphrase ?? "");
       try {
         const { redirectTo } = provider.submitLogin(ticket, passphraseInput);
+        failedLogins.delete(key);
         res.redirect(302, redirectTo);
       } catch (e) {
+        attempt.count += 1;
+        failedLogins.set(key, attempt);
         const msg = e instanceof LoginError ? e.message : "Sign-in failed.";
         res.status(401).type("html").send(provider.renderLoginPage(ticket, msg));
       }
@@ -128,7 +149,7 @@ export async function startHttp(users: HttpUser[], opts: HttpOptions): Promise<v
   const userIdOf = (req: express.Request): string =>
     authEnabled ? String((req.auth?.extra?.userId as string | undefined) ?? "") : "default";
 
-  app.post("/mcp", ...guard, express.json(), async (req, res) => {
+  app.post("/mcp", ...guard, express.json({ limit: "1mb" }), async (req, res) => {
     const userId = userIdOf(req);
     const sid = req.headers["mcp-session-id"] as string | undefined;
     let transport = sid ? transports[sid] : undefined;
@@ -148,9 +169,9 @@ export async function startHttp(users: HttpUser[], opts: HttpOptions): Promise<v
         res.status(400).json(jsonRpcError(-32000, "No session id and not an initialize request"));
         return;
       }
-      const vault = authEnabled ? vaults.get(userId) : defaultVault;
-      if (!vault) {
-        res.status(403).json(jsonRpcError(-32000, `No vault configured for user "${userId}"`));
+      const knowledge = authEnabled ? knowledgeByUser.get(userId) : defaultKnowledge;
+      if (!knowledge) {
+        res.status(403).json(jsonRpcError(-32000, "No knowledge base configured for this user"));
         return;
       }
       const created = new StreamableHTTPServerTransport({
@@ -166,7 +187,7 @@ export async function startHttp(users: HttpUser[], opts: HttpOptions): Promise<v
           delete sessionUsers[created.sessionId];
         }
       };
-      const server = createMcpServer(vault);
+      const server = createKnowledgeMcpServer(knowledge);
       await server.connect(created);
       transport = created;
     }
@@ -192,14 +213,25 @@ export async function startHttp(users: HttpUser[], opts: HttpOptions): Promise<v
   app.get("/mcp", ...guard, streamOrDelete);
   app.delete("/mcp", ...guard, streamOrDelete);
 
-  await new Promise<void>((resolve) => {
-    app.listen(opts.port, opts.host, () => resolve());
+  const httpServer = await new Promise<Server>((resolve, reject) => {
+    const listening = app.listen(opts.port, opts.host, () => resolve(listening));
+    listening.once("error", reject);
   });
+  httpServer.requestTimeout = 0;
 
-  const vaultList = users.map((u) => `${u.id}→${u.vault.rootPath}${u.vault.readOnly ? " (ro)" : ""}`);
   console.error(
     `[obsidian-multivault-mcp] HTTP serving on http://${opts.host}:${opts.port}/mcp` +
-      ` (public ${resourceUrl}) — users: ${vaultList.join(", ")}` +
+      ` (public ${resourceUrl}) — owners: ${users.map((user) => user.id).join(", ")}` +
       (authEnabled ? "" : " — AUTH DISABLED"),
   );
+
+  return {
+    server: httpServer,
+    async close() {
+      await Promise.all(Object.values(transports).map(async (transport) => transport.close()));
+      await new Promise<void>((resolve, reject) => {
+        httpServer.close((error) => error ? reject(error) : resolve());
+      });
+    },
+  };
 }
