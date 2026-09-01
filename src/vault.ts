@@ -1,10 +1,24 @@
+import { randomBytes, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import matter from "gray-matter";
 
 /** Error type whose message is safe to surface to the MCP client. */
 export class VaultError extends Error {}
 
 const DEFAULT_EXT = [".md", ".markdown", ".canvas", ".txt"];
+const MAX_INBOX_BYTES = 1_048_576;
+
+export interface InboxNoteInput {
+  title: string;
+  content: string;
+  frontmatter?: Record<string, string | number | boolean | string[]>;
+}
+
+export interface CreatedInboxNote {
+  path: string;
+  content: string;
+}
 
 /**
  * Filesystem access to an Obsidian vault, confined to a single root directory.
@@ -135,6 +149,54 @@ export class VaultFS {
   }
 
   // ---- write operations -------------------------------------------------
+
+  async createInboxNote(input: InboxNoteInput): Promise<CreatedInboxNote> {
+    this.assertWritable();
+    const title = input.title.trim();
+    if (!title) throw new VaultError("Title is required");
+    if (Buffer.byteLength(input.content, "utf8") > MAX_INBOX_BYTES) {
+      throw new VaultError("Note is too large");
+    }
+
+    const inbox = path.join(this.root, "Agent-Inbox");
+    await fs.mkdir(inbox, { recursive: true, mode: 0o700 });
+    const realInbox = await fs.realpath(inbox);
+    this.assertInside(realInbox);
+
+    const slug = title
+      .normalize("NFKC")
+      .replace(/[^\p{L}\p{N}]+/gu, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 80) || "note";
+    const date = new Date().toISOString().slice(0, 10);
+    const filename = `${date}-${slug}-${randomBytes(4).toString("hex")}.md`;
+    const relativePath = path.posix.join("Agent-Inbox", filename);
+    const absolutePath = path.join(realInbox, filename);
+    this.assertInside(absolutePath);
+
+    const body = `# ${title}\n\n${input.content}`;
+    const rendered = input.frontmatter && Object.keys(input.frontmatter).length > 0
+      ? matter.stringify(body, input.frontmatter)
+      : body;
+    if (Buffer.byteLength(rendered, "utf8") > MAX_INBOX_BYTES) {
+      throw new VaultError("Note is too large");
+    }
+
+    const temporaryPath = path.join(realInbox, `.tmp-${randomUUID()}`);
+    await fs.writeFile(temporaryPath, rendered, { encoding: "utf8", flag: "wx", mode: 0o600 });
+    try {
+      await fs.link(temporaryPath, absolutePath);
+    } catch (error: any) {
+      if (error?.code === "EEXIST") {
+        throw new VaultError("Inbox note collision; retry the request");
+      }
+      throw error;
+    } finally {
+      await fs.rm(temporaryPath, { force: true });
+    }
+
+    return { path: relativePath, content: rendered };
+  }
 
   async writeNote(p: string, content: string): Promise<void> {
     this.assertWritable();
