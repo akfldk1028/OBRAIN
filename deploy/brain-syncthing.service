@@ -1,0 +1,31 @@
+[Unit]
+Description=Private Obsidian Vault Synchronization
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=brain
+Group=brain
+Environment=GOMEMLIMIT=192MiB
+Environment=GOMAXPROCS=1
+ExecStart=/usr/bin/syncthing serve --home=/srv/brain/syncthing --no-browser --no-default-folder --no-upgrade --gui-address=127.0.0.1:8384
+Restart=on-failure
+RestartSec=5
+UMask=0077
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/srv/brain
+MemoryMax=256M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

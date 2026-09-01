@@ -10,3 +10,8 @@ work/
 .env
 *.env
 oauth-clients.json
+
+# Local deployment material
+work/keys/
+work/release/
+oracle-deployment-target.json

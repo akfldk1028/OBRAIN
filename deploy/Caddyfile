@@ -1,0 +1,18 @@
+# install.sh replaces __PUBLIC_HOST__ after validating it as a hostname.
+__PUBLIC_HOST__ {
+    encode zstd gzip
+    request_body {
+        max_size 2MB
+    }
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "no-referrer"
+    }
+    reverse_proxy 127.0.0.1:8787 {
+        flush_interval -1
+        transport http {
+            read_timeout 0
+        }
+    }
+}

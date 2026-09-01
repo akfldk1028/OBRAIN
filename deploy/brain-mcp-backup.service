@@ -1,0 +1,6 @@
+[Unit]
+Description=Back up Obsidian Brain vaults
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/brain-mcp-backup

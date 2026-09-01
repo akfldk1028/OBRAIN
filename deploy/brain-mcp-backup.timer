@@ -1,0 +1,10 @@
+[Unit]
+Description=Nightly Obsidian Brain backup
+
+[Timer]
+OnCalendar=*-*-* 03:15:00 UTC
+Persistent=true
+RandomizedDelaySec=10m
+
+[Install]
+WantedBy=timers.target
