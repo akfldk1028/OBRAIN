@@ -1,2 +1,12 @@
+node_modules/
+dist/
+.npm-cache/
 .worktrees/
 work/
+*.log
+.DS_Store
+
+# Secrets and runtime state — never commit these
+.env
+*.env
+oauth-clients.json
