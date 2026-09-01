@@ -1,0 +1,13 @@
+{
+  "dataDir": "/srv/brain/data",
+  "owner": {
+    "id": "owner",
+    "passphrase": "example-only-not-a-production-secret",
+    "allowedVaults": ["personal", "work", "research"]
+  },
+  "vaults": [
+    { "id": "personal", "root": "/srv/brain/vaults/personal" },
+    { "id": "work", "root": "/srv/brain/vaults/work" },
+    { "id": "research", "root": "/srv/brain/vaults/research" }
+  ]
+}
