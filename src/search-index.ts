@@ -1,3 +1,4 @@
+import { existsSync, renameSync } from "node:fs";
 import Database from "better-sqlite3";
 import type { ParsedNote } from "./note-parser.js";
 
@@ -21,6 +22,22 @@ interface SearchRow {
 
 export class SearchIndex {
   private readonly db: Database.Database;
+
+  static openWithRecovery(file: string): SearchIndex {
+    try {
+      return new SearchIndex(file);
+    } catch (error) {
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      for (const suffix of ["", "-wal", "-shm"]) {
+        const source = `${file}${suffix}`;
+        if (existsSync(source)) {
+          renameSync(source, `${file}.corrupt-${stamp}${suffix}`);
+        }
+      }
+      console.error("quarantined corrupt search index", { file, error });
+      return new SearchIndex(file);
+    }
+  }
 
   constructor(file: string) {
     this.db = new Database(file);

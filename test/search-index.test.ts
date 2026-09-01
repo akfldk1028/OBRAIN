@@ -1,3 +1,4 @@
+import { readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { parseNote } from "../src/note-parser.js";
@@ -44,5 +45,19 @@ describe("SearchIndex", () => {
 
     expect(index.backlinks("personal", "B.md")).toEqual(["A.md"]);
     index.close();
+  });
+
+  it("quarantines an unreadable database and opens a fresh index", async () => {
+    const fx = await makeTempVaultSet(["personal"]);
+    cleanups.push(fx.cleanup);
+    const dbFile = path.join(fx.root, "index.sqlite");
+    await writeFile(dbFile, Buffer.from("not-a-sqlite-database"));
+
+    const index = SearchIndex.openWithRecovery(dbFile);
+    index.upsert(parseNote("personal", "ok.md", "# recovered", { mtimeMs: 1, size: 11 }));
+
+    expect(index.search("recovered", ["personal"], 10)).toHaveLength(1);
+    index.close();
+    expect((await readdir(fx.root)).some((name) => name.startsWith("index.sqlite.corrupt-"))).toBe(true);
   });
 });
