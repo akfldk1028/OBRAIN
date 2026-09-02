@@ -114,6 +114,7 @@ ufw allow 443/tcp
 ufw allow 22000/tcp
 ufw allow 22000/udp
 ufw --force enable
+bash "$RELEASE_DIR/deploy/configure-firewall.sh"
 
 systemctl daemon-reload
 systemctl enable --now brain-syncthing
