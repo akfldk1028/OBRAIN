@@ -23,23 +23,7 @@ done
 
 apt-get update
 apt-get install -y ca-certificates curl gnupg jq openssl build-essential python3 ripgrep ufw
-install -d -m 0755 /etc/apt/keyrings
-
-curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key |
-  gpg --batch --yes --dearmor -o /etc/apt/keyrings/nodesource.gpg
-printf '%s\n' 'deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main' \
-  >/etc/apt/sources.list.d/nodesource.list
-
-curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key |
-  gpg --batch --yes --dearmor -o /etc/apt/keyrings/caddy-stable-archive-keyring.gpg
-curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt \
-  >/etc/apt/sources.list.d/caddy-stable.list
-
-curl -fsSL -o /etc/apt/keyrings/syncthing-archive-keyring.gpg https://syncthing.net/release-key.gpg
-printf '%s\n' 'deb [signed-by=/etc/apt/keyrings/syncthing-archive-keyring.gpg] https://apt.syncthing.net/ syncthing stable-v2' \
-  >/etc/apt/sources.list.d/syncthing.list
-printf '%s\n' 'Package: *' 'Pin: origin apt.syncthing.net' 'Pin-Priority: 990' \
-  >/etc/apt/preferences.d/syncthing.pref
+bash "$RELEASE_DIR/deploy/configure-apt-repositories.sh"
 
 apt-get update
 apt-get install -y nodejs caddy syncthing
@@ -59,6 +43,8 @@ install -d -o root -g root -m 0755 /opt/brain-mcp
 cp -a "$RELEASE_DIR/." /opt/brain-mcp/
 cd /opt/brain-mcp
 npm ci --omit=dev
+chown -R root:brain /opt/brain-mcp
+chmod -R u=rwX,g=rX,o= /opt/brain-mcp
 
 if [[ ! -f /opt/brain-mcp/oauth-clients.json ]]; then
   install -o brain -g brain -m 0600 /dev/null /opt/brain-mcp/oauth-clients.json
@@ -67,9 +53,12 @@ else
   chmod 600 /opt/brain-mcp/oauth-clients.json
 fi
 
-install -d -o brain -g brain -m 0700 /srv/brain/data /srv/brain/backups /srv/brain/syncthing
+install -d -o brain -g brain -m 0700 /srv/brain/data /srv/brain/backups /srv/brain/syncthing /srv/brain/vaults
 for brain_vault_id in "${brain_vault_ids[@]}"; do
-  install -d -o brain -g brain -m 0700 "/srv/brain/vaults/$brain_vault_id/Agent-Inbox"
+  install -d -o brain -g brain -m 0700 \
+    "/srv/brain/vaults/$brain_vault_id" \
+    "/srv/brain/vaults/$brain_vault_id/Agent-Inbox" \
+    "/srv/brain/vaults/$brain_vault_id/.stfolder"
 done
 
 if [[ -f /etc/brain-mcp.env ]]; then

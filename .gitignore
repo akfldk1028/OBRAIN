@@ -1,6 +1,7 @@
 node_modules/
 dist/
 .npm-cache/
+.test-tmp/
 .worktrees/
 work/
 *.log

@@ -127,7 +127,7 @@ for brain_vault_id in "${brain_vault_ids[@]}"; do
     brain_api POST /rest/config/folders "$brain_folder_json" >/dev/null
   fi
 
-  jq -n '{lines: [
+  jq -n '{ignore: [
     "(?d).obsidian/workspace.json",
     "(?d).obsidian/workspace-mobile.json",
     "(?d).obsidian/cache",
@@ -135,7 +135,7 @@ for brain_vault_id in "${brain_vault_ids[@]}"; do
     "(?d).DS_Store",
     "(?d)Thumbs.db"
   ]}' >"$brain_tmp_dir/ignores.json"
-  brain_api PUT "/rest/db/ignores?folder=$brain_vault_id" "$brain_tmp_dir/ignores.json" >/dev/null
+  brain_api POST "/rest/db/ignores?folder=$brain_vault_id" "$brain_tmp_dir/ignores.json" >/dev/null
 done
 
 printf '%s\n' "$brain_device_id" >/root/brain-syncthing-device-id.txt

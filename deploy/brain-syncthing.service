@@ -9,7 +9,7 @@ User=brain
 Group=brain
 Environment=GOMEMLIMIT=192MiB
 Environment=GOMAXPROCS=1
-ExecStart=/usr/bin/syncthing serve --home=/srv/brain/syncthing --no-browser --no-default-folder --no-upgrade --gui-address=127.0.0.1:8384
+ExecStart=/usr/bin/syncthing serve --home=/srv/brain/syncthing --no-browser --no-upgrade --gui-address=127.0.0.1:8384
 Restart=on-failure
 RestartSec=5
 UMask=0077
