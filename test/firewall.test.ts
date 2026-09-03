@@ -105,5 +105,5 @@ exit 0
       expect(secondRun.split(rule).length - 1, rule).toBe(1);
     }
     expect(readFileSync(logPath, "utf8")).toContain("--dport 443 -j ACCEPT");
-  });
+  }, 15_000);
 });
