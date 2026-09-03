@@ -170,6 +170,27 @@ describe("Vault integrity auditor", () => {
     expect(report.findings.map((finding) => finding.code)).not.toContain("broken_link");
   });
 
+  it.each([
+    ["entries", { maxEntries: 1 }],
+    ["directories", { maxDirectories: 1 }],
+  ])("reports a root-level %s cap without deriving cross-file conclusions", async (category, limits) => {
+    const root = await createValidVault();
+    const report = await auditVaultIntegrity({ vault: "brain", root, policy: BRAIN_FOUNDATION_POLICY, limits });
+
+    expect(report.findings).toContainEqual(expect.objectContaining({ code: "audit_limit_exceeded", category, path: "." }));
+    expect(report.findings.map((finding) => finding.code)).not.toEqual(expect.arrayContaining(["missing_required_file", "orphan_note", "broken_link", "ambiguous_link", "canvas_missing_file"]));
+  });
+
+  it("accounts for an uppercase .MD file as Markdown in link and orphan analysis", async () => {
+    const root = await createValidVault();
+    await writeVaultFile(root, "20_Study/Upper.MD", "# upper\n");
+    await writeVaultFile(root, areaMocPath(BRAIN_FOUNDATION_POLICY.areas[3]!), `${renderAreaMoc(BRAIN_FOUNDATION_POLICY.areas[3]!)}\n- [[20_Study/Upper.MD]]\n`);
+
+    const report = await auditVaultIntegrity({ vault: "brain", root, policy: BRAIN_FOUNDATION_POLICY });
+
+    expect(report.findings).not.toContainEqual(expect.objectContaining({ path: "20_Study/Upper.MD", code: "orphan_note" }));
+  });
+
   it("matches the organizer's 240-byte exact and normalized component policy", async () => {
     const root = await createValidVault();
     await writeVaultFile(root, `20_Study/${"a".repeat(241)}.md`, "# too long\n");

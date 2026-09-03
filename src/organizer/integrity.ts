@@ -20,7 +20,7 @@ const INVALID = /[:<>"|?*\u0000-\u001f\u007f-\u009f]/u;
 const RESERVED = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/iu;
 const cmp = (a: string, b: string) => Buffer.compare(Buffer.from(a), Buffer.from(b));
 const key = (value: string) => value.normalize("NFKC").toLocaleLowerCase("en-US");
-const gone = (e: unknown) => ["ENOENT", "ENOTDIR", "ELOOP"].includes((e as NodeJS.ErrnoException).code ?? "");
+const gone = (e: unknown) => ["ENOENT", "ENOTDIR", "ELOOP", "ESTALE"].includes((e as NodeJS.ErrnoException).code ?? "");
 const denied = (e: unknown) => gone(e) || ["EACCES", "EPERM"].includes((e as NodeJS.ErrnoException).code ?? "");
 const outside = (parent: string, child: string) => { const r = path.relative(parent, child); return r === ".." || r.startsWith(`..${path.sep}`) || path.isAbsolute(r); };
 const inside = (parent: string, child: string) => child !== parent && !outside(parent, child);
@@ -82,21 +82,21 @@ function classification(relative: string, directory: boolean, policy: VaultFound
 function tooDeep(relative: string, directory: boolean, policy: VaultFoundationPolicy): boolean { return relative.split("/").length - (directory ? 0 : 1) > policy.maxDepth; }
 
 async function inventory(fs: IntegrityAuditFs, rootName: string, policy: VaultFoundationPolicy, cap: IntegrityAuditLimits, findings: Findings): Promise<{ files: BoundFile[]; complete: boolean }> {
-  const files: BoundFile[] = []; let complete = true; let directories = 0; let entriesSeen = 0; let bytes = 0n; let initial: BigIntStats;
+  const files: BoundFile[] = []; let complete = true; let directories = 1; let entriesSeen = 0; let bytes = 0n; let initial: BigIntStats;
   try { initial = await fs.lstat(rootName); } catch { findings.add("unreadable_file", "root", "."); return { files, complete: false }; }
   let root: BoundDirectory; try { root = await bindDir(fs, rootName, initial, "integrity root"); } catch { findings.add("unsafe_link", "root", "."); return { files, complete: false }; }
   const queue: Array<{ bound: BoundDirectory; parts: string[]; lineage: BoundDirectory[] }> = [{ bound: root, parts: [], lineage: [root] }];
   for (let cursor = 0; cursor < queue.length; cursor += 1) {
     const current = queue[cursor]!; try { await revalidate(fs, current.lineage); } catch { findings.add("changed_file", "ancestor", current.parts.join("/") || "."); complete = false; continue; }
-    let directoryHandle: IntegrityAuditDirectory;
+    let directoryHandle: IntegrityAuditDirectory | undefined;
     try {
       const parent = current.lineage.at(-2); const pre = await fs.lstat(current.bound.pathname); const bound = await bindDir(fs, current.bound.pathname, pre, current.bound.label, parent);
       if (bound.canonicalPath !== current.bound.canonicalPath || !sameDir(bound.snapshot, current.bound.snapshot)) throw new RaceError();
       directoryHandle = await fs.opendir(bound.canonicalPath);
+      try {
       const post = await fs.lstat(current.bound.pathname); const rebound = await bindDir(fs, current.bound.pathname, post, current.bound.label, parent);
       if (rebound.canonicalPath !== current.bound.canonicalPath || !sameDir(rebound.snapshot, current.bound.snapshot)) throw new RaceError();
-    } catch (error) { findings.add(denied(error) ? "unreadable_file" : "changed_file", "directory", current.parts.join("/") || "."); complete = false; continue; }
-    try { for await (const entry of directoryHandle) {
+      for await (const entry of directoryHandle) {
       if (entriesSeen === cap.maxEntries) { findings.add("audit_limit_exceeded", "entries", current.parts.join("/") || "."); complete = false; break; }
       entriesSeen += 1;
       const parts = [...current.parts, entry.name]; const relative = parts.join("/"); const pathname = path.join(current.bound.canonicalPath, entry.name); let stat: BigIntStats;
@@ -104,14 +104,16 @@ async function inventory(fs: IntegrityAuditFs, rootName: string, policy: VaultFo
       if (stat.isSymbolicLink()) { findings.add("unsafe_link", "symlink", relative); continue; }
       const directory = stat.isDirectory(); const invalid = classification(relative, directory, policy); if (invalid) { findings.add(...invalid, relative); if (directory) continue; }
       if (tooDeep(relative, directory, policy)) { findings.add("max_depth", "depth", relative); if (directory) continue; }
-      if (directory) { if (directories === cap.maxDirectories) { findings.add("audit_limit_exceeded", "directories", relative); complete = false; break; } directories += 1; try { const child = await bindDir(fs, pathname, stat, `integrity directory ${relative}`, current.bound); queue.push({ bound: child, parts, lineage: [...current.lineage, child] }); } catch { findings.add("unsafe_link", "directory", relative); complete = false; } continue; }
+      if (directory) { if (directories === cap.maxDirectories) { findings.add("audit_limit_exceeded", "directories", "."); complete = false; break; } directories += 1; try { const child = await bindDir(fs, pathname, stat, `integrity directory ${relative}`, current.bound); queue.push({ bound: child, parts, lineage: [...current.lineage, child] }); } catch { findings.add("unsafe_link", "directory", relative); complete = false; } continue; }
       if (!stat.isFile()) { findings.add("invalid_path", "unsupported_filesystem_type", relative); continue; }
       const pathBytes = BigInt(Buffer.byteLength(entry.name) + Buffer.byteLength(relative));
-      if (files.length === cap.maxFiles) { findings.add("audit_limit_exceeded", "files", relative); complete = false; break; }
-      if (bytes + pathBytes + stat.size > BigInt(cap.maxInventoryBytes)) { findings.add("audit_limit_exceeded", "inventory_bytes", relative); complete = false; break; }
+      if (files.length === cap.maxFiles) { findings.add("audit_limit_exceeded", "files", "."); complete = false; break; }
+      if (bytes + pathBytes + stat.size > BigInt(cap.maxInventoryBytes)) { findings.add("audit_limit_exceeded", "inventory_bytes", "."); complete = false; break; }
       try { const canonicalPath = await bindFile(fs, pathname, stat, current.bound); files.push({ pathname, canonicalPath, snapshot: stat, lineage: current.lineage, path: relative }); bytes += stat.size; if (/^000_[^/]+_Map\.canvas$/iu.test(entry.name) && !foundation(policy).canvases.has(relative)) findings.add("forbidden_artifact", "unapproved_managed_canvas", relative); } catch { findings.add("unsafe_link", "file", relative); complete = false; }
     } } finally { try { await directoryHandle.close(); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ERR_DIR_CLOSED") throw error; } }
+    } catch (error) { findings.add(denied(error) ? "unreadable_file" : "changed_file", "directory", current.parts.join("/") || "."); complete = false; continue; }
   }
+  files.sort((a, b) => cmp(a.path, b.path));
   return { files, complete };
 }
 async function read(fs: IntegrityAuditFs, file: BoundFile, max: number): Promise<Buffer> {
