@@ -133,3 +133,40 @@ Implemented Task 7 in `src/organizer/transaction.ts` with a crash-recoverable ap
 - TypeScript: `npm run typecheck` passed.
 - Diff hygiene: `git diff --check` passed; only line-ending notices were emitted on Windows.
 - All new filesystem tests use isolated temporary fixtures only; no live Vault path is touched.
+
+## Fix Round 3 — dual-operand publication binding
+
+### TDD evidence
+
+- RED: nine focused regressions expanded the transaction suite from 93 to 102 cases. The first run produced 8 intended failures, 91 passes, and 3 platform skips. The failures proved that a managed temp substitution could be published during apply, undo, apply rollback, and undo rollback; a source conflict could be accepted as an already-restored source; and MOC links could become stale at the final bound-read hook.
+- GREEN: the same focused suite completes with 99 passes, 3 platform skips, and no failures.
+
+### Managed temp and target binding
+
+- Every managed replacement now captures the engine-created deterministic temp's synchronized identity and canonical path before any callback. Publication then reopens and binds the temp with a no-follow handle, bounded read, handle stats before and after the read, expected SHA-256, exact mode on platforms with POSIX semantics, canonical parent lineage, pathname `lstat` before and after resolution, and canonical-target `lstat`.
+- After the last faultable hook, publication validates the bytes read from that bound temp, performs a second hook-free temp binding, performs a hook-free current-target binding, and immediately renames the temp over the target. A substituted temp is retained rather than treated as engine-owned cleanup material, and never overwrites a managed target.
+- Deterministic races cover substitutions after `managed_temp_synced` and during `after_bound_handle_read` across normal apply, undo, apply recovery rollback, and undo recovery rollback. Assertions verify that substituted bytes do not publish, sources are not removed, and database state is not committed.
+
+### Final MOC inventory
+
+- Managed MOC parsing and link validation now consume the bytes returned by the bound temp read, rather than the in-memory plan string. The expected hash additionally proves equality with the approved replacement.
+- The last faultable bound-read hook occurs before the fresh exact case/NFKC collision-checked MOC inventory. No injectable hook exists between that inventory, the final temp binding, the final target binding, and rename.
+- Tests delete, exact-spelling rename, and (on case-sensitive platforms) case-ambiguate a MOC target at the last bound-read hook. Apply rejects and rolls back without publishing a dangling MOC or committing the database.
+
+### Apply rollback source conflicts
+
+- An existing source during apply rollback is accepted as replayed only when its exact resolved pathname binds safely and its hash and byte size match the protected original snapshot. A human or otherwise different source fails the complete preflight before any Vault, manifest, report, or store mutation.
+- Existing recovery replay coverage still proves that a source already restored with the exact original bytes remains idempotent.
+
+### Round 3 verification
+
+- Focused: 99 passed, 3 Windows-specific skips, 0 failed (102 total).
+- Full: 29 files, 322 passed, 3 Windows-specific skips, 0 failed (325 total).
+- TypeScript: `npm run typecheck` passed.
+- Diff hygiene: `git diff --check` passed; only line-ending notices were emitted on Windows.
+- The expected stderr is limited to the existing corrupt-search-index quarantine and unauthenticated local HTTP fixture.
+- All filesystem tests use isolated temporary fixtures only; no live Vault path is touched.
+
+### Remaining portability boundary
+
+- Node still lacks a portable descriptor-relative two-path rename. The smallest remaining owner-controlled interval is the hook-free sequence of final temp pathname binding, final target pathname binding, and same-filesystem atomic rename. There is no unbounded asynchronous content read or user-injectable callback in that interval.

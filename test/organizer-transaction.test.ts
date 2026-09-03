@@ -1115,4 +1115,159 @@ describe("organizer transaction engine", () => {
     }).apply(plan)).rejects.toThrow(/ambiguous|collision|MOC/i);
     expect(await vaultState(input)).toEqual({ source: original, destination: undefined, moc: currentMoc, canvas: currentCanvas });
   });
+
+  it("does not publish a substituted managed temp after it was synced", async () => {
+    const input = await fixture();
+    const mocAbsolute = path.join(input.vault, ...mocPath.split("/"));
+    const temp = path.join(path.dirname(mocAbsolute), `.brain-organizer-${input.plan.id}-apply-managed-001.tmp`);
+    const moved = `${temp}.engine-created`;
+    await expect(engine(input, {
+      onEvent: async (event) => {
+        if (event.name !== "managed_temp_synced" || event.managedIndex !== 1) return;
+        await rename(temp, moved);
+        await writeFile(temp, "human substituted temp");
+      },
+    }).apply(input.plan)).rejects.toThrow(/temporary|identity|changed|publication|rollback/i);
+    expect(await readFile(mocAbsolute, "utf8")).toBe(currentMoc);
+    expect(await readFile(temp, "utf8")).toBe("human substituted temp");
+    expect(await readFile(moved, "utf8")).toBe(nextMoc);
+    expect((await vaultState(input)).source).toBe(original);
+    expect(input.store.getTransaction(input.plan.id)).toBeUndefined();
+  });
+
+  it("does not publish a managed temp substituted during its final bound read", async () => {
+    const input = await fixture();
+    const canvasAbsolute = path.join(input.vault, ...canvasPath.split("/"));
+    const temp = path.join(path.dirname(canvasAbsolute), `.brain-organizer-${input.plan.id}-apply-managed-000.tmp`);
+    const moved = `${temp}.engine-created`;
+    await expect(engine(input, {
+      onEvent: async (event) => {
+        if (event.name !== "after_bound_handle_read" || event.operation !== "apply_managed_rename" || event.managedIndex !== 0) return;
+        await rename(temp, moved);
+        await writeFile(temp, "human substituted temp");
+      },
+    }).apply(input.plan)).rejects.toThrow(/temporary|identity|changed|publication|rollback/i);
+    expect(await readFile(canvasAbsolute, "utf8")).toBe(currentCanvas);
+    expect((await vaultState(input)).source).toBe(original);
+    expect(input.store.getTransaction(input.plan.id)).toBeUndefined();
+  });
+
+  it("does not publish a substituted managed temp during undo", async () => {
+    const input = await fixture();
+    await engine(input).apply(input.plan);
+    const canvasAbsolute = path.join(input.vault, ...canvasPath.split("/"));
+    const temp = path.join(path.dirname(canvasAbsolute), `.brain-organizer-${input.plan.id}-undo-managed-000.tmp`);
+    await expect(engine(input, {
+      onEvent: async (event) => {
+        if (event.name !== "after_bound_handle_read" || event.operation !== "undo_managed_rename" || event.managedIndex !== 0) return;
+        await rename(temp, `${temp}.engine-created`);
+        await writeFile(temp, "human substituted undo temp");
+      },
+    }).undo(input.plan.id)).rejects.toThrow(/temporary|identity|changed|publication|rollback/i);
+    expect(await readFile(canvasAbsolute, "utf8")).toBe(nextCanvas);
+    expect(input.store.getTransaction(input.plan.id)?.undoneAt).toBeUndefined();
+  });
+
+  it("does not publish a substituted managed temp during apply recovery", async () => {
+    const input = await fixture();
+    await engine(input).apply(input.plan);
+    await resetToPreDatabaseCrash(input);
+    const canvasAbsolute = path.join(input.vault, ...canvasPath.split("/"));
+    const temp = path.join(path.dirname(canvasAbsolute), `.brain-organizer-${input.plan.id}-recover-managed-000.tmp`);
+    await expect(engine(input, {
+      onEvent: async (event) => {
+        if (event.name !== "after_bound_handle_read" || event.operation !== "recovery_managed_rename" || event.managedIndex !== 0) return;
+        await rename(temp, `${temp}.engine-created`);
+        await writeFile(temp, "human substituted recovery temp");
+      },
+    }).recover()).rejects.toThrow(/temporary|identity|changed|publication|recovery/i);
+    expect(await readFile(canvasAbsolute, "utf8")).toBe(nextCanvas);
+    expect((await vaultState(input)).source).toBe(original);
+    expect(input.store.getTransaction(input.plan.id)).toBeUndefined();
+  });
+
+  it("does not publish a substituted managed temp during undo rollback", async () => {
+    const input = await fixture();
+    await engine(input).apply(input.plan);
+    const canvasAbsolute = path.join(input.vault, ...canvasPath.split("/"));
+    const temp = path.join(path.dirname(canvasAbsolute), `.brain-organizer-${input.plan.id}-recover-undo-managed-000.tmp`);
+    let rollbackStarted = false;
+    await expect(engine(input, {
+      onEvent: async (event) => {
+        if (!rollbackStarted && event.name === "after_undo_managed_publish" && event.managedIndex === 0) {
+          rollbackStarted = true;
+          throw new Error("start undo rollback");
+        }
+        if (event.name !== "after_bound_handle_read" || event.operation !== "undo_recovery_managed_rename" || event.managedIndex !== 0) return;
+        await rename(temp, `${temp}.engine-created`);
+        await writeFile(temp, "human substituted undo recovery temp");
+      },
+    }).undo(input.plan.id)).rejects.toThrow(/rollback could not complete|start undo rollback/i);
+    expect(await readFile(canvasAbsolute, "utf8")).toBe(currentCanvas);
+    expect(await readFile(temp, "utf8")).toBe("human substituted undo recovery temp");
+    expect(input.store.getTransaction(input.plan.id)?.undoneAt).toBeUndefined();
+  });
+
+  it("fails apply recovery without mutation when an existing source is not the original", async () => {
+    const input = await fixture();
+    await engine(input).apply(input.plan);
+    await resetToPreDatabaseCrash(input);
+    const sourceAbsolute = path.join(input.vault, ...sourcePath.split("/"));
+    await writeFile(sourceAbsolute, "human source replacement");
+    const before = await vaultState(input);
+    const manifestPath = path.join(input.recovery, input.plan.id, "manifest.json");
+    const manifestBefore = await readFile(manifestPath, "utf8");
+    await expect(engine(input).recover()).rejects.toThrow(/source|conflict|original/i);
+    expect(await vaultState(input)).toEqual(before);
+    expect(await readFile(manifestPath, "utf8")).toBe(manifestBefore);
+    expect(input.store.getProposal(input.proposal.id)?.status).toBe("pending");
+    expect(input.store.getTransaction(input.plan.id)).toBeUndefined();
+  });
+
+  it.each(["delete", "rename"] as const)("rejects a generated MOC link target %sd at its last bound-read hook", async (kind) => {
+    const input = await fixture();
+    const referenced = "20_Study/reference.md";
+    const referencedAbsolute = path.join(input.vault, ...referenced.split("/"));
+    await writeFile(referencedAbsolute, "reference");
+    const moc = replaceManagedMocIndex(currentMoc, [
+      { path: destinationPath, title: "Organized" },
+      { path: referenced, title: "Reference" },
+    ]);
+    const plan = {
+      ...input.plan,
+      managedReplacements: input.plan.managedReplacements.map((item) => item.relativePath === mocPath ? { ...item, content: moc } : item),
+    };
+    await expect(engine(input, {
+      onEvent: async (event) => {
+        if (event.name !== "after_bound_handle_read" || event.operation !== "apply_managed_rename" || event.managedIndex !== 1) return;
+        if (kind === "delete") await rm(referencedAbsolute);
+        else await rename(referencedAbsolute, path.join(path.dirname(referencedAbsolute), "Reference.md"));
+      },
+    }).apply(plan)).rejects.toThrow(/MOC|link|exist|reference|spelling/i);
+    expect(await vaultState(input)).toEqual({ source: original, destination: undefined, moc: currentMoc, canvas: currentCanvas });
+    expect(input.store.getTransaction(input.plan.id)).toBeUndefined();
+  });
+
+  it.skipIf(process.platform === "win32")("rejects a generated MOC link made case-ambiguous at its last bound-read hook", async () => {
+    const input = await fixture();
+    const referenced = "20_Study/Case.md";
+    await writeFile(path.join(input.vault, ...referenced.split("/")), "reference");
+    const moc = replaceManagedMocIndex(currentMoc, [
+      { path: destinationPath, title: "Organized" },
+      { path: referenced, title: "Case" },
+    ]);
+    const plan = {
+      ...input.plan,
+      managedReplacements: input.plan.managedReplacements.map((item) => item.relativePath === mocPath ? { ...item, content: moc } : item),
+    };
+    await expect(engine(input, {
+      onEvent: async (event) => {
+        if (event.name === "after_bound_handle_read" && event.operation === "apply_managed_rename" && event.managedIndex === 1) {
+          await writeFile(path.join(input.vault, "20_Study", "case.md"), "ambiguous");
+        }
+      },
+    }).apply(plan)).rejects.toThrow(/ambiguous|collision|MOC/i);
+    expect(await vaultState(input)).toEqual({ source: original, destination: undefined, moc: currentMoc, canvas: currentCanvas });
+    expect(input.store.getTransaction(input.plan.id)).toBeUndefined();
+  });
 });

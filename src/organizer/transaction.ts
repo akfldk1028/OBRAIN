@@ -333,7 +333,7 @@ async function writeAtomic(
   input: {
     tempPath?: string;
     afterTempSync?: () => Promise<void>;
-    beforeRename?: () => Promise<void>;
+    beforeRename?: (temp: { stat: BigIntStats; canonicalPath: string }) => Promise<void>;
   } = {},
 ): Promise<void> {
   const directory = path.dirname(file);
@@ -342,8 +342,17 @@ async function writeAtomic(
   let tempStat: BigIntStats | undefined;
   try {
     tempStat = await writeSyncedExclusive(temp, content, mode);
+    assertPrivateMode(tempStat, mode, "atomic temporary file");
+    const tempBeforeCallbacks = await lstat(temp, { bigint: true });
+    const tempCanonical = await realpath(temp);
+    const canonicalTemp = await lstat(tempCanonical, { bigint: true });
+    if (
+      tempCanonical !== temp
+      || !exactFileSnapshot(tempStat, tempBeforeCallbacks)
+      || !exactFileSnapshot(tempStat, canonicalTemp)
+    ) throw new TransactionValidationError("atomic temporary file changed after sync");
     await input.afterTempSync?.();
-    await input.beforeRename?.();
+    await input.beforeRename?.({ stat: tempStat, canonicalPath: tempCanonical });
     await rename(temp, file);
     await chmod(file, mode);
     await syncDirectory(directory);
@@ -501,12 +510,21 @@ async function bindFile(root: BoundDirectory, relativePath: string, maxBytes = M
 async function revalidateFile(
   file: BoundFile,
   expectedHash: string,
-  input?: { options: OrganizerTransactionEngineOptions; operation: NonNullable<TransactionEvent["operation"]>; managedIndex?: number },
-): Promise<void> {
+  input?: {
+    options?: OrganizerTransactionEngineOptions;
+    operation?: NonNullable<TransactionEvent["operation"]>;
+    managedIndex?: number;
+    expectedMode?: number;
+  },
+): Promise<Buffer> {
   await revalidateDirectory(file.parent);
   await exactEntry(file.parent, path.basename(file.absolutePath), false);
   const before = await lstat(file.absolutePath, { bigint: true });
   if (!exactFileSnapshot(file.stat, before)) throw new TransactionValidationError("transaction file identity changed");
+  if (input?.expectedMode !== undefined) {
+    assertPrivateMode(file.stat, input.expectedMode, "transaction temporary file");
+    assertPrivateMode(before, input.expectedMode, "transaction temporary file");
+  }
   const handle = await open(file.absolutePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
   let content: Buffer;
   let opened: BigIntStats;
@@ -515,6 +533,7 @@ async function revalidateFile(
     if (!exactFileSnapshot(file.stat, opened) || opened.size > BigInt(MAX_ARTIFACT_BYTES)) {
       throw new TransactionValidationError("transaction file changed before bound read");
     }
+    if (input?.expectedMode !== undefined) assertPrivateMode(opened, input.expectedMode, "transaction temporary file");
     content = Buffer.alloc(Number(opened.size));
     let offset = 0;
     while (offset < content.length) {
@@ -526,7 +545,8 @@ async function revalidateFile(
     if (offset !== content.length || !exactFileSnapshot(opened, afterRead) || digest(content) !== expectedHash) {
       throw new TransactionValidationError("transaction file changed during bound read or hash validation");
     }
-    if (input) await emit(input.options, {
+    if (input?.expectedMode !== undefined) assertPrivateMode(afterRead, input.expectedMode, "transaction temporary file");
+    if (input?.options && input.operation) await emit(input.options, {
       name: "after_bound_handle_read",
       operation: input.operation,
       ...(input.managedIndex === undefined ? {} : { managedIndex: input.managedIndex }),
@@ -539,6 +559,11 @@ async function revalidateFile(
   const resolved = await realpath(file.absolutePath);
   const pathnameAfter = await lstat(file.absolutePath, { bigint: true });
   const canonicalStat = await lstat(resolved, { bigint: true });
+  if (input?.expectedMode !== undefined) {
+    assertPrivateMode(pathnameBefore, input.expectedMode, "transaction temporary file");
+    assertPrivateMode(pathnameAfter, input.expectedMode, "transaction temporary file");
+    assertPrivateMode(canonicalStat, input.expectedMode, "transaction temporary file");
+  }
   const expectedPath = path.join(file.parent.canonicalPath, path.basename(file.absolutePath));
   if (
     expectedPath !== file.absolutePath || resolved !== file.canonicalPath
@@ -549,6 +574,7 @@ async function revalidateFile(
     || !exactFileSnapshot(opened, pathnameAfter)
     || !exactFileSnapshot(opened, canonicalStat)
   ) throw new TransactionValidationError("transaction pathname changed identity or canonical target");
+  return content;
 }
 
 async function revalidateSource(
@@ -1041,17 +1067,38 @@ async function replaceBoundFile(
     afterTempSync?: () => Promise<void>;
     options?: OrganizerTransactionEngineOptions;
     operation?: NonNullable<TransactionEvent["operation"]>;
-    beforeRename?: () => Promise<void>;
+    beforeRename?: (tempContent: Buffer) => Promise<void>;
   },
 ): Promise<void> {
+  const tempPath = transactionTemp(file, input.id, input.role, input.index);
+  const expectedHash = digest(content);
   await writeAtomic(file.absolutePath, content, mode, {
-    tempPath: transactionTemp(file, input.id, input.role, input.index),
+    tempPath,
     afterTempSync: input.afterTempSync,
-    beforeRename: async () => {
-      await input.beforeRename?.();
-      await revalidateFile(file, file.hash, input.options && input.operation
-        ? { options: input.options, operation: input.operation, ...(input.index === undefined ? {} : { managedIndex: input.index }) }
-        : undefined);
+    beforeRename: async (createdTemp) => {
+      const temp: BoundFile = {
+        relativePath: path.basename(tempPath),
+        absolutePath: tempPath,
+        canonicalPath: createdTemp.canonicalPath,
+        parent: file.parent,
+        stat: createdTemp.stat,
+        content: Buffer.isBuffer(content) ? content : Buffer.from(content),
+        hash: expectedHash,
+        mode,
+      };
+      const tempContent = await revalidateFile(temp, expectedHash, {
+        expectedMode: mode,
+        ...(input.options && input.operation ? {
+          options: input.options,
+          operation: input.operation,
+          ...(input.index === undefined ? {} : { managedIndex: input.index }),
+        } : {}),
+      });
+      await input.beforeRename?.(tempContent);
+      // Node has no portable descriptor-relative rename. No hook is allowed after
+      // this point: rebind both pathnames, then make rename the next operation.
+      await revalidateFile(temp, expectedHash, { expectedMode: mode });
+      await revalidateFile(file, file.hash);
     },
   });
 }
@@ -1280,6 +1327,10 @@ async function preflightApplyRollback(
   const snapshots = await loadRecoverySnapshots(manifest, directory);
   const root = await bindRoot(manifest.vaultRoot);
   const source = await inspectBoundFile(root, manifest.sourcePath);
+  if (source.file && (
+    source.file.hash !== manifest.sourceHash
+    || source.file.content.length !== snapshots.source.length
+  )) throw new TransactionConflictError("recovery conflict at restored source");
   const sourceTemps = (await Promise.all([
     inspectOwnedTemporaryFile(source.parent, transactionTemp(source.parent, manifest.id, "recover-source"), new Set([manifest.sourceHash])),
   ])).filter((item): item is OwnedTemporaryFile => item !== undefined);
@@ -1639,11 +1690,11 @@ export class OrganizerTransactionEngine {
           afterTempSync: async () => emit(this.options, { name: "managed_temp_synced", managedIndex: index }),
           options: this.options,
           operation: "apply_managed_rename",
-          beforeRename: MOC_TARGETS.has(item.replacement.relativePath) ? async () => {
+          beforeRename: MOC_TARGETS.has(item.replacement.relativePath) ? async (tempContent) => {
             if (!manifest!.destinationOwned) throw new TransactionValidationError("managed MOC destination is not proven owned");
             await requirePublishedDestination(prepared!.root, stored.destinationPath, manifest!.destinationHash);
-            assertManagedContent(item.replacement.relativePath, item.replacement.content);
-            await validateMocLinks(prepared!.root, item.replacement.content, stored.destinationPath);
+            assertManagedContent(item.replacement.relativePath, tempContent);
+            await validateMocLinks(prepared!.root, tempContent, stored.destinationPath);
           } : undefined,
         });
         await emit(this.options, { name: "managed_published", managedIndex: index });
