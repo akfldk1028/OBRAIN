@@ -13,6 +13,7 @@ const MAX_RETRIES = 2;
 const FIXED_RETRY_DELAY_MS = 25;
 const MAX_RETRY_AFTER_SECONDS = 60;
 const MAX_OUTPUT_TOKENS = 2_048;
+const RESPONSE_CLEANUP_TIMEOUT_MS = 250;
 const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
 
 type OrganizerEnvironment = ReturnType<typeof loadOrganizerEnvironment>;
@@ -42,19 +43,7 @@ function retryDelay(response: Response, attempt: number): Promise<void> {
   });
 }
 
-function isAbortError(error: unknown, signal: AbortSignal): boolean {
-  return signal.aborted || (error instanceof DOMException && error.name === "AbortError");
-}
-
-async function cancelBody(body: ReadableStream<Uint8Array> | null): Promise<void> {
-  try {
-    await body?.cancel();
-  } catch {
-    // The body is already unusable; no content is surfaced from this cleanup path.
-  }
-}
-
-async function readChunk(reader: ReadableStreamDefaultReader<Uint8Array>, signal: AbortSignal): Promise<ReadableStreamReadResult<Uint8Array>> {
+async function awaitWithAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
   if (signal.aborted) throw new DOMException("aborted", "AbortError");
   let onAbort: (() => void) | undefined;
   const aborted = new Promise<never>((_resolve, reject) => {
@@ -62,10 +51,25 @@ async function readChunk(reader: ReadableStreamDefaultReader<Uint8Array>, signal
     signal.addEventListener("abort", onAbort, { once: true });
   });
   try {
-    return await Promise.race([reader.read(), aborted]);
+    return await Promise.race([promise, aborted]);
   } finally {
     if (onAbort) signal.removeEventListener("abort", onAbort);
   }
+}
+
+async function cancelBody(body: ReadableStream<Uint8Array> | null, requestSignal: AbortSignal): Promise<void> {
+  if (!body) return;
+  const cleanupSignal = AbortSignal.any([requestSignal, AbortSignal.timeout(RESPONSE_CLEANUP_TIMEOUT_MS)]);
+  try {
+    await awaitWithAbort(body.cancel(), cleanupSignal);
+  } catch {
+    if (cleanupSignal.aborted) throw new Error("Organizer provider request timed out");
+    // The body is already unusable; no content is surfaced from this cleanup path.
+  }
+}
+
+async function readChunk(reader: ReadableStreamDefaultReader<Uint8Array>, signal: AbortSignal): Promise<ReadableStreamReadResult<Uint8Array>> {
+  return awaitWithAbort(reader.read(), signal);
 }
 
 async function readResponseText(response: Response, signal: AbortSignal, maxBytes: number): Promise<string> {
@@ -86,7 +90,7 @@ async function readResponseText(response: Response, signal: AbortSignal, maxByte
       chunks.push(value);
     }
   } catch (error) {
-    if (isAbortError(error, signal)) {
+    if (signal.aborted) {
       void reader.cancel().catch(() => undefined);
       throw new Error("Organizer provider request timed out");
     }
@@ -156,15 +160,16 @@ export class DashScopeProvider implements OrganizerProvider {
           signal: timeoutSignal,
         });
       } catch (error) {
-        if (isAbortError(error, timeoutSignal)) {
+        if (timeoutSignal.aborted) {
           throw new Error("Organizer provider request timed out");
         }
         throw new Error("Organizer provider request failed");
       }
 
       if (!response.ok) {
-        if (RETRYABLE_STATUSES.has(response.status) && attempt < MAX_RETRIES) {
-          await cancelBody(response.body);
+        const retry = RETRYABLE_STATUSES.has(response.status) && attempt < MAX_RETRIES;
+        await cancelBody(response.body, timeoutSignal);
+        if (retry) {
           await retryDelay(response, attempt);
           continue;
         }

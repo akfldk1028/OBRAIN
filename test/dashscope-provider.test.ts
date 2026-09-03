@@ -150,23 +150,57 @@ describe("DashScopeProvider", () => {
   });
 
   it("uses exactly three attempts for retryable status exhaustion", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(errorResponse(500));
+    const cancel = vi.fn().mockResolvedValue(undefined);
+    const fetchMock = vi.fn().mockResolvedValue(errorResponse(500, cancel));
     vi.stubGlobal("fetch", fetchMock);
 
     await expect(new DashScopeProvider(environment).propose(context)).rejects.toThrow(
       "Organizer provider request failed with status 500",
     );
     expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(cancel).toHaveBeenCalledTimes(3);
   });
 
-  it("does not retry a non-retryable status", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(errorResponse(400));
+  it("cancels a non-retryable response body before returning its redacted status", async () => {
+    const cancel = vi.fn().mockResolvedValue(undefined);
+    const fetchMock = vi.fn().mockResolvedValue(errorResponse(400, cancel));
     vi.stubGlobal("fetch", fetchMock);
 
     await expect(new DashScopeProvider(environment).propose(context)).rejects.toThrow(
       "Organizer provider request failed with status 400",
     );
     expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns a timeout when terminal response cleanup exceeds its bounded deadline", async () => {
+    const requestController = new AbortController();
+    const cleanupController = new AbortController();
+    vi.spyOn(AbortSignal, "timeout")
+      .mockReturnValueOnce(requestController.signal)
+      .mockReturnValueOnce(cleanupController.signal);
+    let cancelStarted!: () => void;
+    const cancellationStarted = new Promise<void>((resolve) => { cancelStarted = resolve; });
+    const cancel = vi.fn(() => {
+      cancelStarted();
+      return new Promise<void>(() => undefined);
+    });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(errorResponse(400, cancel)));
+
+    const pending = new DashScopeProvider(environment).propose(context);
+    await cancellationStarted;
+    cleanupController.abort();
+
+    await expect(pending).rejects.toThrow("Organizer provider request timed out");
+  });
+
+  it("does not treat an unrelated AbortError as a provider timeout", async () => {
+    const fetchMock = vi.fn().mockRejectedValue(new DOMException("test-only-provider-key", "AbortError"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(new DashScopeProvider(environment).propose(context)).rejects.toThrow(
+      "Organizer provider request failed",
+    );
   });
 
   it.each([
