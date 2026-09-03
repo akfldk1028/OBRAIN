@@ -89,9 +89,9 @@ describe("OrganizerStore", () => {
     store.saveProposal(stored);
 
     expect(() => store.saveProposal(stored)).toThrow("proposal already exists");
-    expect(store.markProposal(stored.id, "applied")).toEqual({ ...stored, status: "applied" });
+    expect(() => store.markProposal(stored.id, "applied")).toThrow("transaction");
+    expect(store.markProposal(stored.id, "stale")).toEqual({ ...stored, status: "stale" });
     expect(() => store.markProposal(stored.id, "pending")).toThrow("invalid proposal transition");
-    expect(() => store.markProposal(stored.id, "rejected")).toThrow("invalid proposal transition");
     store.close();
   });
 
@@ -100,7 +100,11 @@ describe("OrganizerStore", () => {
     const stored = proposal();
     const applied = transaction(stored.id);
     store.saveProposal(stored);
-    store.recordTransaction(applied);
+    expect(store.applyProposalWithTransaction(applied)).toEqual({
+      proposal: { ...stored, status: "applied" },
+      transaction: applied,
+    });
+    expect(store.getProposal(stored.id)).toEqual({ ...stored, status: "applied" });
 
     expect(store.getTransaction(applied.id)).toEqual(applied);
     expect(store.markUndone(applied.id, "2026-09-03T02:00:00.000Z")).toEqual({
@@ -110,6 +114,103 @@ describe("OrganizerStore", () => {
     expect(() => store.markUndone(applied.id, "2026-09-03T03:00:00.000Z")).toThrow("transaction already undone");
     expect(() => store.recordTransaction({ ...applied, id: "ORG-20260903-002" })).toThrow("transaction already exists");
     store.close();
+  });
+
+  it("rolls back both proposal and transaction when atomic application cannot insert", async () => {
+    const store = new OrganizerStore(await databaseFile());
+    const first = proposal();
+    const second = proposal("PRP-20260903-002");
+    store.saveProposal(first);
+    store.saveProposal(second);
+    store.applyProposalWithTransaction(transaction(first.id));
+
+    expect(() => store.applyProposalWithTransaction({ ...transaction(second.id), id: "ORG-20260903-001" }))
+      .toThrow("transaction already exists");
+    expect(store.getProposal(second.id)).toEqual(second);
+    expect(store.getTransaction("ORG-20260903-001")?.proposalId).toBe(first.id);
+    store.close();
+  });
+
+  it("uses UTF-8 byte limits consistently for Korean proposal and transaction columns", async () => {
+    const store = new OrganizerStore(await databaseFile());
+    const maxVault = "가".repeat(85) + "a";
+    const maxPath = "가".repeat(341) + "/";
+    const maxPolicy = "가".repeat(42) + "aa";
+    const stored = proposal();
+    const bounded = {
+      ...stored,
+      vault: maxVault,
+      sourcePath: maxPath,
+      destinationPath: maxPath,
+      policyVersion: maxPolicy,
+    };
+    store.saveProposal(bounded);
+    expect(store.getProposal(bounded.id)).toEqual(bounded);
+    expect(() => store.saveProposal({ ...proposal("PRP-20260903-002"), vault: "가".repeat(86) })).toThrow();
+    expect(() => store.saveProposal({ ...proposal("PRP-20260903-003"), sourcePath: "가".repeat(342) })).toThrow();
+    expect(() => store.saveProposal({ ...proposal("PRP-20260903-004"), policyVersion: "가".repeat(43) })).toThrow();
+    expect(() => store.saveProposal({ ...proposal("PRP-20260903-005"), targetDirectory: "Ｆ".repeat(171) })).toThrow();
+    expect(() => store.applyProposalWithTransaction({ ...transaction(bounded.id), vault: "가".repeat(86) })).toThrow();
+    store.close();
+  });
+
+  it("enforces proposal, transaction, and undo time ordering", async () => {
+    const store = new OrganizerStore(await databaseFile());
+    expect(() => store.saveProposal({
+      ...proposal(),
+      createdAt: "2026-09-03T02:00:00.000Z",
+      expiresAt: "2026-09-03T01:00:00.000Z",
+    })).toThrow("invalid new proposal");
+    const stored = proposal();
+    store.saveProposal(stored);
+    expect(() => store.applyProposalWithTransaction({ ...transaction(stored.id), appliedAt: "2026-09-02T23:59:59.999Z" }))
+      .toThrow("transaction does not match proposal");
+    store.applyProposalWithTransaction(transaction(stored.id));
+    expect(() => store.markUndone("ORG-20260903-001", "2026-09-03T00:59:59.999Z"))
+      .toThrow("undo is before transaction application");
+    store.close();
+  });
+
+  it("fails closed when a persisted undo predates its application", async () => {
+    const file = await databaseFile();
+    const store = new OrganizerStore(file);
+    const stored = proposal();
+    store.saveProposal(stored);
+    store.applyProposalWithTransaction(transaction(stored.id));
+    store.close();
+    const db = new Database(file);
+    db.prepare("UPDATE organizer_transactions SET undone_at=? WHERE id=?")
+      .run("2026-09-03T00:59:59.999Z", "ORG-20260903-001");
+    db.close();
+    const reopened = new OrganizerStore(file);
+    expect(() => reopened.getTransaction("ORG-20260903-001")).toThrow("invalid stored transaction");
+    reopened.close();
+  });
+
+  it("rejects run completion with a mismatched mode or a time before its start", async () => {
+    const store = new OrganizerStore(await databaseFile());
+    const run = store.startRun({ vault: "brain", mode: "dry-run", startedAt: "2026-09-03T01:00:00.000Z" });
+    expect(() => store.finishRun(run.runId, { ...run, mode: "automatic", status: "complete" }, "2026-09-03T02:00:00.000Z"))
+      .toThrow("run mode");
+    expect(() => store.finishRun(run.runId, { ...run, status: "complete" }, "2026-09-03T00:59:59.999Z"))
+      .toThrow("before run start");
+    expect(store.getRun(run.runId)).toEqual(run);
+    store.close();
+  });
+
+  it("fails closed for corrupted run completion invariants", async () => {
+    const file = await databaseFile();
+    const store = new OrganizerStore(file);
+    const run = store.startRun({ vault: "brain", mode: "dry-run", startedAt: "2026-09-03T00:00:00.000Z" });
+    store.close();
+    const db = new Database(file);
+    db.prepare("UPDATE organizer_runs SET summary_json=?, finished_at=NULL WHERE id=?").run(
+      JSON.stringify({ ...run, status: "complete" }), run.runId,
+    );
+    db.close();
+    const reopened = new OrganizerStore(file);
+    expect(() => reopened.getRun(run.runId)).toThrow("invalid stored run");
+    reopened.close();
   });
 
   it("starts the seven-day trial once and returns a stable state after reopen", async () => {
@@ -128,7 +229,35 @@ describe("OrganizerStore", () => {
       expiresAt: "2026-09-10T00:00:00.000Z",
       active: false,
     });
+    expect(reopened.getOrStartTrial("2026-09-09T00:00:00.000Z").active).toBe(false);
     reopened.close();
+  });
+
+  it("rejects an incompatible partial organizer schema at open", async () => {
+    const file = await databaseFile();
+    const db = new Database(file);
+    db.exec("CREATE TABLE organizer_meta (key TEXT PRIMARY KEY)");
+    db.close();
+    expect(() => new OrganizerStore(file)).toThrow("incompatible organizer schema");
+  });
+
+  it("fails before persisting a non-representable trial expiry", async () => {
+    const store = new OrganizerStore(await databaseFile());
+    expect(() => store.getOrStartTrial("9999-12-31T23:59:59.999Z")).toThrow("invalid stored trial");
+    store.close();
+  });
+
+  it("rejects a same-named organizer table with an incompatible column layout", async () => {
+    const file = await databaseFile();
+    const db = new Database(file);
+    db.exec(`
+      CREATE TABLE organizer_meta (key INTEGER PRIMARY KEY, value TEXT NOT NULL);
+      CREATE TABLE organizer_runs (id TEXT PRIMARY KEY, vault TEXT NOT NULL, mode TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT, summary_json TEXT);
+      CREATE TABLE organizer_proposals (id TEXT PRIMARY KEY, vault TEXT NOT NULL, source_path TEXT NOT NULL, source_hash TEXT NOT NULL, destination_path TEXT NOT NULL, policy_version TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL, status TEXT NOT NULL, proposal_json TEXT NOT NULL);
+      CREATE TABLE organizer_transactions (id TEXT PRIMARY KEY, proposal_id TEXT NOT NULL UNIQUE, vault TEXT NOT NULL, source_path TEXT NOT NULL, destination_path TEXT NOT NULL, source_hash TEXT NOT NULL, destination_hash TEXT NOT NULL, applied_at TEXT NOT NULL, undone_at TEXT);
+    `);
+    db.close();
+    expect(() => new OrganizerStore(file)).toThrow("incompatible organizer schema");
   });
 
   it("fails closed when persisted proposal JSON does not satisfy the bounded schema", async () => {
