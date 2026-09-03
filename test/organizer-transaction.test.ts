@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
-import { chmod, lstat, mkdir, mkdtemp, readFile, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, link, lstat, mkdir, mkdtemp, readFile, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -856,5 +856,263 @@ describe("organizer transaction engine", () => {
     expect(await engine(input).cleanupRecovery({ now: "2026-10-04T01:00:00.000Z", backupVerified: true }))
       .toEqual([input.plan.id]);
     await expect(lstat(directory)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.each(["／", "＼"])("rejects a path component whose NFKC form introduces a separator: %s", async (separator) => {
+    const input = await fixture();
+    await replaceProposalSource(input, `Agent-Inbox/bad${separator}name.md`);
+    const before = await vaultState(input);
+    await expect(engine(input).apply(input.plan)).rejects.toThrow(/path|unsafe|separator/i);
+    expect(await vaultState(input)).toEqual(before);
+  });
+
+  it("promotes and recovers a valid synced initial manifest temp", async () => {
+    const input = await fixture();
+    await engine(input).apply(input.plan);
+    const directory = path.join(input.recovery, input.plan.id);
+    const manifestPath = path.join(directory, "manifest.json");
+    const tempPath = path.join(directory, `.brain-organizer-${input.plan.id}-manifest.json.tmp`);
+    await rename(manifestPath, tempPath);
+    await expect(engine(input).recover()).resolves.toEqual([expect.objectContaining({ outcome: "committed" })]);
+    expect(JSON.parse(await readFile(manifestPath, "utf8"))).toEqual(expect.objectContaining({ state: "committed" }));
+    await expect(lstat(tempPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.each(["corrupt", "oversized", "wrong-id"] as const)("fails closed for a %s initial manifest temp", async (kind) => {
+    const input = await fixture();
+    await engine(input).apply(input.plan);
+    const directory = path.join(input.recovery, input.plan.id);
+    const manifestPath = path.join(directory, "manifest.json");
+    const tempPath = path.join(directory, `.brain-organizer-${input.plan.id}-manifest.json.tmp`);
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    await rename(manifestPath, tempPath);
+    if (kind === "corrupt") await writeFile(tempPath, "{not-json");
+    if (kind === "oversized") await writeFile(tempPath, "x".repeat(70_000));
+    if (kind === "wrong-id") await writeFile(tempPath, JSON.stringify({ ...manifest, id: "ORG-wrong" }));
+    const before = await vaultState(input);
+    await expect(engine(input).recover()).rejects.toThrow(/manifest|oversized|schema|invalid/i);
+    expect(await vaultState(input)).toEqual(before);
+  });
+
+  it("fails closed on an unknown artifact beside an initial manifest temp", async () => {
+    const input = await fixture();
+    await engine(input).apply(input.plan);
+    const directory = path.join(input.recovery, input.plan.id);
+    await rename(path.join(directory, "manifest.json"), path.join(directory, `.brain-organizer-${input.plan.id}-manifest.json.tmp`));
+    await writeFile(path.join(directory, "unknown.secret"), "do not delete");
+    const before = await vaultState(input);
+    await expect(engine(input).recover()).rejects.toThrow(/unknown|unverified|artifact/i);
+    expect(await vaultState(input)).toEqual(before);
+    expect(await readFile(path.join(directory, "unknown.secret"), "utf8")).toBe("do not delete");
+  });
+
+  it("fails closed on a transaction-shaped symlink entry in the recovery root", async () => {
+    const input = await fixture();
+    await engine(input).apply(input.plan);
+    const outside = path.join(input.root, "recovery-entry-outside");
+    await mkdir(outside);
+    await symlink(outside, path.join(input.recovery, "ORG-other-entry"), process.platform === "win32" ? "junction" : "dir");
+    const before = await vaultState(input);
+    await expect(engine(input).recover()).rejects.toThrow(/symlink|unsafe|directory/i);
+    expect(await vaultState(input)).toEqual(before);
+  });
+
+  it("rejects a same-outcome terminal report whose timestamp predates the manifest", async () => {
+    const input = await fixture();
+    await engine(input).apply(input.plan);
+    await engine(input).recover();
+    const reportPath = path.join(input.recovery, input.plan.id, "recovery-report.json");
+    const report = JSON.parse(await readFile(reportPath, "utf8"));
+    await writeFile(reportPath, JSON.stringify({ ...report, at: "2026-09-03T00:30:00.000Z" }));
+    const before = await vaultState(input);
+    await expect(engine(input).recover()).rejects.toThrow(/timestamp|report|manifest/i);
+    expect(await vaultState(input)).toEqual(before);
+  });
+
+  it.each([
+    ["apply_managed_rename", canvasPath],
+    ["apply_source_unlink", sourcePath],
+  ] as const)("does not overwrite or delete a human pathname substitution at %s", async (operation, relativePath) => {
+    const input = await fixture();
+    const absolute = path.join(input.vault, ...relativePath.split("/"));
+    const moved = `${absolute}.pre-race`;
+    await expect(engine(input, {
+      onEvent: async (event) => {
+        if ((event as TransactionEvent & { operation?: string }).operation !== operation) return;
+        await rename(absolute, moved);
+        await writeFile(absolute, "human replacement");
+      },
+    }).apply(input.plan)).rejects.toThrow(/identity|changed|stale|rollback/i);
+    expect(await readFile(absolute, "utf8")).toBe("human replacement");
+    expect(await readFile(moved, "utf8")).toBe(relativePath === sourcePath ? original : currentCanvas);
+  });
+
+  it("does not delete a human destination substitution during undo", async () => {
+    const input = await fixture();
+    await engine(input).apply(input.plan);
+    const absolute = path.join(input.vault, ...destinationPath.split("/"));
+    const moved = `${absolute}.pre-race`;
+    await expect(engine(input, {
+      onEvent: async (event) => {
+        if ((event as TransactionEvent & { operation?: string }).operation !== "undo_destination_unlink") return;
+        await rename(absolute, moved);
+        await writeFile(absolute, "human destination");
+      },
+    }).undo(input.plan.id)).rejects.toThrow(/identity|changed|rollback|conflict/i);
+    expect(await readFile(absolute, "utf8")).toBe("human destination");
+    expect(await readFile(moved, "utf8")).toBe(organized);
+  });
+
+  it.each([
+    ["recovery_managed_rename", canvasPath, "managed"],
+    ["recovery_destination_unlink", destinationPath, "destination"],
+    ["undo_recovery_managed_rename", canvasPath, "undo"],
+  ] as const)("does not overwrite or delete a human pathname substitution at %s", async (operation, relativePath, phase) => {
+    const input = await fixture();
+    await engine(input).apply(input.plan);
+    const absolute = path.join(input.vault, ...relativePath.split("/"));
+    const moved = `${absolute}.pre-race`;
+    let triggered = false;
+    if (phase === "undo") {
+      await expect(engine(input, {
+        onEvent: async (event) => {
+          if (!triggered && event.name === "after_undo_managed_publish" && event.managedIndex === 0) {
+            triggered = true;
+            throw new Error("start undo rollback");
+          }
+          if (
+            (event as TransactionEvent & { operation?: string }).operation === operation
+            && (!operation.includes("managed") || event.managedIndex === 0)
+          ) {
+            await rename(absolute, moved);
+            await writeFile(absolute, "human rollback replacement");
+          }
+        },
+      }).undo(input.plan.id)).rejects.toThrow(/rollback could not complete/i);
+    } else {
+      await resetToPreDatabaseCrash(input);
+      await expect(engine(input, {
+        onEvent: async (event) => {
+          if (
+            (event as TransactionEvent & { operation?: string }).operation !== operation
+            || (operation.includes("managed") && event.managedIndex !== 0)
+          ) return;
+          await rename(absolute, moved);
+          await writeFile(absolute, "human rollback replacement");
+        },
+      }).recover()).rejects.toThrow(/identity|changed|conflict/i);
+    }
+    expect(await readFile(absolute, "utf8")).toBe("human rollback replacement");
+  });
+
+  it("revalidates generated MOC links after temp sync and before rename", async () => {
+    const input = await fixture();
+    const referenced = "20_Study/reference.md";
+    await writeFile(path.join(input.vault, ...referenced.split("/")), "reference");
+    const moc = replaceManagedMocIndex(currentMoc, [
+      { path: destinationPath, title: "Organized" },
+      { path: referenced, title: "Reference" },
+    ]);
+    const plan = {
+      ...input.plan,
+      managedReplacements: input.plan.managedReplacements.map((item) => item.relativePath === mocPath ? { ...item, content: moc } : item),
+    };
+    await expect(engine(input, {
+      onEvent: async (event) => {
+        if (event.name === "managed_temp_synced" && event.managedIndex === 1) await rm(path.join(input.vault, ...referenced.split("/")));
+      },
+    }).apply(plan)).rejects.toThrow(/MOC|link|exist|reference/i);
+    expect(await vaultState(input)).toEqual({ source: original, destination: undefined, moc: currentMoc, canvas: currentCanvas });
+    expect(input.store.getTransaction(input.plan.id)).toBeUndefined();
+  });
+
+  it.each([
+    "recovery_destination_ownership_inferred",
+    "recovery_destination_ownership_persisted",
+    "recovery_destination_proof_removed",
+    "recovery_destination_removed",
+  ])("replays recovery after a crash at durable ownership boundary %s", async (fault) => {
+    const input = await fixture();
+    await engine(input).apply(input.plan);
+    await resetToPreDatabaseCrash(input);
+    const directory = path.join(input.recovery, input.plan.id);
+    const manifestPath = path.join(directory, "manifest.json");
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    await writeFile(manifestPath, JSON.stringify({ ...manifest, state: "prepared", destinationOwned: false }));
+    const destination = path.join(input.vault, ...destinationPath.split("/"));
+    const proof = path.join(path.dirname(destination), `.brain-organizer-${input.plan.id}-destination.tmp`);
+    await link(destination, proof);
+    await expect(engine(input, {
+      onEvent: (event) => { if ((event.name as string) === fault) throw new Error(`crash ${fault}`); },
+    }).recover()).rejects.toThrow(`crash ${fault}`);
+    const durable = JSON.parse(await readFile(manifestPath, "utf8"));
+    expect(durable.destinationOwned).toBe(fault !== "recovery_destination_ownership_inferred");
+    await expect(engine(input).recover()).resolves.toEqual([expect.objectContaining({ outcome: "rolled_back" })]);
+    expect(await vaultState(input)).toEqual({ source: original, destination: undefined, moc: currentMoc, canvas: currentCanvas });
+  });
+
+  it("leaves hard-link proof and durably marks ownership after a post-link marker failure", async () => {
+    const input = await fixture();
+    const directory = path.join(input.recovery, input.plan.id);
+    const destination = path.join(input.vault, ...destinationPath.split("/"));
+    const proof = path.join(path.dirname(destination), `.brain-organizer-${input.plan.id}-destination.tmp`);
+    let publicationFaulted = false;
+    await expect(engine(input, {
+      onEvent: async (event) => {
+        if ((event.name as string) === "before_destination_ownership_persist" && !publicationFaulted) {
+          publicationFaulted = true;
+          throw new Error("marker persistence failed");
+        }
+        if ((event.name as string) === "recovery_destination_ownership_persisted") {
+          expect((await lstat(proof)).isFile()).toBe(true);
+          throw new Error("crash after recovery marker");
+        }
+      },
+    }).apply(input.plan)).rejects.toThrow(/rollback could not complete/i);
+    expect(JSON.parse(await readFile(path.join(directory, "manifest.json"), "utf8")).destinationOwned).toBe(true);
+    expect((await lstat(proof)).isFile()).toBe(true);
+    await expect(engine(input).recover()).resolves.toEqual([expect.objectContaining({ outcome: "rolled_back" })]);
+    expect(await vaultState(input)).toEqual({ source: original, destination: undefined, moc: currentMoc, canvas: currentCanvas });
+  });
+
+  it("rejects a generated MOC target renamed after its temp sync", async () => {
+    const input = await fixture();
+    const referenced = "20_Study/reference.md";
+    const referencedAbsolute = path.join(input.vault, ...referenced.split("/"));
+    await writeFile(referencedAbsolute, "reference");
+    const moc = replaceManagedMocIndex(currentMoc, [
+      { path: destinationPath, title: "Organized" },
+      { path: referenced, title: "Reference" },
+    ]);
+    const plan = {
+      ...input.plan,
+      managedReplacements: input.plan.managedReplacements.map((item) => item.relativePath === mocPath ? { ...item, content: moc } : item),
+    };
+    await expect(engine(input, {
+      onEvent: async (event) => {
+        if (event.name === "managed_temp_synced" && event.managedIndex === 1) await rename(referencedAbsolute, path.join(path.dirname(referencedAbsolute), "Reference.md"));
+      },
+    }).apply(plan)).rejects.toThrow(/MOC|link|exist|spelling/i);
+    expect(await vaultState(input)).toEqual({ source: original, destination: undefined, moc: currentMoc, canvas: currentCanvas });
+  });
+
+  it.skipIf(process.platform === "win32")("rejects a generated MOC target made case-ambiguous after its temp sync", async () => {
+    const input = await fixture();
+    const referenced = "20_Study/Case.md";
+    await writeFile(path.join(input.vault, ...referenced.split("/")), "reference");
+    const moc = replaceManagedMocIndex(currentMoc, [
+      { path: destinationPath, title: "Organized" },
+      { path: referenced, title: "Case" },
+    ]);
+    const plan = {
+      ...input.plan,
+      managedReplacements: input.plan.managedReplacements.map((item) => item.relativePath === mocPath ? { ...item, content: moc } : item),
+    };
+    await expect(engine(input, {
+      onEvent: async (event) => {
+        if (event.name === "managed_temp_synced" && event.managedIndex === 1) await writeFile(path.join(input.vault, "20_Study", "case.md"), "ambiguous");
+      },
+    }).apply(plan)).rejects.toThrow(/ambiguous|collision|MOC/i);
+    expect(await vaultState(input)).toEqual({ source: original, destination: undefined, moc: currentMoc, canvas: currentCanvas });
   });
 });

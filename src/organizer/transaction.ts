@@ -131,6 +131,7 @@ export type TransactionEventName =
   | "before_destination_chmod"
   | "before_destination_directory_sync"
   | "before_destination_temp_unlink"
+  | "before_destination_ownership_persist"
   | "destination_published"
   | "before_managed_publish"
   | "managed_temp_synced"
@@ -149,6 +150,10 @@ export type TransactionEventName =
   | "undo_recovery_managed_restored"
   | "before_undo_recovery_source_unlink"
   | "undo_recovery_source_removed"
+  | "after_bound_handle_read"
+  | "recovery_destination_ownership_persisted"
+  | "recovery_destination_ownership_inferred"
+  | "recovery_destination_proof_removed"
   | "after_undo_managed_publish"
   | "after_undo_source_publish"
   | "after_undo_destination_remove"
@@ -158,6 +163,15 @@ export type TransactionEventName =
 export interface TransactionEvent {
   name: TransactionEventName;
   managedIndex?: number;
+  operation?:
+    | "apply_managed_rename"
+    | "apply_source_unlink"
+    | "undo_managed_rename"
+    | "undo_destination_unlink"
+    | "recovery_managed_rename"
+    | "recovery_destination_unlink"
+    | "undo_recovery_managed_rename"
+    | "undo_recovery_source_unlink";
 }
 
 export interface RecoveryReport {
@@ -193,6 +207,7 @@ interface BoundDirectory {
 interface BoundFile {
   relativePath: string;
   absolutePath: string;
+  canonicalPath: string;
   parent: BoundDirectory;
   stat: BigIntStats;
   content: Buffer;
@@ -260,6 +275,7 @@ function validateRelativePath(value: string, extension?: ".md" | ".canvas"): str
   if (segments.some((segment) => (
     !segment || segment === "." || segment === ".." || segment.startsWith(".")
     || WINDOWS_INVALID.test(segment) || /[ .]$/u.test(segment) || WINDOWS_RESERVED.test(segment)
+    || segment.normalize("NFKC").includes("/") || segment.normalize("NFKC").includes("\\")
   ))) throw new TransactionValidationError("transaction path is unsafe");
   if (segments.some((segment) => (
     Buffer.byteLength(segment, "utf8") > COMPONENT_BYTES
@@ -296,15 +312,18 @@ async function syncDirectory(directory: string): Promise<void> {
   }
 }
 
-async function writeSyncedExclusive(file: string, content: string | Buffer, mode = 0o600): Promise<void> {
+async function writeSyncedExclusive(file: string, content: string | Buffer, mode = 0o600): Promise<BigIntStats> {
   const handle = await open(file, "wx", mode);
   try {
     await handle.writeFile(content);
     await handle.sync();
+    await handle.chmod(mode);
+    const info = await handle.stat({ bigint: true });
+    if (!info.isFile()) throw new TransactionValidationError("synced exclusive file changed identity");
+    return info;
   } finally {
     await handle.close();
   }
-  await chmod(file, mode);
 }
 
 async function writeAtomic(
@@ -320,8 +339,9 @@ async function writeAtomic(
   const directory = path.dirname(file);
   const temp = input.tempPath ?? recoveryAtomicTemp(directory, path.basename(file));
   if (path.dirname(temp) !== directory) throw new TransactionValidationError("atomic temporary file must share the target directory");
+  let tempStat: BigIntStats | undefined;
   try {
-    await writeSyncedExclusive(temp, content, mode);
+    tempStat = await writeSyncedExclusive(temp, content, mode);
     await input.afterTempSync?.();
     await input.beforeRename?.();
     await rename(temp, file);
@@ -329,6 +349,10 @@ async function writeAtomic(
     await syncDirectory(directory);
   } catch (error: unknown) {
     try {
+      const current = await lstat(temp, { bigint: true });
+      if (!tempStat || !exactFileSnapshot(tempStat, current)) {
+        throw new TransactionValidationError("atomic temporary cleanup target changed identity");
+      }
       await unlink(temp);
       await syncDirectory(directory);
     } catch (cleanupError: unknown) {
@@ -347,7 +371,12 @@ function recoveryAtomicTemp(directory: string, filename: string): string {
   return path.join(directory, `.brain-organizer-${owner}-${filename}.tmp`);
 }
 
-async function discardAtomicRecoveryTemp(directory: string, filename: string, maxBytes: number): Promise<void> {
+async function discardAtomicRecoveryTemp(
+  directory: string,
+  filename: string,
+  maxBytes: number,
+  validate?: (content: Buffer) => void | Promise<void>,
+): Promise<void> {
   const temp = recoveryAtomicTemp(directory, filename);
   let info: BigIntStats;
   try { info = await lstat(temp, { bigint: true }); }
@@ -357,7 +386,8 @@ async function discardAtomicRecoveryTemp(directory: string, filename: string, ma
   }
   if (info.isSymbolicLink() || !info.isFile()) throw new TransactionValidationError("atomic recovery temporary file is unsafe");
   assertPrivateMode(info, 0o600, "atomic recovery temporary file");
-  await readBoundedFile(temp, maxBytes);
+  const content = await readBoundedFile(temp, maxBytes);
+  await validate?.(content);
   const current = await lstat(temp, { bigint: true });
   if (!exactFileSnapshot(info, current)) throw new TransactionValidationError("atomic recovery temporary file changed identity");
   await unlink(temp);
@@ -465,21 +495,69 @@ async function bindFile(root: BoundDirectory, relativePath: string, maxBytes = M
   const content = await readBoundedFile(absolutePath, maxBytes);
   const after = await lstat(absolutePath, { bigint: true });
   if (!exactFileSnapshot(statValue, after)) throw new TransactionValidationError("transaction file changed while binding");
-  return { relativePath, absolutePath, parent, stat: statValue, content, hash: digest(content), mode: safeMode(statValue) };
+  return { relativePath, absolutePath, canonicalPath: canonical, parent, stat: statValue, content, hash: digest(content), mode: safeMode(statValue) };
 }
 
-async function revalidateFile(file: BoundFile, expectedHash: string): Promise<void> {
+async function revalidateFile(
+  file: BoundFile,
+  expectedHash: string,
+  input?: { options: OrganizerTransactionEngineOptions; operation: NonNullable<TransactionEvent["operation"]>; managedIndex?: number },
+): Promise<void> {
   await revalidateDirectory(file.parent);
   await exactEntry(file.parent, path.basename(file.absolutePath), false);
-  const current = await lstat(file.absolutePath, { bigint: true });
-  if (!exactFileSnapshot(file.stat, current)) throw new TransactionValidationError("transaction file identity changed");
-  const content = await readBoundedFile(file.absolutePath, MAX_ARTIFACT_BYTES);
-  if (digest(content) !== expectedHash) throw new TransactionValidationError("transaction file hash changed");
+  const before = await lstat(file.absolutePath, { bigint: true });
+  if (!exactFileSnapshot(file.stat, before)) throw new TransactionValidationError("transaction file identity changed");
+  const handle = await open(file.absolutePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  let content: Buffer;
+  let opened: BigIntStats;
+  try {
+    opened = await handle.stat({ bigint: true });
+    if (!exactFileSnapshot(file.stat, opened) || opened.size > BigInt(MAX_ARTIFACT_BYTES)) {
+      throw new TransactionValidationError("transaction file changed before bound read");
+    }
+    content = Buffer.alloc(Number(opened.size));
+    let offset = 0;
+    while (offset < content.length) {
+      const { bytesRead } = await handle.read(content, offset, content.length - offset, offset);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    const afterRead = await handle.stat({ bigint: true });
+    if (offset !== content.length || !exactFileSnapshot(opened, afterRead) || digest(content) !== expectedHash) {
+      throw new TransactionValidationError("transaction file changed during bound read or hash validation");
+    }
+    if (input) await emit(input.options, {
+      name: "after_bound_handle_read",
+      operation: input.operation,
+      ...(input.managedIndex === undefined ? {} : { managedIndex: input.managedIndex }),
+    });
+  } finally {
+    await handle.close();
+  }
+  await revalidateDirectory(file.parent);
+  const pathnameBefore = await lstat(file.absolutePath, { bigint: true });
+  const resolved = await realpath(file.absolutePath);
+  const pathnameAfter = await lstat(file.absolutePath, { bigint: true });
+  const canonicalStat = await lstat(resolved, { bigint: true });
+  const expectedPath = path.join(file.parent.canonicalPath, path.basename(file.absolutePath));
+  if (
+    expectedPath !== file.absolutePath || resolved !== file.canonicalPath
+    || !exactFileSnapshot(file.stat, pathnameBefore)
+    || !exactFileSnapshot(file.stat, pathnameAfter)
+    || !exactFileSnapshot(file.stat, canonicalStat)
+    || !exactFileSnapshot(opened, pathnameBefore)
+    || !exactFileSnapshot(opened, pathnameAfter)
+    || !exactFileSnapshot(opened, canonicalStat)
+  ) throw new TransactionValidationError("transaction pathname changed identity or canonical target");
 }
 
-async function revalidateSource(file: BoundFile, expectedHash: string): Promise<void> {
+async function revalidateSource(
+  file: BoundFile,
+  expectedHash: string,
+  input?: { options: OrganizerTransactionEngineOptions; operation: "apply_source_unlink" },
+): Promise<void> {
   try {
-    await revalidateFile(file, expectedHash);
+    await revalidateFile(file, expectedHash, input);
   } catch {
     throw new StaleSourceError("source is stale or changed concurrently");
   }
@@ -805,7 +883,20 @@ async function readRecoveryFile(directory: string, filename: string, maxBytes: n
 }
 
 async function readManifest(directory: string, expectedId: string): Promise<RecoveryManifest> {
-  const file = path.join(directory, "manifest.json");
+  return readManifestFile(path.join(directory, "manifest.json"), expectedId);
+}
+
+function parseManifestContent(content: Buffer, expectedId: string): RecoveryManifest {
+  let raw: unknown;
+  try { raw = JSON.parse(content.toString("utf8")); }
+  catch { throw new TransactionValidationError("recovery manifest is malformed"); }
+  const parsed = manifestSchema.safeParse(raw);
+  if (!parsed.success || parsed.data.id !== expectedId) throw new TransactionValidationError("recovery manifest schema is invalid");
+  validateManifestSemantics(parsed.data);
+  return parsed.data;
+}
+
+async function readManifestFile(file: string, expectedId: string): Promise<RecoveryManifest> {
   let content: Buffer;
   try {
     const info = await lstat(file, { bigint: true });
@@ -814,13 +905,7 @@ async function readManifest(directory: string, expectedId: string): Promise<Reco
     content = await readBoundedFile(file, MAX_MANIFEST_BYTES);
   }
   catch { throw new TransactionValidationError("recovery manifest is invalid or oversized"); }
-  let raw: unknown;
-  try { raw = JSON.parse(content.toString("utf8")); }
-  catch { throw new TransactionValidationError("recovery manifest is malformed"); }
-  const parsed = manifestSchema.safeParse(raw);
-  if (!parsed.success || parsed.data.id !== expectedId) throw new TransactionValidationError("recovery manifest schema is invalid");
-  validateManifestSemantics(parsed.data);
-  return parsed.data;
+  return parseManifestContent(content, expectedId);
 }
 
 async function writeRecoveryReport(directory: string, report: RecoveryReport): Promise<void> {
@@ -840,12 +925,31 @@ async function readRecoveryReport(directory: string, expectedId: string): Promis
   }
   if (info.isSymbolicLink() || !info.isFile()) throw new TransactionValidationError("recovery report is unsafe");
   assertPrivateMode(info, 0o600, "recovery report");
-  let raw: unknown;
-  try { raw = JSON.parse((await readBoundedFile(file, MAX_REPORT_BYTES)).toString("utf8")); }
+  let content: Buffer;
+  try { content = await readBoundedFile(file, MAX_REPORT_BYTES); }
   catch { throw new TransactionValidationError("recovery report is invalid or oversized"); }
+  return parseRecoveryReportContent(content, expectedId);
+}
+
+function parseRecoveryReportContent(content: Buffer, expectedId: string): RecoveryReport {
+  let raw: unknown;
+  try { raw = JSON.parse(content.toString("utf8")); }
+  catch { throw new TransactionValidationError("recovery report is malformed"); }
   const parsed = recoveryReportSchema.safeParse(raw);
   if (!parsed.success || parsed.data.id !== expectedId) throw new TransactionValidationError("recovery report schema is invalid");
   return parsed.data;
+}
+
+function recoveryReportTimestamp(manifest: RecoveryManifest, candidate: string): string {
+  const floor = manifest.undoneAt ?? manifest.appliedAt;
+  return Date.parse(candidate) >= Date.parse(floor) ? candidate : floor;
+}
+
+function validateRecoveryReportForManifest(report: RecoveryReport, manifest: RecoveryManifest): void {
+  const floor = manifest.undoneAt ?? manifest.appliedAt;
+  if (Date.parse(report.at) < Date.parse(floor)) {
+    throw new TransactionValidationError("recovery report timestamp predates manifest state");
+  }
 }
 
 async function publishCreateOnly(
@@ -862,13 +966,18 @@ async function publishCreateOnly(
 ): Promise<boolean> {
   const temp = transactionTemp(parent, input.id, input.role);
   let tempExists = false;
+  let linkSucceeded = false;
+  let tempStat: BigIntStats | undefined;
   let cleanupError: unknown;
   try {
-    await writeSyncedExclusive(temp, content, mode);
+    tempStat = await writeSyncedExclusive(temp, content, mode);
     tempExists = true;
     if (input.role === "destination" && input.options) await emit(input.options, { name: "before_destination_link" });
     await assertDestinationAbsent(parent, path.basename(target));
+    const verifiedTemp = await inspectOwnedTemporaryFile(parent, temp, new Set([digest(content)]));
+    if (!verifiedTemp || !exactFileSnapshot(tempStat, verifiedTemp.stat)) throw new TransactionValidationError("create-only proof temp changed before link");
     await link(temp, target);
+    linkSucceeded = true;
     const [tempInfo, targetInfo] = await Promise.all([
       lstat(temp, { bigint: true }),
       lstat(target, { bigint: true }),
@@ -878,17 +987,29 @@ async function publishCreateOnly(
     }
     await input.onOwned?.();
     if (input.role === "destination" && input.options) await emit(input.options, { name: "before_destination_chmod" });
+    const targetBeforeChmod = await lstat(target, { bigint: true });
+    if (!tempStat || !exactFileSnapshot(targetInfo, targetBeforeChmod) || !provableIdentity(tempStat, targetBeforeChmod)) {
+      throw new TransactionValidationError("create-only target changed before chmod");
+    }
     await chmod(target, mode);
     if (input.role === "destination" && input.options) await emit(input.options, { name: "before_destination_directory_sync" });
     await syncDirectory(parent.canonicalPath);
     if (input.role === "destination" && input.options) await emit(input.options, { name: "before_destination_temp_unlink" });
+    const tempBeforeUnlink = await lstat(temp, { bigint: true });
+    if (!tempStat || !exactFileSnapshot(tempStat, tempBeforeUnlink)) {
+      throw new TransactionValidationError("create-only proof temp changed before cleanup");
+    }
     await unlink(temp);
     tempExists = false;
     await syncDirectory(parent.canonicalPath);
     return true;
   } catch (error: unknown) {
-    if (tempExists) {
+    if (tempExists && !linkSucceeded) {
       try {
+        const current = await lstat(temp, { bigint: true });
+        if (!tempStat || !exactFileSnapshot(tempStat, current)) {
+          throw new TransactionValidationError("create-only temporary cleanup target changed identity");
+        }
         await unlink(temp);
         tempExists = false;
         await syncDirectory(parent.canonicalPath);
@@ -913,12 +1034,25 @@ async function replaceBoundFile(
   file: BoundFile,
   content: string | Buffer,
   mode: number,
-  input: { id: string; role: string; index?: number; afterTempSync?: () => Promise<void> },
+  input: {
+    id: string;
+    role: string;
+    index?: number;
+    afterTempSync?: () => Promise<void>;
+    options?: OrganizerTransactionEngineOptions;
+    operation?: NonNullable<TransactionEvent["operation"]>;
+    beforeRename?: () => Promise<void>;
+  },
 ): Promise<void> {
   await writeAtomic(file.absolutePath, content, mode, {
     tempPath: transactionTemp(file, input.id, input.role, input.index),
     afterTempSync: input.afterTempSync,
-    beforeRename: async () => revalidateFile(file, file.hash),
+    beforeRename: async () => {
+      await input.beforeRename?.();
+      await revalidateFile(file, file.hash, input.options && input.operation
+        ? { options: input.options, operation: input.operation, ...(input.index === undefined ? {} : { managedIndex: input.index }) }
+        : undefined);
+    },
   });
 }
 
@@ -938,6 +1072,7 @@ async function inspectBoundFile(
 
 interface OwnedTemporaryFile {
   absolutePath: string;
+  canonicalPath: string;
   parent: BoundDirectory;
   stat: BigIntStats;
   hash: string;
@@ -958,15 +1093,29 @@ async function inspectOwnedTemporaryFile(
   const content = await readBoundedFile(absolutePath, MAX_ARTIFACT_BYTES);
   const hash = digest(content);
   if (!allowedHashes.has(hash)) throw new TransactionValidationError("owned transaction temporary file content is invalid");
-  return { absolutePath, parent, stat: statValue, hash };
+  const after = await lstat(absolutePath, { bigint: true });
+  const canonicalPath = await realpath(absolutePath);
+  const canonicalStat = await lstat(canonicalPath, { bigint: true });
+  if (
+    canonicalPath !== absolutePath
+    || !exactFileSnapshot(statValue, after)
+    || !exactFileSnapshot(statValue, canonicalStat)
+  ) throw new TransactionValidationError("owned transaction temporary file changed identity");
+  return { absolutePath, canonicalPath, parent, stat: statValue, hash };
 }
 
 async function removeOwnedTemporaryFile(file: OwnedTemporaryFile): Promise<void> {
-  await revalidateDirectory(file.parent);
-  const current = await lstat(file.absolutePath, { bigint: true });
-  if (!exactFileSnapshot(file.stat, current)) throw new TransactionValidationError("owned transaction temporary file changed identity");
-  const content = await readBoundedFile(file.absolutePath, MAX_ARTIFACT_BYTES);
-  if (digest(content) !== file.hash) throw new TransactionValidationError("owned transaction temporary file changed content");
+  const bound: BoundFile = {
+    relativePath: path.basename(file.absolutePath),
+    absolutePath: file.absolutePath,
+    canonicalPath: file.canonicalPath,
+    parent: file.parent,
+    stat: file.stat,
+    content: Buffer.alloc(0),
+    hash: file.hash,
+    mode: safeMode(file.stat),
+  };
+  await revalidateFile(bound, file.hash);
   await unlink(file.absolutePath);
   await syncDirectory(file.parent.canonicalPath);
 }
@@ -1015,9 +1164,13 @@ async function loadRecoverySnapshots(manifest: RecoveryManifest, directory: stri
   return { source, managed, ...(undoDestination ? { undoDestination } : {}), undoManaged };
 }
 
-async function assertNoUnknownRecoveryArtifacts(manifest: RecoveryManifest, directory: string): Promise<void> {
+async function assertNoUnknownRecoveryArtifacts(
+  manifest: RecoveryManifest,
+  directory: string,
+  manifestFilename = "manifest.json",
+): Promise<void> {
   const allowed = new Set<string>([
-    "manifest.json",
+    manifestFilename,
     "recovery-report.json",
     manifest.sourceSnapshotFile,
     ...manifest.managed.map((item) => item.snapshotFile),
@@ -1032,6 +1185,75 @@ async function assertNoUnknownRecoveryArtifacts(manifest: RecoveryManifest, dire
   }
 }
 
+async function readOrPromoteInitialManifest(
+  directory: string,
+  expectedId: string,
+  recoveryRoot: string,
+): Promise<{ manifest: RecoveryManifest; root: BoundDirectory }> {
+  const directoryBefore = await lstat(directory, { bigint: true });
+  if (
+    directoryBefore.isSymbolicLink() || !directoryBefore.isDirectory()
+    || path.dirname(directory) !== recoveryRoot || path.basename(directory) !== expectedId
+  ) throw new TransactionValidationError("initial recovery transaction directory identity is invalid");
+  const manifestPath = path.join(directory, "manifest.json");
+  let manifestExists = true;
+  try { await lstat(manifestPath, { bigint: true }); }
+  catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    manifestExists = false;
+  }
+  if (manifestExists) {
+    const manifest = await readManifest(directory, expectedId);
+    const root = await bindRoot(manifest.vaultRoot);
+    if (!isOutside(root.canonicalPath, recoveryRoot)) throw new TransactionValidationError("recovery root must be outside the vault");
+    return { manifest, root };
+  }
+  const tempPath = recoveryAtomicTemp(directory, "manifest.json");
+  let manifest: RecoveryManifest;
+  let initialTempStat: BigIntStats;
+  try { initialTempStat = await lstat(tempPath, { bigint: true }); }
+  catch { throw new TransactionValidationError("initial recovery manifest temp is missing or unsafe"); }
+  try { manifest = await readManifestFile(tempPath, expectedId); }
+  catch { throw new TransactionValidationError("initial recovery manifest temp is invalid or oversized"); }
+  const root = await bindRoot(manifest.vaultRoot);
+  if (!isOutside(root.canonicalPath, recoveryRoot)) throw new TransactionValidationError("recovery root must be outside the vault");
+  await loadRecoverySnapshots(manifest, directory);
+  await assertNoUnknownRecoveryArtifacts(manifest, directory, path.basename(tempPath));
+  const current = await readManifestFile(tempPath, expectedId);
+  if (!isDeepStrictEqual(current, manifest)) throw new TransactionValidationError("initial recovery manifest temp changed before promotion");
+  const directoryAfter = await lstat(directory, { bigint: true });
+  if (!sameIdentity(directoryBefore, directoryAfter) || directoryAfter.isSymbolicLink() || !directoryAfter.isDirectory()) {
+    throw new TransactionValidationError("initial recovery transaction directory changed before promotion");
+  }
+  const tempBeforeResolution = await lstat(tempPath, { bigint: true });
+  const resolvedTemp = await realpath(tempPath);
+  const tempAfterResolution = await lstat(tempPath, { bigint: true });
+  const canonicalTemp = await lstat(resolvedTemp, { bigint: true });
+  const expectedTemp = path.join(directory, path.basename(tempPath));
+  if (
+    resolvedTemp !== expectedTemp
+    || !exactFileSnapshot(initialTempStat, tempBeforeResolution)
+    || !exactFileSnapshot(initialTempStat, tempAfterResolution)
+    || !exactFileSnapshot(initialTempStat, canonicalTemp)
+  ) throw new TransactionValidationError("initial recovery manifest temp changed identity before promotion");
+  try { await link(tempPath, manifestPath); }
+  catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new TransactionConflictError("recovery manifest appeared during initial promotion");
+    throw error;
+  }
+  await syncDirectory(directory);
+  const [proof, published] = await Promise.all([
+    lstat(tempPath, { bigint: true }),
+    lstat(manifestPath, { bigint: true }),
+  ]);
+  if (!provableIdentity(proof, published)) throw new TransactionValidationError("promoted recovery manifest ownership is not provable");
+  const proofBeforeUnlink = await lstat(tempPath, { bigint: true });
+  if (!exactFileSnapshot(initialTempStat, proofBeforeUnlink)) throw new TransactionValidationError("promoted recovery manifest proof changed identity");
+  await unlink(tempPath);
+  await syncDirectory(directory);
+  return { manifest, root };
+}
+
 interface PreparedApplyRollback {
   root: BoundDirectory;
   source: Awaited<ReturnType<typeof inspectBoundFile>>;
@@ -1043,6 +1265,8 @@ interface PreparedApplyRollback {
     temps: OwnedTemporaryFile[];
   }>;
   destination?: BoundFile;
+  ownershipNeedsPersistence: boolean;
+  ownershipProof?: OwnedTemporaryFile;
   sourceTemps: OwnedTemporaryFile[];
   destinationTemps: OwnedTemporaryFile[];
   sourceSnapshot: Buffer;
@@ -1056,7 +1280,6 @@ async function preflightApplyRollback(
   const snapshots = await loadRecoverySnapshots(manifest, directory);
   const root = await bindRoot(manifest.vaultRoot);
   const source = await inspectBoundFile(root, manifest.sourcePath);
-  if (source.file && source.file.hash !== manifest.sourceHash) throw new TransactionConflictError("recovery conflict at source");
   const sourceTemps = (await Promise.all([
     inspectOwnedTemporaryFile(source.parent, transactionTemp(source.parent, manifest.id, "recover-source"), new Set([manifest.sourceHash])),
   ])).filter((item): item is OwnedTemporaryFile => item !== undefined);
@@ -1077,11 +1300,14 @@ async function preflightApplyRollback(
   const destinationTemps = (await Promise.all([
     inspectOwnedTemporaryFile(destinationParent, transactionTemp(destinationParent, manifest.id, "destination"), new Set([manifest.destinationHash])),
   ])).filter((item): item is OwnedTemporaryFile => item !== undefined);
-  let ownsDestination = destinationOwned ?? manifest.destinationOwned;
+  const ownershipDeclared = destinationOwned ?? manifest.destinationOwned;
+  let ownsDestination = ownershipDeclared;
+  let ownershipProof: OwnedTemporaryFile | undefined;
   if (!ownsDestination && destinationTemps[0]) {
     try {
       const targetInfo = await lstat(destinationAbsolute, { bigint: true });
       ownsDestination = targetInfo.isFile() && provableIdentity(destinationTemps[0].stat, targetInfo);
+      if (ownsDestination) ownershipProof = destinationTemps[0];
     } catch (error: unknown) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
@@ -1097,6 +1323,8 @@ async function preflightApplyRollback(
     source,
     managed,
     ...(ownsDestination && destination.file ? { destination: destination.file } : {}),
+    ownershipNeedsPersistence: !manifest.destinationOwned && ownsDestination,
+    ...(ownershipProof ? { ownershipProof } : {}),
     sourceTemps,
     destinationTemps,
     sourceSnapshot: snapshots.source,
@@ -1110,6 +1338,12 @@ async function rollbackApply(
   destinationOwned?: boolean,
 ): Promise<void> {
   const prepared = await preflightApplyRollback(manifest, directory, destinationOwned);
+  if (prepared.ownershipNeedsPersistence) {
+    await emit(options, { name: "recovery_destination_ownership_inferred" });
+    manifest.destinationOwned = true;
+    await writeManifest(directory, manifest);
+    await emit(options, { name: "recovery_destination_ownership_persisted" });
+  }
   for (const temp of prepared.sourceTemps) await removeOwnedTemporaryFile(temp);
   if (!prepared.source.file) {
     await publishCreateOnly(prepared.source.parent, prepared.source.absolutePath, prepared.sourceSnapshot, manifest.sourceMode, {
@@ -1121,14 +1355,23 @@ async function rollbackApply(
   for (const { index, item, current, snapshot, temps } of [...prepared.managed].reverse()) {
     for (const temp of temps) await removeOwnedTemporaryFile(temp);
     if (current.hash === item.afterHash && item.afterHash !== item.beforeHash) {
-      await replaceBoundFile(current, snapshot, item.mode, { id: manifest.id, role: "recover-managed", index });
+      await replaceBoundFile(current, snapshot, item.mode, {
+        id: manifest.id,
+        role: "recover-managed",
+        index,
+        options,
+        operation: "recovery_managed_rename",
+      });
       await emit(options, { name: "recovery_managed_restored", managedIndex: index });
     }
   }
-  for (const temp of prepared.destinationTemps) await removeOwnedTemporaryFile(temp);
+  for (const temp of prepared.destinationTemps) {
+    await removeOwnedTemporaryFile(temp);
+    if (temp === prepared.ownershipProof) await emit(options, { name: "recovery_destination_proof_removed" });
+  }
   if (prepared.destination) {
     await emit(options, { name: "before_recovery_destination_unlink" });
-    await revalidateFile(prepared.destination, manifest.destinationHash);
+    await revalidateFile(prepared.destination, manifest.destinationHash, { options, operation: "recovery_destination_unlink" });
     await unlink(prepared.destination.absolutePath);
     await syncDirectory(prepared.destination.parent.canonicalPath);
     await emit(options, { name: "recovery_destination_removed" });
@@ -1206,14 +1449,20 @@ async function rollbackUndo(
     for (const temp of temps) await removeOwnedTemporaryFile(temp);
     if (current.hash !== item.hash) {
       await emit(options, { name: "before_undo_recovery_managed_publish", managedIndex: index });
-      await replaceBoundFile(current, snapshot, item.mode, { id: manifest.id, role: "recover-undo-managed", index });
+      await replaceBoundFile(current, snapshot, item.mode, {
+        id: manifest.id,
+        role: "recover-undo-managed",
+        index,
+        options,
+        operation: "undo_recovery_managed_rename",
+      });
       await emit(options, { name: "undo_recovery_managed_restored", managedIndex: index });
     }
   }
   for (const temp of prepared.sourceTemps) await removeOwnedTemporaryFile(temp);
   if (prepared.source) {
     await emit(options, { name: "before_undo_recovery_source_unlink" });
-    await revalidateFile(prepared.source, manifest.sourceHash);
+    await revalidateFile(prepared.source, manifest.sourceHash, { options, operation: "undo_recovery_source_unlink" });
     await unlink(prepared.source.absolutePath);
     await syncDirectory(prepared.source.parent.canonicalPath);
     await emit(options, { name: "undo_recovery_source_removed" });
@@ -1362,8 +1611,10 @@ export class OrganizerTransactionEngine {
           options: this.options,
           onOwned: async () => {
             destinationPublished = true;
-            manifest = { ...manifest!, destinationOwned: true };
-            await writeManifest(transactionDirectory!, manifest);
+            await emit(this.options, { name: "before_destination_ownership_persist" });
+            const ownedManifest = { ...manifest!, destinationOwned: true };
+            await writeManifest(transactionDirectory!, ownedManifest);
+            manifest = ownedManifest;
           },
         });
       } catch (error: unknown) {
@@ -1386,13 +1637,21 @@ export class OrganizerTransactionEngine {
           role: "apply-managed",
           index,
           afterTempSync: async () => emit(this.options, { name: "managed_temp_synced", managedIndex: index }),
+          options: this.options,
+          operation: "apply_managed_rename",
+          beforeRename: MOC_TARGETS.has(item.replacement.relativePath) ? async () => {
+            if (!manifest!.destinationOwned) throw new TransactionValidationError("managed MOC destination is not proven owned");
+            await requirePublishedDestination(prepared!.root, stored.destinationPath, manifest!.destinationHash);
+            assertManagedContent(item.replacement.relativePath, item.replacement.content);
+            await validateMocLinks(prepared!.root, item.replacement.content, stored.destinationPath);
+          } : undefined,
         });
         await emit(this.options, { name: "managed_published", managedIndex: index });
       }
 
       await requirePublishedDestination(prepared.root, stored.destinationPath, manifest.destinationHash);
       await emit(this.options, { name: "before_source_unlink" });
-      await revalidateSource(prepared.source, stored.sourceHash);
+      await revalidateSource(prepared.source, stored.sourceHash, { options: this.options, operation: "apply_source_unlink" });
       await unlink(prepared.source.absolutePath);
       await syncDirectory(prepared.source.parent.canonicalPath);
       await emit(this.options, { name: "source_removed" });
@@ -1417,7 +1676,12 @@ export class OrganizerTransactionEngine {
           await rollbackApply(manifest, transactionDirectory, this.options, destinationPublished);
           manifest = { ...manifest, state: "rolled_back" };
           await writeManifest(transactionDirectory, manifest);
-          await writeRecoveryReport(transactionDirectory, { version: 1, id: manifest.id, outcome: "rolled_back", at: this.now() });
+          await writeRecoveryReport(transactionDirectory, {
+            version: 1,
+            id: manifest.id,
+            outcome: "rolled_back",
+            at: recoveryReportTimestamp(manifest, this.now()),
+          });
         }
       } catch (rollbackError: unknown) {
         throw new AggregateError([error, rollbackError], "transaction failed and rollback could not complete");
@@ -1484,7 +1748,13 @@ export class OrganizerTransactionEngine {
         const current = managedFiles[index]!;
         const snapshot = await readRecoveryFile(directory, item.snapshotFile, MAX_ARTIFACT_BYTES);
         await revalidateFile(current, item.afterHash);
-        await replaceBoundFile(current, snapshot, item.mode, { id: manifest.id, role: "undo-managed", index });
+        await replaceBoundFile(current, snapshot, item.mode, {
+          id: manifest.id,
+          role: "undo-managed",
+          index,
+          options: this.options,
+          operation: "undo_managed_rename",
+        });
         await emit(this.options, { name: "after_undo_managed_publish", managedIndex: index });
       }
       await revalidateDirectory(sourceParent);
@@ -1495,7 +1765,7 @@ export class OrganizerTransactionEngine {
       });
       await emit(this.options, { name: "after_undo_source_publish" });
 
-      await revalidateFile(destination, manifest.destinationHash);
+      await revalidateFile(destination, manifest.destinationHash, { options: this.options, operation: "undo_destination_unlink" });
       await unlink(destination.absolutePath);
       await syncDirectory(destination.parent.canonicalPath);
       await emit(this.options, { name: "after_undo_destination_remove" });
@@ -1512,7 +1782,12 @@ export class OrganizerTransactionEngine {
         await rollbackUndo(manifest, directory, this.options);
         manifest = { ...manifest, state: "committed" };
         await writeManifest(directory, manifest);
-        await writeRecoveryReport(directory, { version: 1, id: manifest.id, outcome: "undo_rolled_back", at: this.now() });
+        await writeRecoveryReport(directory, {
+          version: 1,
+          id: manifest.id,
+          outcome: "undo_rolled_back",
+          at: recoveryReportTimestamp(manifest, this.now()),
+        });
       } catch (rollbackError: unknown) {
         throw new AggregateError([error, rollbackError], "undo failed and rollback could not complete");
       }
@@ -1540,7 +1815,8 @@ export class OrganizerTransactionEngine {
     if (entries.length > 1_000) throw new TransactionValidationError("recovery directory entry count exceeds limit");
     const removed: string[] = [];
     for (const entry of entries.sort((left, right) => Buffer.compare(Buffer.from(left.name), Buffer.from(right.name)))) {
-      if (!entry.isDirectory() || !identifier.safeParse(entry.name).success) continue;
+      if (!identifier.safeParse(entry.name).success) continue;
+      if (!entry.isDirectory()) throw new TransactionValidationError("transaction-shaped recovery entry is unsafe");
       const directory = path.join(recoveryRoot, entry.name);
       const info = await lstat(directory, { bigint: true });
       if (info.isSymbolicLink() || !info.isDirectory()) throw new TransactionValidationError("recovery transaction directory is unsafe");
@@ -1551,6 +1827,7 @@ export class OrganizerTransactionEngine {
       if (!["committed", "rolled_back", "undone"].includes(manifest.state)) continue;
       const report = await readRecoveryReport(directory, manifest.id);
       if (!report || Date.parse(report.at) > cutoff) continue;
+      validateRecoveryReportForManifest(report, manifest);
       const expectedOutcome: RecoveryReport["outcome"] = manifest.state === "rolled_back"
         ? "rolled_back"
         : manifest.state === "undone"
@@ -1577,16 +1854,22 @@ export class OrganizerTransactionEngine {
     if (entries.length > 1_000) throw new TransactionValidationError("recovery directory entry count exceeds limit");
     const reports: RecoveryReport[] = [];
     for (const entry of entries.sort((left, right) => Buffer.compare(Buffer.from(left.name), Buffer.from(right.name)))) {
-      if (!entry.isDirectory() || !identifier.safeParse(entry.name).success) continue;
+      if (!identifier.safeParse(entry.name).success) continue;
+      if (!entry.isDirectory()) throw new TransactionValidationError("transaction-shaped recovery entry is unsafe");
       const directory = path.join(recoveryRoot, entry.name);
       const info = await lstat(directory, { bigint: true });
       if (info.isSymbolicLink() || !info.isDirectory()) throw new TransactionValidationError("recovery transaction directory is unsafe");
       assertPrivateMode(info, 0o700, "recovery transaction directory");
-      const manifest = await readManifest(directory, entry.name);
-      const manifestRoot = await bindRoot(manifest.vaultRoot);
-      if (!isOutside(manifestRoot.canonicalPath, recoveryRoot)) throw new TransactionValidationError("recovery root must be outside the vault");
-      await discardAtomicRecoveryTemp(directory, "manifest.json", MAX_MANIFEST_BYTES);
-      await discardAtomicRecoveryTemp(directory, "recovery-report.json", MAX_REPORT_BYTES);
+      const { manifest } = await readOrPromoteInitialManifest(directory, entry.name, recoveryRoot);
+      await discardAtomicRecoveryTemp(directory, "manifest.json", MAX_MANIFEST_BYTES, async (content) => {
+        const candidate = parseManifestContent(content, entry.name);
+        const candidateRoot = await bindRoot(candidate.vaultRoot);
+        if (!isOutside(candidateRoot.canonicalPath, recoveryRoot)) throw new TransactionValidationError("temporary recovery manifest vault is unsafe");
+        await loadRecoverySnapshots(candidate, directory);
+      });
+      await discardAtomicRecoveryTemp(directory, "recovery-report.json", MAX_REPORT_BYTES, (content) => {
+        validateRecoveryReportForManifest(parseRecoveryReportContent(content, entry.name), manifest);
+      });
       if (["committed", "rolled_back", "undone"].includes(manifest.state)) {
         const outcome: RecoveryReport["outcome"] = manifest.state === "rolled_back"
           ? "rolled_back"
@@ -1598,8 +1881,14 @@ export class OrganizerTransactionEngine {
           : undefined;
         if (!rolledProposal) assertAppliedReconciliation(manifest, this.options.store, manifest.state === "undone");
         const existing = await readRecoveryReport(directory, manifest.id);
+        if (existing) validateRecoveryReportForManifest(existing, manifest);
         if (existing?.outcome !== outcome) {
-          const report: RecoveryReport = { version: 1, id: manifest.id, outcome, at: this.now() };
+          const report: RecoveryReport = {
+            version: 1,
+            id: manifest.id,
+            outcome,
+            at: recoveryReportTimestamp(manifest, this.now()),
+          };
           await writeRecoveryReport(directory, report);
           reports.push(report);
         }
@@ -1639,7 +1928,12 @@ export class OrganizerTransactionEngine {
       }
       const updated = { ...manifest, state: next };
       await writeManifest(directory, updated);
-      const report: RecoveryReport = { version: 1, id: manifest.id, outcome, at: this.now() };
+      const report: RecoveryReport = {
+        version: 1,
+        id: manifest.id,
+        outcome,
+        at: recoveryReportTimestamp(updated, this.now()),
+      };
       await writeRecoveryReport(directory, report);
       if (next === "rolled_back") {
         const proposal = assertRolledBackReconciliation(updated, this.options.store);

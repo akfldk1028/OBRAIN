@@ -85,3 +85,51 @@ Implemented Task 7 in `src/organizer/transaction.ts` with a crash-recoverable ap
 ### Remaining portability boundary
 
 - Node still has no portable descriptor-relative rename/unlink API. The implementation therefore uses same-filesystem atomic link/rename publication and an exact identity/hash/canonical-lineage check as the immediately preceding operation. This is the accepted owner-controlled Vault boundary; no live Vault path is used by any test.
+
+## Fix Round 2 — post-read binding and replay-durable ownership
+
+### TDD evidence
+
+- RED: expanded the focused suite from 70 to 88 cases before the primary implementation. The observed run was 74 passed, 13 failed, and 1 Windows-only skip. The failures specifically demonstrated absent initial-manifest-temp promotion, missing terminal timestamp reconciliation, unobserved pathname substitutions during bound reads, missing final MOC inventory validation, and missing recovery ownership-boundary events/persistence.
+- Additional focused RED/GREEN cycles covered post-link marker failure and transaction-shaped recovery-root symlinks. Both tests were observed failing for the intended missing behavior before their minimal fixes.
+- Final focused suite: 93 cases total on Windows (91 passed, 2 platform-specific ambiguity/mode skips, 0 failed).
+
+### Scanner-grade final pathname binding
+
+- `BoundFile` now retains the canonical file path captured during initial binding.
+- Final revalidation binds the original stat, opened handle stat, post-read handle stat, SHA-256 content, canonical parent lineage, pathname `lstat` before and after resolution, resolved canonical path, and canonical-target `lstat` to the same file identity/type/size/mtime.
+- The test-only fault event fires after handle read/fstat/hash while the handle is still open. The handle is closed, parent/pathname binding is repeated, and the caller performs rename or unlink as the next filesystem operation.
+- Deterministic races now replace the pathname during the bound read at apply-managed rename, source unlink, undo destination unlink, apply rollback managed rename/destination unlink, and undo rollback managed rename. Every replacement is detected; human bytes are never overwritten or deleted.
+- Synced exclusive files are chmodded and statted through their still-open handle. Create-only publication rebinds the proof temp immediately before hard-link creation and re-proves the published target immediately before chmod. Cleanup unlinks only an identity/hash/canonical-checked owned temp.
+
+### Replay-durable destination ownership
+
+- Publication retains the deterministic hard-link proof temp on every post-link error until durable ownership is available. It no longer removes the only ownership evidence on marker, chmod, sync, or later cleanup failure.
+- Normal publication writes and fsyncs `destinationOwned=true` before chmod/temp cleanup. The in-memory manifest is advanced only after that durable write succeeds; a partial marker write therefore cannot falsely suppress recovery persistence.
+- Recovery that proves ownership from the hard-linked destination/proof pair emits an inference boundary, writes and fsyncs `destinationOwned=true`, then—and only then—may restore Vault artifacts, remove the proof, or remove the destination.
+- Crash replay tests cover interruption after inference, marker persistence, proof-temp cleanup, and destination deletion. A post-link marker failure test verifies the proof remains present until recovery durably records ownership.
+
+### Initial manifest publication recovery
+
+- A transaction directory with no `manifest.json` accepts only its exact transaction-derived manifest temp. The temp must be `0600`, bounded, valid JSON, schema- and cross-field-valid, match the directory transaction ID, reference an outside-Vault recovery root, have every required snapshot present and valid, and coexist with no unknown artifact.
+- Promotion uses create-only hard-link publication, syncs the directory, proves the published manifest and temp are the same object, removes the proof with a final identity check, and syncs again. A crash leaving both names is replayable.
+- Corrupt, oversized, wrong-ID, unsafe-mode, missing-snapshot, and unknown-artifact states fail closed before Vault mutation. Existing manifest/report temps are parsed and validated before any cleanup rather than silently discarded.
+
+### Final MOC inventory and path parity
+
+- After the managed MOC temp is synced and after earlier Vault mutations, the engine freshly parses only the generated marker block and rebinds every linked target through exact case/NFKC collision-checked inventory immediately before the MOC target's final pathname check and rename.
+- The planned destination exception is allowed only while `destinationOwned` is durable and the published destination rebinds to the expected hash. Target deletion, exact-spelling rename, and post-sync case ambiguity all reject and roll back without committing a broken MOC.
+- Relative path validation now explicitly rejects any component whose NFKC form introduces `/` or `\\`, matching Task 2. Fullwidth slash and reverse-solidus fixtures remain untouched and fail before Vault mutation.
+
+### Terminal reports
+
+- Recovery report timestamps must be at or after the manifest's apply/undo state timestamp. Newly written reports are floored to the relevant manifest timestamp if the injected/runtime clock is older.
+- Even a schema-valid, same-ID, same-outcome terminal report is rejected if its timestamp predates the terminal manifest state.
+
+### Round 2 verification
+
+- Focused: 91 passed, 2 Windows-specific skips, 0 failed (93 total).
+- Full: 29 files, 314 passed, 2 Windows-specific skips, 0 failed (316 total).
+- TypeScript: `npm run typecheck` passed.
+- Diff hygiene: `git diff --check` passed; only line-ending notices were emitted on Windows.
+- All new filesystem tests use isolated temporary fixtures only; no live Vault path is touched.
