@@ -107,4 +107,3 @@ exit 0
     expect(readFileSync(logPath, "utf8")).toContain("--dport 443 -j ACCEPT");
   }, 15_000);
 });
-
