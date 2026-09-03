@@ -6,8 +6,8 @@ import {
 } from "../src/organizer/paths.js";
 
 describe("organizer paths", () => {
-  it("normalizes Inbox Markdown paths and accepts five directory levels", () => {
-    expect(assertInboxSource("Agent-Inbox\\ＭＤＰ.md")).toBe("Agent-Inbox/MDP.md");
+  it("normalizes separators while preserving exact Unicode spelling and five directory levels", () => {
+    expect(assertInboxSource("Agent-Inbox\\ＭＤＰ.md")).toBe("Agent-Inbox/ＭＤＰ.md");
     expect(assertInboxSource("Agent-Inbox/a/b/c/d/note.md"))
       .toBe("Agent-Inbox/a/b/c/d/note.md");
   });
@@ -18,6 +18,8 @@ describe("organizer paths", () => {
     "C:\\outside.md",
     "\\\\server\\share\\outside.md",
     "Agent-Inbox\\..\\outside.md",
+    "Agent-Inbox/foo／bar.md",
+    "Agent-Inbox/foo＼bar.md",
     "Agent-Inbox/./outside.md",
     "Agent-Inbox//outside.md",
     "Agent-Inbox/.hidden/note.md",
@@ -43,7 +45,13 @@ describe("organizer paths", () => {
 
     expect(assertApprovedDestination("20_Study\\22_RL", existing)).toBe("20_Study/22_RL");
     expect(assertApprovedDestination("20_Study/a/b/c/d", existing)).toBe("20_Study/a/b/c/d");
-    expect(assertApprovedDestination("40_Research/MDP", existing)).toBe("40_Research/MDP");
+    expect(assertApprovedDestination("40_Research/MDP", existing)).toBe("40_Research/ＭＤＰ");
+  });
+
+  it("rejects ambiguous case-insensitive NFKC-equivalent existing destinations", () => {
+    const existing = new Set(["20_Study/ABC", "20_Study/ａｂｃ"]);
+
+    expect(() => assertApprovedDestination("20_Study/Abc", existing)).toThrow(/ambiguous/i);
   });
 
   it.each([
@@ -80,4 +88,20 @@ describe("organizer paths", () => {
     expect(() => buildDestinationPath("20_Study", "  ", new Set())).toThrow();
     expect(() => buildDestinationPath("20_Study", "bad\u007ftitle", new Set())).toThrow();
   });
+
+  it("enforces normalized UTF-8 component, filename, and total path byte bounds", () => {
+    const oversizedComponent = "한".repeat(81);
+    expect(() => assertInboxSource(`Agent-Inbox/${oversizedComponent}/note.md`)).toThrow(/byte/i);
+
+    const bounded = buildDestinationPath("20_Study", "한".repeat(100), new Set());
+    expect(Buffer.byteLength(pathBasename(bounded).normalize("NFKC"), "utf8")).toBeLessThanOrEqual(240);
+
+    const longSegment = "한".repeat(70);
+    const longDestination = `20_Study/${longSegment}/${longSegment}/${longSegment}/${longSegment}`;
+    expect(() => buildDestinationPath(longDestination, "한".repeat(100), new Set())).toThrow(/byte/i);
+  });
 });
+
+function pathBasename(value: string): string {
+  return value.slice(value.lastIndexOf("/") + 1);
+}

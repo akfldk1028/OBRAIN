@@ -1,4 +1,5 @@
 import {
+  appendFile,
   lstat,
   mkdir,
   mkdtemp,
@@ -13,6 +14,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { scanStableInbox } from "../src/organizer/scanner.js";
 
 const readProbe = vi.hoisted(() => ({ paths: [] as string[] }));
+const ioProbe = vi.hoisted(() => ({
+  beforeOpen: undefined as undefined | ((filePath: string) => Promise<void>),
+  beforeRead: undefined as undefined | ((filePath: string) => Promise<void>),
+  handleReads: [] as Array<{ path: string; requestedBytes: number }>,
+}));
 
 vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
@@ -21,6 +27,29 @@ vi.mock("node:fs/promises", async (importOriginal) => {
     readFile: async (...args: Parameters<typeof actual.readFile>) => {
       readProbe.paths.push(String(args[0]));
       return actual.readFile(...args);
+    },
+    open: async (...args: Parameters<typeof actual.open>) => {
+      const filePath = String(args[0]);
+      const beforeOpen = ioProbe.beforeOpen;
+      ioProbe.beforeOpen = undefined;
+      if (beforeOpen) await beforeOpen(filePath);
+      const handle = await actual.open(...args);
+      return new Proxy(handle, {
+        get(target, property) {
+          if (property === "read") {
+            return async (buffer: Uint8Array, offset: number, length: number, position: number) => {
+              const requestedBytes = length;
+              ioProbe.handleReads.push({ path: filePath, requestedBytes });
+              const beforeRead = ioProbe.beforeRead;
+              ioProbe.beforeRead = undefined;
+              if (beforeRead) await beforeRead(filePath);
+              return target.read(buffer, offset, length, position);
+            };
+          }
+          const value = Reflect.get(target, property, target) as unknown;
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
     },
   };
 });
@@ -48,6 +77,9 @@ async function writeAgedFile(
 
 afterEach(async () => {
   readProbe.paths.length = 0;
+  ioProbe.beforeOpen = undefined;
+  ioProbe.beforeRead = undefined;
+  ioProbe.handleReads.length = 0;
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
@@ -75,7 +107,27 @@ describe("stable Inbox scanner", () => {
       size: 11,
       mtimeMs: expectedStat.mtimeMs,
     }]);
-    expect(readProbe.paths).toEqual([stable]);
+    expect(readProbe.paths).toEqual([]);
+  });
+
+  it("preserves exact on-disk Unicode spelling in candidate paths", async () => {
+    const root = await makeVault();
+    await writeAgedFile(path.join(root, "Agent-Inbox", "Ｆｕｌｌ.md"), "fullwidth", 600);
+
+    const candidates = await scanStableInbox({ root, minStableSeconds: 300, nowMs });
+
+    expect(candidates.map((candidate) => candidate.path)).toEqual(["Agent-Inbox/Ｆｕｌｌ.md"]);
+  });
+
+  it("rejects ambiguous case-insensitive NFKC-equivalent on-disk paths before reading", async () => {
+    const root = await makeVault();
+    const inbox = path.join(root, "Agent-Inbox");
+    await writeAgedFile(path.join(inbox, "ABC.md"), "ascii", 600);
+    await writeAgedFile(path.join(inbox, "ａｂｃ.md"), "fullwidth lower", 600);
+
+    await expect(scanStableInbox({ root, minStableSeconds: 300, nowMs })).rejects.toThrow(/ambiguous/i);
+    expect(readProbe.paths).toEqual([]);
+    expect(ioProbe.handleReads).toEqual([]);
   });
 
   it("includes the exact stability boundary and sorts recursively by POSIX path", async () => {
@@ -149,5 +201,46 @@ describe("stable Inbox scanner", () => {
 
     await expect(scanStableInbox({ root, minStableSeconds: 300, nowMs })).rejects.toThrow(/symlink/i);
     expect(readProbe.paths).toEqual([]);
+  });
+
+  it("rejects a supplied Vault root symlink or junction before canonicalization", async () => {
+    const root = await makeVault();
+    const aliases = await mkdtemp(path.join(os.tmpdir(), "brain-scanner-alias-"));
+    roots.push(aliases);
+    const alias = path.join(aliases, "vault-link");
+    await symlink(root, alias, "junction");
+
+    await expect(scanStableInbox({ root: alias, minStableSeconds: 300, nowMs })).rejects.toThrow(/root.*symlink/i);
+  });
+
+  it("discards a candidate replaced by an escaping junction before its handle opens", async () => {
+    const root = await makeVault();
+    const candidateDirectory = path.join(root, "Agent-Inbox", "race");
+    await writeAgedFile(path.join(candidateDirectory, "note.md"), "inside", 600);
+    const outside = await mkdtemp(path.join(os.tmpdir(), "brain-scanner-outside-"));
+    roots.push(outside);
+    await writeAgedFile(path.join(outside, "note.md"), "secret", 600);
+    ioProbe.beforeOpen = async () => {
+      await rm(candidateDirectory, { recursive: true, force: true });
+      await symlink(outside, candidateDirectory, "junction");
+    };
+
+    expect(await scanStableInbox({ root, minStableSeconds: 300, nowMs })).toEqual([]);
+    expect(readProbe.paths).toEqual([]);
+    expect(ioProbe.handleReads).toEqual([]);
+  });
+
+  it("reads at most maxBytes plus one and discards growth through the open handle", async () => {
+    const root = await makeVault();
+    const candidate = path.join(root, "Agent-Inbox", "growing.md");
+    await writeAgedFile(candidate, "aaaa", 600);
+    ioProbe.beforeRead = async (filePath) => {
+      await appendFile(filePath, "b");
+    };
+
+    expect(await scanStableInbox({ root, minStableSeconds: 300, nowMs, maxBytes: 4 })).toEqual([]);
+    expect(readProbe.paths).toEqual([]);
+    expect(ioProbe.handleReads.length).toBeGreaterThan(0);
+    expect(ioProbe.handleReads.every((read) => read.requestedBytes <= 5)).toBe(true);
   });
 });
