@@ -25,7 +25,7 @@ const sourcePath = "Agent-Inbox/source.md";
 const destinationPath = "20_Study/22_RL/organized.md";
 const mocPath = areaMocPath(study);
 const canvasPath = areaCanvasPath(study);
-const currentMoc = `# Study\n\n<!-- brain-auto:start note-index -->\nold\n<!-- brain-auto:end note-index -->\n`;
+const currentMoc = `# Study\n\n<!-- brain-auto:start note-index -->\n<!-- brain-auto:end note-index -->\n`;
 const currentCanvas = renderAreaCanvas(study);
 const nextMoc = replaceManagedMocIndex(currentMoc, [{ path: destinationPath, title: "Organized" }]);
 const nextCanvas = renderManagedAreaCanvas({
@@ -105,13 +105,13 @@ async function fixture(): Promise<Fixture> {
 
 function engine(
   input: Fixture,
-  options: Partial<Omit<OrganizerTransactionEngineOptions, "recoveryRoot" | "store">> = {},
+  options: Partial<OrganizerTransactionEngineOptions> = {},
 ) {
   return new OrganizerTransactionEngine({
-    ...options,
-    recoveryRoot: input.recovery,
-    store: input.store,
+    recoveryRoot: options.recoveryRoot ?? input.recovery,
+    store: options.store ?? input.store,
     now: options.now ?? (() => "2026-09-03T01:00:00.000Z"),
+    onEvent: options.onEvent,
   });
 }
 
@@ -126,6 +126,41 @@ async function vaultState(input: Fixture) {
     moc: await read(mocPath),
     canvas: await read(canvasPath),
   };
+}
+
+async function resetToPreDatabaseCrash(input: Fixture): Promise<void> {
+  input.store.close();
+  const db = new Database(input.database);
+  db.prepare("DELETE FROM organizer_transactions WHERE id=?").run(input.plan.id);
+  db.prepare("UPDATE organizer_proposals SET status='pending', proposal_json=? WHERE id=?")
+    .run(JSON.stringify(input.proposal), input.proposal.id);
+  db.close();
+  input.store = new OrganizerStore(input.database);
+  cleanups.push(async () => input.store.close());
+}
+
+async function resetUndoneDatabaseToApplied(input: Fixture): Promise<void> {
+  input.store.close();
+  const db = new Database(input.database);
+  db.prepare("UPDATE organizer_transactions SET undone_at=NULL WHERE id=?").run(input.plan.id);
+  db.close();
+  input.store = new OrganizerStore(input.database);
+  cleanups.push(async () => input.store.close());
+}
+
+async function replaceProposalSource(input: Fixture, nextSourcePath: string): Promise<void> {
+  await rm(path.join(input.vault, ...input.proposal.sourcePath.split("/")));
+  await writeFile(path.join(input.vault, ...nextSourcePath.split("/")), original);
+  const proposal = { ...input.proposal, sourcePath: nextSourcePath };
+  input.store.close();
+  const db = new Database(input.database);
+  db.prepare("UPDATE organizer_proposals SET source_path=?, proposal_json=? WHERE id=?")
+    .run(nextSourcePath, JSON.stringify(proposal), proposal.id);
+  db.close();
+  input.store = new OrganizerStore(input.database);
+  input.proposal = proposal;
+  input.plan = { ...input.plan, proposal };
+  cleanups.push(async () => input.store.close());
 }
 
 describe("organizer transaction engine", () => {
@@ -396,6 +431,7 @@ describe("organizer transaction engine", () => {
     const first = await engine(input).recover();
     expect(first).toEqual([expect.objectContaining({ id: input.plan.id, outcome: "rolled_back" })]);
     expect(await vaultState(input)).toEqual({ source: original, destination: undefined, moc: currentMoc, canvas: currentCanvas });
+    expect(input.store.getProposal(input.proposal.id)?.status).toBe("rejected");
     expect(await engine(input).recover()).toEqual([]);
     const report = JSON.parse(await readFile(path.join(transactionDirectory, "recovery-report.json"), "utf8"));
     expect(report).toEqual(expect.objectContaining({ id: input.plan.id, outcome: "rolled_back" }));
@@ -541,5 +577,284 @@ describe("organizer transaction engine", () => {
     expect(await engine(input).recover()).toEqual([expect.objectContaining({ outcome: "undo_rolled_back" })]);
     expect(await vaultState(input)).toEqual({ source: undefined, destination: organized, moc: nextMoc, canvas: nextCanvas });
     expect(await engine(input).recover()).toEqual([]);
+  });
+
+  it.each(["Agent-Inbox/Ｆ.md", "Agent-Inbox/e\u0301.md"])('applies a scanner-accepted exact Unicode source spelling %s', async (unicodePath) => {
+    const input = await fixture();
+    await replaceProposalSource(input, unicodePath);
+    await engine(input).apply(input.plan);
+    expect(await readFile(path.join(input.vault, ...destinationPath.split("/")), "utf8")).toBe(organized);
+    await expect(lstat(path.join(input.vault, ...unicodePath.split("/")))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rejects exact or normalized path components above the Task 2 UTF-8 limit", async () => {
+    const input = await fixture();
+    const longPath = `Agent-Inbox/${"가".repeat(81)}.md`;
+    await replaceProposalSource(input, longPath);
+    const before = await vaultState(input);
+    await expect(engine(input).apply(input.plan)).rejects.toThrow(/component|byte|limit/i);
+    expect(await vaultState(input)).toEqual(before);
+  });
+
+  it("preflights every apply rollback snapshot before mutating the crash-state vault", async () => {
+    const input = await fixture();
+    await engine(input).apply(input.plan);
+    await resetToPreDatabaseCrash(input);
+    const transactionDirectory = path.join(input.recovery, input.plan.id);
+    await writeFile(path.join(transactionDirectory, "managed-001.snapshot"), "corrupt snapshot");
+    const before = await vaultState(input);
+    await expect(engine(input).recover()).rejects.toThrow(/snapshot|hash/i);
+    expect(await vaultState(input)).toEqual(before);
+  });
+
+  it("restores source first and removes the owned destination last during apply recovery", async () => {
+    const input = await fixture();
+    await engine(input).apply(input.plan);
+    await resetToPreDatabaseCrash(input);
+    const events: TransactionEvent[] = [];
+    await engine(input, { onEvent: (event) => { events.push(event); } }).recover();
+    const names = events.map((event) => event.name);
+    expect(names.indexOf("recovery_source_restored")).toBeLessThan(names.indexOf("recovery_managed_restored"));
+    expect(names.indexOf("recovery_managed_restored")).toBeLessThan(names.indexOf("recovery_destination_removed"));
+  });
+
+  it.each([
+    ["recovery_source_restored", undefined],
+    ["recovery_managed_restored", 0],
+    ["recovery_managed_restored", 1],
+    ["recovery_destination_removed", undefined],
+  ] as const)("replays apply recovery after an interruption at %s %s", async (name, managedIndex) => {
+    const input = await fixture();
+    await engine(input).apply(input.plan);
+    await resetToPreDatabaseCrash(input);
+    await expect(engine(input, {
+      onEvent: (event) => {
+        if (event.name === name && (managedIndex === undefined || event.managedIndex === managedIndex)) throw new Error(`crash ${name}`);
+      },
+    }).recover()).rejects.toThrow(`crash ${name}`);
+    await expect(engine(input).recover()).resolves.toEqual([expect.objectContaining({ outcome: "rolled_back" })]);
+    expect(await vaultState(input)).toEqual({ source: original, destination: undefined, moc: currentMoc, canvas: currentCanvas });
+  });
+
+  it("preflights every undo rollback image before mutating an interrupted undo", async () => {
+    const input = await fixture();
+    await engine(input).apply(input.plan);
+    await new OrganizerTransactionEngine({ recoveryRoot: input.recovery, store: input.store, now: () => "2026-09-03T02:00:00.000Z" }).undo(input.plan.id);
+    input.store.close();
+    const db = new Database(input.database);
+    db.prepare("UPDATE organizer_transactions SET undone_at=NULL WHERE id=?").run(input.plan.id);
+    db.close();
+    input.store = new OrganizerStore(input.database);
+    cleanups.push(async () => input.store.close());
+    const transactionDirectory = path.join(input.recovery, input.plan.id);
+    await writeFile(path.join(transactionDirectory, "undo-managed-001.snapshot"), "corrupt snapshot");
+    const before = await vaultState(input);
+    await expect(engine(input).recover()).rejects.toThrow(/snapshot|hash/i);
+    expect(await vaultState(input)).toEqual(before);
+  });
+
+  it.each([
+    ["undo_recovery_destination_restored", undefined],
+    ["undo_recovery_managed_restored", 0],
+    ["undo_recovery_managed_restored", 1],
+    ["undo_recovery_source_removed", undefined],
+  ] as const)("replays undo rollback after an interruption at %s %s", async (name, managedIndex) => {
+    const input = await fixture();
+    await engine(input).apply(input.plan);
+    await new OrganizerTransactionEngine({ recoveryRoot: input.recovery, store: input.store, now: () => "2026-09-03T02:00:00.000Z" }).undo(input.plan.id);
+    await resetUndoneDatabaseToApplied(input);
+    await expect(engine(input, {
+      onEvent: (event) => {
+        if (event.name === name && (managedIndex === undefined || event.managedIndex === managedIndex)) throw new Error(`crash ${name}`);
+      },
+    }).recover()).rejects.toThrow(`crash ${name}`);
+    await expect(engine(input).recover()).resolves.toEqual([expect.objectContaining({ outcome: "undo_rolled_back" })]);
+    expect(await vaultState(input)).toEqual({ source: undefined, destination: organized, moc: nextMoc, canvas: nextCanvas });
+  });
+
+  it("revalidates a managed target after its temp file is synced and immediately before rename", async () => {
+    const input = await fixture();
+    const mocAbsolute = path.join(input.vault, ...mocPath.split("/"));
+    await expect(engine(input, {
+      onEvent: async (event) => {
+        if ((event.name as string) === "managed_temp_synced" && event.managedIndex === 1) {
+          await rename(mocAbsolute, `${mocAbsolute}.moved-after-sync`);
+          await writeFile(mocAbsolute, currentMoc);
+        }
+      },
+    }).apply(input.plan)).rejects.toThrow(/identity|changed/i);
+    expect(await readFile(`${mocAbsolute}.moved-after-sync`, "utf8")).toBe(currentMoc);
+    expect(input.store.getTransaction(input.plan.id)).toBeUndefined();
+  });
+
+  it.each(["disappear", "replace"] as const)("revalidates source %s immediately before unlink", async (kind) => {
+    const input = await fixture();
+    const sourceAbsolute = path.join(input.vault, ...sourcePath.split("/"));
+    await expect(engine(input, {
+      onEvent: async (event) => {
+        if ((event.name as string) === "before_source_unlink") {
+          if (kind === "disappear") await rm(sourceAbsolute);
+          else {
+            await rename(sourceAbsolute, `${sourceAbsolute}.moved-before-unlink`);
+            await writeFile(sourceAbsolute, original);
+          }
+        }
+      },
+    }).apply(input.plan)).rejects.toThrow(/stale|changed|identity/i);
+    expect(input.store.getTransaction(input.plan.id)).toBeUndefined();
+  });
+
+  it("rejects an inside-Vault recovery root before creating it", async () => {
+    const input = await fixture();
+    const inside = path.join(input.vault, "private-recovery");
+    await expect(engine(input, { recoveryRoot: inside } as never).apply(input.plan)).rejects.toThrow(/outside/i);
+    await expect(lstat(inside)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await vaultState(input)).toEqual({ source: original, destination: undefined, moc: currentMoc, canvas: currentCanvas });
+  });
+
+  it.each(["direct", "ancestor"] as const)("rejects a %s recovery-root symlink before chmod or creation", async (kind) => {
+    const input = await fixture();
+    const outside = path.join(input.root, `outside-${kind}`);
+    await mkdir(outside);
+    const linkPath = path.join(input.root, `recovery-link-${kind}`);
+    await symlink(outside, linkPath, process.platform === "win32" ? "junction" : "dir");
+    const recoveryRoot = kind === "direct" ? linkPath : path.join(linkPath, "nested");
+    await expect(engine(input, { recoveryRoot } as never).apply(input.plan)).rejects.toThrow(/symlink|junction|safe/i);
+    if (kind === "ancestor") await expect(lstat(path.join(outside, "nested"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("durably links each newly created recovery component before creating the next", async () => {
+    const input = await fixture();
+    const recoveryRoot = path.join(input.root, "state", "transactions");
+    const events: TransactionEvent[] = [];
+    await engine(input, { recoveryRoot, onEvent: (event: TransactionEvent) => { events.push(event); } } as never).apply(input.plan);
+    const names = events.map((event) => event.name as string);
+    const creates = names.map((name, index) => name === "recovery_component_created" ? index : -1).filter((index) => index >= 0);
+    const syncs = names.map((name, index) => name === "recovery_parent_synced" ? index : -1).filter((index) => index >= 0);
+    expect(creates.length).toBeGreaterThanOrEqual(2);
+    expect(syncs.length).toBe(creates.length);
+    expect(creates[0]).toBeLessThan(syncs[0]);
+    expect(syncs[0]).toBeLessThan(creates[1]);
+    expect(syncs.at(-1)!).toBeLessThan(names.indexOf("after_source_snapshot_sync"));
+  });
+
+  it("validates every generated MOC link target before any mutation", async () => {
+    const input = await fixture();
+    const badMoc = replaceManagedMocIndex(currentMoc, [
+      { path: destinationPath, title: "Organized" },
+      { path: "20_Study/missing.md", title: "Missing" },
+    ]);
+    const plan = {
+      ...input.plan,
+      managedReplacements: input.plan.managedReplacements.map((replacement) => replacement.relativePath === mocPath
+        ? { ...replacement, content: badMoc }
+        : replacement),
+    };
+    await expect(engine(input).apply(plan)).rejects.toThrow(/MOC|link|exist/i);
+    expect(await vaultState(input)).toEqual({ source: original, destination: undefined, moc: currentMoc, canvas: currentCanvas });
+  });
+
+  it.skipIf(process.platform === "win32")("rejects case-ambiguous generated MOC link targets", async () => {
+    const input = await fixture();
+    await writeFile(path.join(input.vault, "20_Study", "Case.md"), "one");
+    await writeFile(path.join(input.vault, "20_Study", "case.md"), "two");
+    const badMoc = replaceManagedMocIndex(currentMoc, [{ path: "20_Study/Case.md", title: "Case" }]);
+    const plan = {
+      ...input.plan,
+      managedReplacements: input.plan.managedReplacements.map((replacement) => replacement.relativePath === mocPath
+        ? { ...replacement, content: badMoc }
+        : replacement),
+    };
+    await expect(engine(input).apply(plan)).rejects.toThrow(/ambiguous|collision/i);
+  });
+
+  it("refuses to finalize recovery when the database has the same ID but different transaction content", async () => {
+    const input = await fixture();
+    await engine(input).apply(input.plan);
+    input.store.close();
+    const db = new Database(input.database);
+    db.prepare("UPDATE organizer_transactions SET destination_hash=? WHERE id=?").run("f".repeat(64), input.plan.id);
+    db.close();
+    input.store = new OrganizerStore(input.database);
+    cleanups.push(async () => input.store.close());
+    const before = await vaultState(input);
+    await expect(engine(input).recover()).rejects.toThrow(/database|match|reconcile/i);
+    expect(await vaultState(input)).toEqual(before);
+  });
+
+  it("recreates a missing terminal recovery report on the next recovery pass", async () => {
+    const input = await fixture();
+    await engine(input).apply(input.plan);
+    await engine(input).recover();
+    const reportPath = path.join(input.recovery, input.plan.id, "recovery-report.json");
+    await rm(reportPath);
+    expect(await engine(input).recover()).toEqual([expect.objectContaining({ id: input.plan.id, outcome: "committed" })]);
+    expect(JSON.parse(await readFile(reportPath, "utf8"))).toEqual(expect.objectContaining({ outcome: "committed" }));
+  });
+
+  it.each([
+    "before_destination_link",
+    "before_destination_chmod",
+    "before_destination_directory_sync",
+    "before_destination_temp_unlink",
+  ])("fails safely when destination publication injects %s", async (fault) => {
+    const input = await fixture();
+    await expect(engine(input, {
+      onEvent: (event) => { if ((event.name as string) === fault) throw new Error(`injected ${fault}`); },
+    }).apply(input.plan)).rejects.toThrow(`injected ${fault}`);
+    expect(await vaultState(input)).toEqual({ source: original, destination: undefined, moc: currentMoc, canvas: currentCanvas });
+    expect(input.store.getTransaction(input.plan.id)).toBeUndefined();
+  });
+
+  it("leaves recoverable state and no bookkeeping when owned destination unlink fails", async () => {
+    const input = await fixture();
+    await expect(engine(input, {
+      onEvent: (event) => {
+        if (event.name === "destination_published") throw new Error("trigger rollback");
+        if ((event.name as string) === "before_recovery_destination_unlink") throw new Error("injected target unlink");
+      },
+    }).apply(input.plan)).rejects.toThrow(/rollback could not complete/i);
+    expect(input.store.getProposal(input.proposal.id)?.status).toBe("pending");
+    expect(input.store.getTransaction(input.plan.id)).toBeUndefined();
+    expect((await vaultState(input)).destination).toBe(organized);
+  });
+
+  it("removes only transaction-derived valid orphan Vault temps during recovery", async () => {
+    const input = await fixture();
+    await engine(input).apply(input.plan);
+    await resetToPreDatabaseCrash(input);
+    const mocAbsolute = path.join(input.vault, ...mocPath.split("/"));
+    const orphan = path.join(path.dirname(mocAbsolute), `.brain-organizer-${input.plan.id}-recover-managed-001.tmp`);
+    await writeFile(orphan, currentMoc);
+    await engine(input).recover();
+    await expect(lstat(orphan)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await vaultState(input)).toEqual({ source: original, destination: undefined, moc: currentMoc, canvas: currentCanvas });
+  });
+
+  it("fails closed before rollback when a transaction-derived orphan temp has unexpected content", async () => {
+    const input = await fixture();
+    await engine(input).apply(input.plan);
+    await resetToPreDatabaseCrash(input);
+    const mocAbsolute = path.join(input.vault, ...mocPath.split("/"));
+    const orphan = path.join(path.dirname(mocAbsolute), `.brain-organizer-${input.plan.id}-recover-managed-001.tmp`);
+    await writeFile(orphan, "not an owned before-image");
+    const before = await vaultState(input);
+    await expect(engine(input).recover()).rejects.toThrow(/temporary|content|invalid/i);
+    expect(await vaultState(input)).toEqual(before);
+    expect(await readFile(orphan, "utf8")).toBe("not an owned before-image");
+  });
+
+  it("retains recovery automatically and exposes only backup-gated 30-day terminal cleanup", async () => {
+    const input = await fixture();
+    await engine(input).apply(input.plan);
+    await engine(input).recover();
+    const directory = path.join(input.recovery, input.plan.id);
+    await expect(engine(input).cleanupRecovery({ now: "2026-10-04T01:00:00.000Z", backupVerified: false }))
+      .rejects.toThrow(/backup/i);
+    expect((await lstat(directory)).isDirectory()).toBe(true);
+    expect(await engine(input).cleanupRecovery({ now: "2026-09-20T01:00:00.000Z", backupVerified: true })).toEqual([]);
+    expect(await engine(input).cleanupRecovery({ now: "2026-10-04T01:00:00.000Z", backupVerified: true }))
+      .toEqual([input.plan.id]);
+    await expect(lstat(directory)).rejects.toMatchObject({ code: "ENOENT" });
   });
 });

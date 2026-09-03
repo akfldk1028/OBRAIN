@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { constants, type BigIntStats } from "node:fs";
 import {
   chmod,
@@ -27,6 +27,7 @@ const MAX_MANIFEST_BYTES = 65_536;
 const MAX_REPORT_BYTES = 4_096;
 const MAX_ARTIFACT_BYTES = 2_097_152;
 const MAX_MANAGED_REPLACEMENTS = 32;
+const COMPONENT_BYTES = 240;
 const PATH_BYTES = 1_024;
 const ID_BYTES = 160;
 const VAULT_BYTES = 256;
@@ -50,6 +51,10 @@ const identifier = z.string().min(1).max(ID_BYTES).regex(/^ORG-[A-Za-z0-9_-]+$/u
 const hashSchema = z.string().regex(HASH);
 const relativePathSchema = boundedText(1, PATH_BYTES);
 const modeSchema = z.number().int().min(0).max(0o777);
+const timestampSchema = boundedText(1, 64).refine(
+  (value) => z.string().datetime({ offset: true }).safeParse(value).success && Number.isFinite(Date.parse(value)),
+  "invalid timestamp",
+);
 
 const managedSnapshotSchema = z.object({
   relativePath: relativePathSchema,
@@ -74,6 +79,7 @@ const manifestSchema = z.object({
   version: z.literal(1),
   id: identifier,
   proposalId: boundedText(1, ID_BYTES),
+  proposalHash: hashSchema,
   vault: boundedText(1, VAULT_BYTES),
   vaultRoot: boundedText(1, PATH_BYTES * 2),
   sourcePath: relativePathSchema,
@@ -82,6 +88,9 @@ const manifestSchema = z.object({
   sourceHash: hashSchema,
   sourceMode: modeSchema,
   destinationHash: hashSchema,
+  destinationOwned: z.boolean(),
+  appliedAt: timestampSchema,
+  undoneAt: timestampSchema.optional(),
   managed: z.array(managedSnapshotSchema).max(MAX_MANAGED_REPLACEMENTS),
   state: z.enum(["prepared", "vault_applied", "committed", "rolled_back", "undo_prepared", "undo_vault_applied", "undone"]),
   undo: undoSnapshotSchema.optional(),
@@ -93,7 +102,7 @@ const recoveryReportSchema = z.object({
   version: z.literal(1),
   id: identifier,
   outcome: z.enum(["rolled_back", "committed", "undo_rolled_back", "undone"]),
-  at: boundedText(1, 64).refine((value) => Number.isFinite(Date.parse(value)), "invalid report timestamp"),
+  at: timestampSchema,
 }).strict();
 
 export interface ManagedReplacement {
@@ -115,16 +124,31 @@ export type TransactionEventName =
   | "after_managed_snapshot_sync"
   | "after_manifest_sync"
   | "manifest_directory_synced"
+  | "recovery_component_created"
+  | "recovery_parent_synced"
   | "before_destination_publish"
+  | "before_destination_link"
+  | "before_destination_chmod"
+  | "before_destination_directory_sync"
+  | "before_destination_temp_unlink"
   | "destination_published"
   | "before_managed_publish"
+  | "managed_temp_synced"
   | "managed_published"
+  | "before_source_unlink"
   | "source_removed"
   | "before_database_commit"
   | "database_committed"
   | "recovery_destination_removed"
+  | "before_recovery_destination_unlink"
   | "recovery_managed_restored"
   | "recovery_source_restored"
+  | "before_undo_recovery_destination_publish"
+  | "undo_recovery_destination_restored"
+  | "before_undo_recovery_managed_publish"
+  | "undo_recovery_managed_restored"
+  | "before_undo_recovery_source_unlink"
+  | "undo_recovery_source_removed"
   | "after_undo_managed_publish"
   | "after_undo_source_publish"
   | "after_undo_destination_remove"
@@ -141,6 +165,11 @@ export interface RecoveryReport {
   id: string;
   outcome: "rolled_back" | "committed" | "undo_rolled_back" | "undone";
   at: string;
+}
+
+export interface RecoveryCleanupInput {
+  now: string;
+  backupVerified: boolean;
 }
 
 export interface OrganizerTransactionEngineOptions {
@@ -184,6 +213,10 @@ function digest(value: string | Buffer): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
+function proposalRecoveryHash(proposal: StoredProposal): string {
+  return digest(JSON.stringify({ ...proposal, status: "pending" }));
+}
+
 function collisionKey(value: string): string {
   return value.normalize("NFKC").toLocaleLowerCase("en-US");
 }
@@ -198,6 +231,11 @@ function sameIdentity(left: BigIntStats, right: BigIntStats): boolean {
   return left.dev === right.dev && left.ino === right.ino;
 }
 
+function provableIdentity(left: BigIntStats, right: BigIntStats): boolean {
+  return !(left.dev === 0n && left.ino === 0n) && !(right.dev === 0n && right.ino === 0n)
+    && left.dev === right.dev && left.ino === right.ino;
+}
+
 function exactFileSnapshot(left: BigIntStats, right: BigIntStats): boolean {
   return left.isFile() && right.isFile() && sameIdentity(left, right)
     && left.size === right.size && left.mtimeNs === right.mtimeNs;
@@ -210,19 +248,23 @@ function safeMode(statValue: BigIntStats): number {
 function validateRelativePath(value: string, extension?: ".md" | ".canvas"): string {
   if (
     !value
-    || value !== value.normalize("NFKC")
     || value.includes("\\")
     || path.isAbsolute(value)
     || path.posix.isAbsolute(value)
     || path.win32.isAbsolute(value)
     || CONTROL.test(value)
     || Buffer.byteLength(value, "utf8") > PATH_BYTES
-  ) throw new TransactionValidationError("transaction path is unsafe or not in exact NFKC form");
+    || Buffer.byteLength(value.normalize("NFKC"), "utf8") > PATH_BYTES
+  ) throw new TransactionValidationError("transaction path is unsafe or exceeds the byte limit");
   const segments = value.split("/");
   if (segments.some((segment) => (
     !segment || segment === "." || segment === ".." || segment.startsWith(".")
     || WINDOWS_INVALID.test(segment) || /[ .]$/u.test(segment) || WINDOWS_RESERVED.test(segment)
   ))) throw new TransactionValidationError("transaction path is unsafe");
+  if (segments.some((segment) => (
+    Buffer.byteLength(segment, "utf8") > COMPONENT_BYTES
+    || Buffer.byteLength(segment.normalize("NFKC"), "utf8") > COMPONENT_BYTES
+  ))) throw new TransactionValidationError("transaction path component exceeds the UTF-8 byte limit");
   if (segments.length - 1 > BRAIN_FOUNDATION_POLICY.maxDepth) throw new TransactionValidationError("transaction path exceeds maximum depth");
   if (extension && path.posix.extname(value).toLocaleLowerCase("en-US") !== extension) {
     throw new TransactionValidationError(`transaction path must end in ${extension}`);
@@ -269,22 +311,57 @@ async function writeAtomic(
   file: string,
   content: string | Buffer,
   mode: number,
-  afterSync?: () => Promise<void>,
+  input: {
+    tempPath?: string;
+    afterTempSync?: () => Promise<void>;
+    beforeRename?: () => Promise<void>;
+  } = {},
 ): Promise<void> {
   const directory = path.dirname(file);
-  const temp = path.join(directory, `.brain-organizer-${randomUUID()}.tmp`);
+  const temp = input.tempPath ?? recoveryAtomicTemp(directory, path.basename(file));
+  if (path.dirname(temp) !== directory) throw new TransactionValidationError("atomic temporary file must share the target directory");
   try {
     await writeSyncedExclusive(temp, content, mode);
-    await afterSync?.();
+    await input.afterTempSync?.();
+    await input.beforeRename?.();
     await rename(temp, file);
     await chmod(file, mode);
     await syncDirectory(directory);
-  } catch (error) {
-    await unlink(temp).catch((unlinkError: unknown) => {
-      if ((unlinkError as NodeJS.ErrnoException).code !== "ENOENT") throw unlinkError;
-    });
+  } catch (error: unknown) {
+    try {
+      await unlink(temp);
+      await syncDirectory(directory);
+    } catch (cleanupError: unknown) {
+      if ((cleanupError as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw new AggregateError([error, cleanupError], "atomic publication and temporary cleanup failed");
+      }
+    }
     throw error;
   }
+}
+
+function recoveryAtomicTemp(directory: string, filename: string): string {
+  if (!/^[A-Za-z0-9._-]+$/u.test(filename)) throw new TransactionValidationError("atomic target filename is invalid");
+  const owner = path.basename(directory);
+  if (!identifier.safeParse(owner).success) throw new TransactionValidationError("atomic recovery directory owner is invalid");
+  return path.join(directory, `.brain-organizer-${owner}-${filename}.tmp`);
+}
+
+async function discardAtomicRecoveryTemp(directory: string, filename: string, maxBytes: number): Promise<void> {
+  const temp = recoveryAtomicTemp(directory, filename);
+  let info: BigIntStats;
+  try { info = await lstat(temp, { bigint: true }); }
+  catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  if (info.isSymbolicLink() || !info.isFile()) throw new TransactionValidationError("atomic recovery temporary file is unsafe");
+  assertPrivateMode(info, 0o600, "atomic recovery temporary file");
+  await readBoundedFile(temp, maxBytes);
+  const current = await lstat(temp, { bigint: true });
+  if (!exactFileSnapshot(info, current)) throw new TransactionValidationError("atomic recovery temporary file changed identity");
+  await unlink(temp);
+  await syncDirectory(directory);
 }
 
 async function readBoundedFile(file: string, maxBytes: number): Promise<Buffer> {
@@ -332,8 +409,8 @@ async function exactEntry(parent: BoundDirectory, wanted: string, allowMissing: 
     if (allowMissing) return undefined;
     throw new TransactionValidationError("filesystem path does not exist");
   }
-  if (matches[0] !== wanted || wanted !== wanted.normalize("NFKC")) {
-    throw new TransactionValidationError("filesystem path does not have exact case and NFKC identity");
+  if (matches[0] !== wanted) {
+    throw new TransactionValidationError("filesystem path does not have exact spelling");
   }
   return matches[0];
 }
@@ -456,6 +533,37 @@ function managedMocEnvelope(content: Buffer | string): { prefix: string; suffix:
   return { prefix: text.slice(0, afterStart + newlineLength), suffix: text.slice(end) };
 }
 
+function managedMocLinks(content: Buffer | string): string[] {
+  const text = content.toString();
+  replaceManagedMocIndex(text, []);
+  const start = text.indexOf(MOC_START) + MOC_START.length;
+  const contentStart = start + (text.slice(start, start + 2) === "\r\n" ? 2 : 1);
+  const end = text.indexOf(MOC_END, contentStart);
+  const block = text.slice(contentStart, end).replace(/\r?\n$/u, "");
+  if (!block) return [];
+  return block.split(/\r?\n/u).map((line) => {
+    const match = /^- \[\[([^\]|]+)\|[^\]\r\n]*\]\]$/u.exec(line);
+    if (!match?.[1]) throw new TransactionValidationError("managed MOC generated block contains an invalid link entry");
+    return validateRelativePath(match[1], ".md");
+  });
+}
+
+async function validateMocLinks(
+  root: BoundDirectory,
+  content: Buffer | string,
+  destinationPath?: string,
+): Promise<void> {
+  const identities = new Set<string>();
+  for (const linkPath of managedMocLinks(content)) {
+    const key = collisionKey(linkPath);
+    if (identities.has(key)) throw new TransactionValidationError("managed MOC link identity is ambiguous");
+    identities.add(key);
+    if (destinationPath && linkPath === destinationPath) continue;
+    try { await bindFile(root, linkPath); }
+    catch (error) { throw new TransactionValidationError(`managed MOC link target does not exist or is ambiguous: ${(error as Error).message}`); }
+  }
+}
+
 function assertMocHumanBytesPreserved(before: Buffer, after: string): void {
   const beforeEnvelope = managedMocEnvelope(before);
   const afterEnvelope = managedMocEnvelope(after);
@@ -506,6 +614,7 @@ async function prepareApply(plan: TransactionPlan, stored: StoredProposal): Prom
   if (!area) throw new TransactionValidationError("destination area is not approved");
   const destinationMoc = await bindFile(root, areaMocPath(area));
   assertManagedContent(areaMocPath(area), destinationMoc.content);
+  await validateMocLinks(root, destinationMoc.content);
 
   const identities = new Set<string>();
   const managed: PreparedApply["managed"] = [];
@@ -527,6 +636,9 @@ async function prepareApply(plan: TransactionPlan, stored: StoredProposal): Prom
       await bindFile(root, requiredMoc);
       await validateCanvasReferences(root, parseCanvas(file.content, "current"), plan.proposal.destinationPath);
       await validateCanvasReferences(root, parseCanvas(replacement.content, "replacement"), plan.proposal.destinationPath);
+    } else {
+      await validateMocLinks(root, file.content);
+      await validateMocLinks(root, replacement.content, plan.proposal.destinationPath);
     }
     managed.push({ replacement: { ...replacement, relativePath }, file, afterHash: digest(replacement.content) });
     if (index >= MAX_MANAGED_REPLACEMENTS) throw new TransactionValidationError("managed replacement count exceeds limit");
@@ -535,17 +647,64 @@ async function prepareApply(plan: TransactionPlan, stored: StoredProposal): Prom
   return { root, source, requiredMoc: destinationMoc, destinationParent, destinationAbsolute: path.join(destinationParent.canonicalPath, destinationFilename), managed };
 }
 
-async function ensureRecoveryRoot(recoveryRoot: string, vaultCanonical?: string): Promise<string> {
+function assertPrivateMode(statValue: BigIntStats, expected: number, label: string): void {
+  if (process.platform === "win32") return;
+  if (safeMode(statValue) !== expected) throw new TransactionValidationError(`${label} permissions are not ${expected.toString(8)}`);
+}
+
+async function ensureRecoveryRoot(
+  recoveryRoot: string,
+  options: OrganizerTransactionEngineOptions,
+  input: { create: boolean; vaultCanonical?: string },
+): Promise<string | undefined> {
   if (!path.isAbsolute(recoveryRoot) || Buffer.byteLength(recoveryRoot, "utf8") > PATH_BYTES * 2) {
     throw new TransactionValidationError("recovery root must be a bounded absolute path");
   }
-  await mkdir(recoveryRoot, { recursive: true, mode: 0o700 });
-  await chmod(recoveryRoot, 0o700);
-  const info = await lstat(recoveryRoot);
-  if (info.isSymbolicLink() || !info.isDirectory()) throw new TransactionValidationError("recovery root is not a safe directory");
-  const canonical = await realpath(recoveryRoot);
-  if (vaultCanonical && !isOutside(vaultCanonical, canonical)) throw new TransactionValidationError("recovery root must be outside the vault");
-  return canonical;
+  const resolved = path.resolve(recoveryRoot);
+  if (input.vaultCanonical && !isOutside(input.vaultCanonical, resolved)) {
+    throw new TransactionValidationError("recovery root must be outside the vault");
+  }
+  const parsed = path.parse(resolved);
+  let current = parsed.root;
+  let parentCanonical = process.platform === "win32" ? parsed.root : await realpath(parsed.root);
+  for (const segment of resolved.slice(parsed.root.length).split(path.sep).filter(Boolean)) {
+    const next = path.join(current, segment);
+    let info: BigIntStats;
+    let created = false;
+    try {
+      info = await lstat(next, { bigint: true });
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      if (!input.create) return undefined;
+      await mkdir(next, { mode: 0o700 });
+      created = true;
+      await emit(options, { name: "recovery_component_created" });
+      await syncDirectory(current);
+      await emit(options, { name: "recovery_parent_synced" });
+      info = await lstat(next, { bigint: true });
+    }
+    if (info.isSymbolicLink() || !info.isDirectory()) throw new TransactionValidationError("recovery root ancestor is a symlink, junction, or unsafe path");
+    // On Windows, realpath of protected ancestors can fail even though lstat is
+    // permitted. lstat identifies reparse points without following them, so the
+    // exact resolved spelling remains the safer lineage value there.
+    const canonical = process.platform === "win32" ? next : await realpath(next);
+    const canonicalInfo = await lstat(next, { bigint: true });
+    if (!sameIdentity(info, canonicalInfo) || isOutside(parentCanonical, canonical)) {
+      throw new TransactionValidationError("recovery root ancestor changed or escaped");
+    }
+    if (created) {
+      await chmod(next, 0o700);
+      assertPrivateMode(await lstat(next, { bigint: true }), 0o700, "recovery directory");
+    }
+    current = next;
+    parentCanonical = canonical;
+  }
+  if (input.vaultCanonical && !isOutside(input.vaultCanonical, parentCanonical)) {
+    throw new TransactionValidationError("recovery root must be outside the vault");
+  }
+  const finalInfo = await lstat(current, { bigint: true });
+  assertPrivateMode(finalInfo, 0o700, "recovery root");
+  return parentCanonical;
 }
 
 async function makeTransactionDirectory(recoveryRoot: string, id: string): Promise<string> {
@@ -557,6 +716,7 @@ async function makeTransactionDirectory(recoveryRoot: string, id: string): Promi
     throw error;
   }
   await chmod(directory, 0o700);
+  assertPrivateMode(await lstat(directory, { bigint: true }), 0o700, "recovery transaction directory");
   await syncDirectory(recoveryRoot);
   return directory;
 }
@@ -573,6 +733,9 @@ function validateManifestSemantics(manifest: RecoveryManifest): void {
   }
   if (collisionKey(manifest.sourcePath) === collisionKey(manifest.destinationPath)) {
     throw new TransactionValidationError("recovery manifest source and destination collide");
+  }
+  if (["vault_applied", "committed", "undo_prepared", "undo_vault_applied", "undone"].includes(manifest.state) && !manifest.destinationOwned) {
+    throw new TransactionValidationError("recovery manifest destination ownership is inconsistent");
   }
   validateSnapshotFile(manifest.sourceSnapshotFile);
   const pathKeys = new Set<string>();
@@ -593,6 +756,12 @@ function validateManifestSemantics(manifest: RecoveryManifest): void {
   }
   if (["undo_prepared", "undo_vault_applied", "undone"].includes(manifest.state) && !manifest.undo) {
     throw new TransactionValidationError("recovery manifest undo snapshots are missing");
+  }
+  if ((manifest.undo !== undefined) !== (manifest.undoneAt !== undefined)) {
+    throw new TransactionValidationError("recovery manifest undo timestamp is inconsistent");
+  }
+  if (manifest.undoneAt && Date.parse(manifest.undoneAt) < Date.parse(manifest.appliedAt)) {
+    throw new TransactionValidationError("recovery manifest undo timestamp is before apply");
   }
   if (manifest.undo) {
     validateSnapshotFile(manifest.undo.destinationSnapshotFile);
@@ -623,7 +792,7 @@ async function writeManifest(
   validateManifestSemantics(value);
   const text = `${JSON.stringify(value, null, 2)}\n`;
   if (Buffer.byteLength(text, "utf8") > MAX_MANIFEST_BYTES) throw new TransactionValidationError("recovery manifest exceeds byte limit");
-  await writeAtomic(path.join(directory, "manifest.json"), text, 0o600, afterSync);
+  await writeAtomic(path.join(directory, "manifest.json"), text, 0o600, { afterTempSync: afterSync });
 }
 
 async function readRecoveryFile(directory: string, filename: string, maxBytes: number): Promise<Buffer> {
@@ -631,13 +800,19 @@ async function readRecoveryFile(directory: string, filename: string, maxBytes: n
   const file = path.join(directory, filename);
   const info = await lstat(file, { bigint: true });
   if (info.isSymbolicLink() || !info.isFile()) throw new TransactionValidationError("recovery snapshot is unsafe");
+  assertPrivateMode(info, 0o600, "recovery snapshot");
   return readBoundedFile(file, maxBytes);
 }
 
 async function readManifest(directory: string, expectedId: string): Promise<RecoveryManifest> {
   const file = path.join(directory, "manifest.json");
   let content: Buffer;
-  try { content = await readBoundedFile(file, MAX_MANIFEST_BYTES); }
+  try {
+    const info = await lstat(file, { bigint: true });
+    if (info.isSymbolicLink() || !info.isFile()) throw new Error("unsafe");
+    assertPrivateMode(info, 0o600, "recovery manifest");
+    content = await readBoundedFile(file, MAX_MANIFEST_BYTES);
+  }
   catch { throw new TransactionValidationError("recovery manifest is invalid or oversized"); }
   let raw: unknown;
   try { raw = JSON.parse(content.toString("utf8")); }
@@ -655,33 +830,96 @@ async function writeRecoveryReport(directory: string, report: RecoveryReport): P
   await writeAtomic(path.join(directory, "recovery-report.json"), text, 0o600);
 }
 
+async function readRecoveryReport(directory: string, expectedId: string): Promise<RecoveryReport | undefined> {
+  const file = path.join(directory, "recovery-report.json");
+  let info: BigIntStats;
+  try { info = await lstat(file, { bigint: true }); }
+  catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+  if (info.isSymbolicLink() || !info.isFile()) throw new TransactionValidationError("recovery report is unsafe");
+  assertPrivateMode(info, 0o600, "recovery report");
+  let raw: unknown;
+  try { raw = JSON.parse((await readBoundedFile(file, MAX_REPORT_BYTES)).toString("utf8")); }
+  catch { throw new TransactionValidationError("recovery report is invalid or oversized"); }
+  const parsed = recoveryReportSchema.safeParse(raw);
+  if (!parsed.success || parsed.data.id !== expectedId) throw new TransactionValidationError("recovery report schema is invalid");
+  return parsed.data;
+}
+
 async function publishCreateOnly(
   parent: BoundDirectory,
   target: string,
   content: string | Buffer,
   mode: number,
+  input: {
+    id: string;
+    role: string;
+    options?: OrganizerTransactionEngineOptions;
+    onOwned?: () => void | Promise<void>;
+  },
 ): Promise<boolean> {
-  const temp = path.join(parent.canonicalPath, `.brain-organizer-${randomUUID()}.tmp`);
-  let published = false;
+  const temp = transactionTemp(parent, input.id, input.role);
+  let tempExists = false;
+  let cleanupError: unknown;
   try {
     await writeSyncedExclusive(temp, content, mode);
+    tempExists = true;
+    if (input.role === "destination" && input.options) await emit(input.options, { name: "before_destination_link" });
+    await assertDestinationAbsent(parent, path.basename(target));
     await link(temp, target);
-    published = true;
+    const [tempInfo, targetInfo] = await Promise.all([
+      lstat(temp, { bigint: true }),
+      lstat(target, { bigint: true }),
+    ]);
+    if (!tempInfo.isFile() || !targetInfo.isFile() || !provableIdentity(tempInfo, targetInfo)) {
+      throw new TransactionValidationError("create-only target ownership could not be proven");
+    }
+    await input.onOwned?.();
+    if (input.role === "destination" && input.options) await emit(input.options, { name: "before_destination_chmod" });
     await chmod(target, mode);
+    if (input.role === "destination" && input.options) await emit(input.options, { name: "before_destination_directory_sync" });
+    await syncDirectory(parent.canonicalPath);
+    if (input.role === "destination" && input.options) await emit(input.options, { name: "before_destination_temp_unlink" });
+    await unlink(temp);
+    tempExists = false;
     await syncDirectory(parent.canonicalPath);
     return true;
-  } catch (error) {
-    if (published) await unlink(target).catch(() => undefined);
+  } catch (error: unknown) {
+    if (tempExists) {
+      try {
+        await unlink(temp);
+        tempExists = false;
+        await syncDirectory(parent.canonicalPath);
+      } catch (next: unknown) {
+        if ((next as NodeJS.ErrnoException).code !== "ENOENT") cleanupError = next;
+      }
+    }
+    if (cleanupError) throw new AggregateError([error, cleanupError], "create-only publication and temporary cleanup failed");
     throw error;
-  } finally {
-    await unlink(temp).catch((error: unknown) => {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    });
   }
 }
 
-async function replaceBoundFile(file: BoundFile, content: string | Buffer, mode: number): Promise<void> {
-  await writeAtomic(file.absolutePath, content, mode);
+function transactionTemp(file: BoundFile | BoundDirectory, id: string, role: string, index?: number): string {
+  identifier.parse(id);
+  if (!/^[a-z-]+$/u.test(role)) throw new TransactionValidationError("temporary file role is invalid");
+  const directory = "absolutePath" in file ? file.parent.canonicalPath : file.canonicalPath;
+  const suffix = index === undefined ? "" : `-${index.toString().padStart(3, "0")}`;
+  return path.join(directory, `.brain-organizer-${id}-${role}${suffix}.tmp`);
+}
+
+async function replaceBoundFile(
+  file: BoundFile,
+  content: string | Buffer,
+  mode: number,
+  input: { id: string; role: string; index?: number; afterTempSync?: () => Promise<void> },
+): Promise<void> {
+  await writeAtomic(file.absolutePath, content, mode, {
+    tempPath: transactionTemp(file, input.id, input.role, input.index),
+    afterTempSync: input.afterTempSync,
+    beforeRename: async () => revalidateFile(file, file.hash),
+  });
 }
 
 async function inspectBoundFile(
@@ -698,6 +936,41 @@ async function inspectBoundFile(
   return { parent, absolutePath, file: await bindFile(root, relativePath) };
 }
 
+interface OwnedTemporaryFile {
+  absolutePath: string;
+  parent: BoundDirectory;
+  stat: BigIntStats;
+  hash: string;
+}
+
+async function inspectOwnedTemporaryFile(
+  parent: BoundDirectory,
+  absolutePath: string,
+  allowedHashes: ReadonlySet<string>,
+): Promise<OwnedTemporaryFile | undefined> {
+  let statValue: BigIntStats;
+  try { statValue = await lstat(absolutePath, { bigint: true }); }
+  catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+  if (statValue.isSymbolicLink() || !statValue.isFile()) throw new TransactionValidationError("owned transaction temporary path is unsafe");
+  const content = await readBoundedFile(absolutePath, MAX_ARTIFACT_BYTES);
+  const hash = digest(content);
+  if (!allowedHashes.has(hash)) throw new TransactionValidationError("owned transaction temporary file content is invalid");
+  return { absolutePath, parent, stat: statValue, hash };
+}
+
+async function removeOwnedTemporaryFile(file: OwnedTemporaryFile): Promise<void> {
+  await revalidateDirectory(file.parent);
+  const current = await lstat(file.absolutePath, { bigint: true });
+  if (!exactFileSnapshot(file.stat, current)) throw new TransactionValidationError("owned transaction temporary file changed identity");
+  const content = await readBoundedFile(file.absolutePath, MAX_ARTIFACT_BYTES);
+  if (digest(content) !== file.hash) throw new TransactionValidationError("owned transaction temporary file changed content");
+  await unlink(file.absolutePath);
+  await syncDirectory(file.parent.canonicalPath);
+}
+
 async function requirePublishedDestination(
   root: BoundDirectory,
   relativePath: string,
@@ -709,85 +982,245 @@ async function requirePublishedDestination(
   return inspected.file;
 }
 
+interface RecoverySnapshots {
+  source: Buffer;
+  managed: Map<string, Buffer>;
+  undoDestination?: Buffer;
+  undoManaged: Map<string, Buffer>;
+}
+
+async function loadRecoverySnapshots(manifest: RecoveryManifest, directory: string): Promise<RecoverySnapshots> {
+  const directoryInfo = await lstat(directory, { bigint: true });
+  if (directoryInfo.isSymbolicLink() || !directoryInfo.isDirectory()) throw new TransactionValidationError("recovery transaction directory is unsafe");
+  assertPrivateMode(directoryInfo, 0o700, "recovery transaction directory");
+  const source = await readRecoveryFile(directory, manifest.sourceSnapshotFile, MAX_ARTIFACT_BYTES);
+  if (digest(source) !== manifest.sourceHash) throw new TransactionValidationError("source recovery snapshot hash mismatch");
+  const managed = new Map<string, Buffer>();
+  for (const item of manifest.managed) {
+    const snapshot = await readRecoveryFile(directory, item.snapshotFile, MAX_ARTIFACT_BYTES);
+    if (digest(snapshot) !== item.beforeHash) throw new TransactionValidationError("managed recovery snapshot hash mismatch");
+    managed.set(item.relativePath, snapshot);
+  }
+  const undoManaged = new Map<string, Buffer>();
+  let undoDestination: Buffer | undefined;
+  if (manifest.undo) {
+    undoDestination = await readRecoveryFile(directory, manifest.undo.destinationSnapshotFile, MAX_ARTIFACT_BYTES);
+    if (digest(undoDestination) !== manifest.destinationHash) throw new TransactionValidationError("undo destination snapshot hash mismatch");
+    for (const item of manifest.undo.managed) {
+      const snapshot = await readRecoveryFile(directory, item.snapshotFile, MAX_ARTIFACT_BYTES);
+      if (digest(snapshot) !== item.hash) throw new TransactionValidationError("undo managed snapshot hash mismatch");
+      undoManaged.set(item.relativePath, snapshot);
+    }
+  }
+  return { source, managed, ...(undoDestination ? { undoDestination } : {}), undoManaged };
+}
+
+async function assertNoUnknownRecoveryArtifacts(manifest: RecoveryManifest, directory: string): Promise<void> {
+  const allowed = new Set<string>([
+    "manifest.json",
+    "recovery-report.json",
+    manifest.sourceSnapshotFile,
+    ...manifest.managed.map((item) => item.snapshotFile),
+    ...(manifest.undo ? [
+      manifest.undo.destinationSnapshotFile,
+      ...manifest.undo.managed.map((item) => item.snapshotFile),
+    ] : []),
+  ]);
+  const entries = await readdir(directory, { withFileTypes: true });
+  if (entries.length > MAX_MANAGED_REPLACEMENTS * 2 + 8 || entries.some((entry) => !entry.isFile() || !allowed.has(entry.name))) {
+    throw new TransactionValidationError("recovery directory contains an unverified artifact");
+  }
+}
+
+interface PreparedApplyRollback {
+  root: BoundDirectory;
+  source: Awaited<ReturnType<typeof inspectBoundFile>>;
+  managed: Array<{
+    index: number;
+    item: RecoveryManifest["managed"][number];
+    current: BoundFile;
+    snapshot: Buffer;
+    temps: OwnedTemporaryFile[];
+  }>;
+  destination?: BoundFile;
+  sourceTemps: OwnedTemporaryFile[];
+  destinationTemps: OwnedTemporaryFile[];
+  sourceSnapshot: Buffer;
+}
+
+async function preflightApplyRollback(
+  manifest: RecoveryManifest,
+  directory: string,
+  destinationOwned?: boolean,
+): Promise<PreparedApplyRollback> {
+  const snapshots = await loadRecoverySnapshots(manifest, directory);
+  const root = await bindRoot(manifest.vaultRoot);
+  const source = await inspectBoundFile(root, manifest.sourcePath);
+  if (source.file && source.file.hash !== manifest.sourceHash) throw new TransactionConflictError("recovery conflict at source");
+  const sourceTemps = (await Promise.all([
+    inspectOwnedTemporaryFile(source.parent, transactionTemp(source.parent, manifest.id, "recover-source"), new Set([manifest.sourceHash])),
+  ])).filter((item): item is OwnedTemporaryFile => item !== undefined);
+  const managed: PreparedApplyRollback["managed"] = [];
+  for (const [index, item] of manifest.managed.entries()) {
+    const current = await bindFile(root, item.relativePath);
+    if (current.hash !== item.beforeHash && current.hash !== item.afterHash) throw new TransactionConflictError("recovery conflict at managed file");
+    const temps = (await Promise.all([
+      inspectOwnedTemporaryFile(current.parent, transactionTemp(current, manifest.id, "apply-managed", index), new Set([item.afterHash])),
+      inspectOwnedTemporaryFile(current.parent, transactionTemp(current, manifest.id, "recover-managed", index), new Set([item.beforeHash])),
+    ])).filter((temp): temp is OwnedTemporaryFile => temp !== undefined);
+    managed.push({ index, item, current, snapshot: snapshots.managed.get(item.relativePath)!, temps });
+  }
+  const destinationSegments = manifest.destinationPath.split("/");
+  const destinationFilename = destinationSegments.pop()!;
+  const destinationParent = await bindDirectory(root, destinationSegments.join("/"));
+  const destinationAbsolute = path.join(destinationParent.canonicalPath, destinationFilename);
+  const destinationTemps = (await Promise.all([
+    inspectOwnedTemporaryFile(destinationParent, transactionTemp(destinationParent, manifest.id, "destination"), new Set([manifest.destinationHash])),
+  ])).filter((item): item is OwnedTemporaryFile => item !== undefined);
+  let ownsDestination = destinationOwned ?? manifest.destinationOwned;
+  if (!ownsDestination && destinationTemps[0]) {
+    try {
+      const targetInfo = await lstat(destinationAbsolute, { bigint: true });
+      ownsDestination = targetInfo.isFile() && provableIdentity(destinationTemps[0].stat, targetInfo);
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+  const destination: Awaited<ReturnType<typeof inspectBoundFile>> = ownsDestination
+    ? await inspectBoundFile(root, manifest.destinationPath)
+    : { parent: destinationParent, absolutePath: destinationAbsolute };
+  if (ownsDestination && destination.file && destination.file.hash !== manifest.destinationHash) {
+    throw new TransactionConflictError("recovery conflict at destination");
+  }
+  return {
+    root,
+    source,
+    managed,
+    ...(ownsDestination && destination.file ? { destination: destination.file } : {}),
+    sourceTemps,
+    destinationTemps,
+    sourceSnapshot: snapshots.source,
+  };
+}
+
 async function rollbackApply(
   manifest: RecoveryManifest,
   directory: string,
   options: OrganizerTransactionEngineOptions,
   destinationOwned?: boolean,
 ): Promise<void> {
-  const root = await bindRoot(manifest.vaultRoot);
-  const destination = await inspectBoundFile(root, manifest.destinationPath);
-  const destinationHash = destination.file?.hash;
-  if (destinationOwned !== false && destinationHash !== undefined && destinationHash !== manifest.destinationHash) {
-    throw new TransactionConflictError("recovery conflict at destination");
+  const prepared = await preflightApplyRollback(manifest, directory, destinationOwned);
+  for (const temp of prepared.sourceTemps) await removeOwnedTemporaryFile(temp);
+  if (!prepared.source.file) {
+    await publishCreateOnly(prepared.source.parent, prepared.source.absolutePath, prepared.sourceSnapshot, manifest.sourceMode, {
+      id: manifest.id,
+      role: "recover-source",
+    });
+    await emit(options, { name: "recovery_source_restored" });
   }
-  if (destinationOwned !== false && destinationHash !== undefined) {
-    await revalidateFile(destination.file!, manifest.destinationHash);
-    await unlink(destination.absolutePath);
-    await syncDirectory(destination.parent.canonicalPath);
-    await emit(options, { name: "recovery_destination_removed" });
-  }
-
-  for (const [index, item] of manifest.managed.entries()) {
-    const current = await bindFile(root, item.relativePath);
-    if (current.hash !== item.beforeHash && current.hash !== item.afterHash) throw new TransactionConflictError("recovery conflict at managed file");
+  for (const { index, item, current, snapshot, temps } of [...prepared.managed].reverse()) {
+    for (const temp of temps) await removeOwnedTemporaryFile(temp);
     if (current.hash === item.afterHash && item.afterHash !== item.beforeHash) {
-      const snapshot = await readRecoveryFile(directory, item.snapshotFile, MAX_ARTIFACT_BYTES);
-      if (digest(snapshot) !== item.beforeHash) throw new TransactionValidationError("managed recovery snapshot hash mismatch");
-      await replaceBoundFile(current, snapshot, item.mode);
+      await replaceBoundFile(current, snapshot, item.mode, { id: manifest.id, role: "recover-managed", index });
       await emit(options, { name: "recovery_managed_restored", managedIndex: index });
     }
   }
-
-  const source = await inspectBoundFile(root, manifest.sourcePath);
-  const sourceHash = source.file?.hash;
-  if (sourceHash === undefined) {
-    const snapshot = await readRecoveryFile(directory, manifest.sourceSnapshotFile, MAX_ARTIFACT_BYTES);
-    if (digest(snapshot) !== manifest.sourceHash) throw new TransactionValidationError("source recovery snapshot hash mismatch");
-    await publishCreateOnly(source.parent, source.absolutePath, snapshot, manifest.sourceMode);
-    await emit(options, { name: "recovery_source_restored" });
+  for (const temp of prepared.destinationTemps) await removeOwnedTemporaryFile(temp);
+  if (prepared.destination) {
+    await emit(options, { name: "before_recovery_destination_unlink" });
+    await revalidateFile(prepared.destination, manifest.destinationHash);
+    await unlink(prepared.destination.absolutePath);
+    await syncDirectory(prepared.destination.parent.canonicalPath);
+    await emit(options, { name: "recovery_destination_removed" });
   }
+}
+
+interface PreparedUndoRollback {
+  destination: Awaited<ReturnType<typeof inspectBoundFile>>;
+  source?: BoundFile;
+  managed: Array<{
+    index: number;
+    item: NonNullable<RecoveryManifest["undo"]>["managed"][number];
+    current: BoundFile;
+    snapshot: Buffer;
+    temps: OwnedTemporaryFile[];
+  }>;
+  destinationTemps: OwnedTemporaryFile[];
+  sourceTemps: OwnedTemporaryFile[];
+  destinationSnapshot: Buffer;
+}
+
+async function preflightUndoRollback(manifest: RecoveryManifest, directory: string): Promise<PreparedUndoRollback> {
+  if (!manifest.undo) throw new TransactionValidationError("undo recovery snapshots are missing");
+  const snapshots = await loadRecoverySnapshots(manifest, directory);
+  const root = await bindRoot(manifest.vaultRoot);
+  const destination = await inspectBoundFile(root, manifest.destinationPath);
+  if (destination.file && destination.file.hash !== manifest.destinationHash) throw new TransactionConflictError("undo rollback conflict at destination");
+  const source = await inspectBoundFile(root, manifest.sourcePath);
+  if (source.file && source.file.hash !== manifest.sourceHash) throw new TransactionConflictError("undo rollback conflict at source");
+  const managed: PreparedUndoRollback["managed"] = [];
+  for (const [index, item] of manifest.undo.managed.entries()) {
+    const current = await bindFile(root, item.relativePath);
+    const applied = manifest.managed.find((candidate) => candidate.relativePath === item.relativePath);
+    if (!applied || (current.hash !== applied.beforeHash && current.hash !== item.hash)) {
+      throw new TransactionConflictError("undo rollback conflict at managed file");
+    }
+    const temps = (await Promise.all([
+      inspectOwnedTemporaryFile(current.parent, transactionTemp(current, manifest.id, "undo-managed", index), new Set([applied.beforeHash])),
+      inspectOwnedTemporaryFile(current.parent, transactionTemp(current, manifest.id, "recover-undo-managed", index), new Set([item.hash])),
+    ])).filter((temp): temp is OwnedTemporaryFile => temp !== undefined);
+    managed.push({ index, item, current, snapshot: snapshots.undoManaged.get(item.relativePath)!, temps });
+  }
+  const destinationTemps = (await Promise.all([
+    inspectOwnedTemporaryFile(destination.parent, transactionTemp(destination.parent, manifest.id, "recover-destination"), new Set([manifest.destinationHash])),
+  ])).filter((item): item is OwnedTemporaryFile => item !== undefined);
+  const sourceTemps = (await Promise.all([
+    inspectOwnedTemporaryFile(source.parent, transactionTemp(source.parent, manifest.id, "undo-source"), new Set([manifest.sourceHash])),
+  ])).filter((item): item is OwnedTemporaryFile => item !== undefined);
+  return {
+    destination,
+    ...(source.file ? { source: source.file } : {}),
+    managed,
+    destinationSnapshot: snapshots.undoDestination!,
+    destinationTemps,
+    sourceTemps,
+  };
 }
 
 async function rollbackUndo(
   manifest: RecoveryManifest,
   directory: string,
+  options: OrganizerTransactionEngineOptions,
 ): Promise<void> {
-  if (!manifest.undo) throw new TransactionValidationError("undo recovery snapshots are missing");
-  const root = await bindRoot(manifest.vaultRoot);
-  const destination = await inspectBoundFile(root, manifest.destinationPath);
-  const destinationCurrent = destination.file?.hash;
-  if (destinationCurrent !== undefined && destinationCurrent !== manifest.destinationHash) throw new TransactionConflictError("undo rollback conflict at destination");
-  if (destinationCurrent === undefined) {
-    const snapshot = await readRecoveryFile(directory, manifest.undo.destinationSnapshotFile, MAX_ARTIFACT_BYTES);
-    if (digest(snapshot) !== manifest.destinationHash) throw new TransactionValidationError("undo destination snapshot hash mismatch");
-    await publishCreateOnly(destination.parent, destination.absolutePath, snapshot, manifest.undo.destinationMode);
+  const prepared = await preflightUndoRollback(manifest, directory);
+  for (const temp of prepared.destinationTemps) await removeOwnedTemporaryFile(temp);
+  if (!prepared.destination.file) {
+    await emit(options, { name: "before_undo_recovery_destination_publish" });
+    await publishCreateOnly(prepared.destination.parent, prepared.destination.absolutePath, prepared.destinationSnapshot, manifest.undo!.destinationMode, {
+      id: manifest.id,
+      role: "recover-destination",
+    });
+    await emit(options, { name: "undo_recovery_destination_restored" });
   }
-
-  const source = await inspectBoundFile(root, manifest.sourcePath);
-  const sourceCurrent = source.file?.hash;
-  if (sourceCurrent !== undefined && sourceCurrent !== manifest.sourceHash) throw new TransactionConflictError("undo rollback conflict at source");
-  if (sourceCurrent === manifest.sourceHash) {
-    await revalidateFile(source.file!, manifest.sourceHash);
-    await unlink(source.absolutePath);
-    await syncDirectory(source.parent.canonicalPath);
-  }
-
-  for (const item of manifest.undo.managed) {
-    const current = await bindFile(root, item.relativePath);
-    const manifestItem = manifest.managed.find((candidate) => candidate.relativePath === item.relativePath);
-    if (!manifestItem || (current.hash !== manifestItem.beforeHash && current.hash !== item.hash)) {
-      throw new TransactionConflictError("undo rollback conflict at managed file");
-    }
+  for (const { index, item, current, snapshot, temps } of prepared.managed) {
+    for (const temp of temps) await removeOwnedTemporaryFile(temp);
     if (current.hash !== item.hash) {
-      const snapshot = await readRecoveryFile(directory, item.snapshotFile, MAX_ARTIFACT_BYTES);
-      if (digest(snapshot) !== item.hash) throw new TransactionValidationError("undo managed snapshot hash mismatch");
-      await replaceBoundFile(current, snapshot, item.mode);
+      await emit(options, { name: "before_undo_recovery_managed_publish", managedIndex: index });
+      await replaceBoundFile(current, snapshot, item.mode, { id: manifest.id, role: "recover-undo-managed", index });
+      await emit(options, { name: "undo_recovery_managed_restored", managedIndex: index });
     }
+  }
+  for (const temp of prepared.sourceTemps) await removeOwnedTemporaryFile(temp);
+  if (prepared.source) {
+    await emit(options, { name: "before_undo_recovery_source_unlink" });
+    await revalidateFile(prepared.source, manifest.sourceHash);
+    await unlink(prepared.source.absolutePath);
+    await syncDirectory(prepared.source.parent.canonicalPath);
+    await emit(options, { name: "undo_recovery_source_removed" });
   }
 }
 
-function transactionFromManifest(manifest: RecoveryManifest, appliedAt: string): TransactionRecord {
+function transactionFromManifest(manifest: RecoveryManifest): TransactionRecord {
   return {
     id: manifest.id,
     proposalId: manifest.proposalId,
@@ -796,8 +1229,57 @@ function transactionFromManifest(manifest: RecoveryManifest, appliedAt: string):
     destinationPath: manifest.destinationPath,
     sourceHash: manifest.sourceHash,
     destinationHash: manifest.destinationHash,
-    appliedAt,
+    appliedAt: manifest.appliedAt,
+    ...(manifest.undoneAt ? { undoneAt: manifest.undoneAt } : {}),
   };
+}
+
+function appliedTransactionFromManifest(manifest: RecoveryManifest): TransactionRecord {
+  const transaction = transactionFromManifest(manifest);
+  delete transaction.undoneAt;
+  return transaction;
+}
+
+function assertProposalReconciliation(
+  manifest: RecoveryManifest,
+  proposal: StoredProposal | undefined,
+  status: "pending" | "applied",
+): StoredProposal {
+  if (
+    !proposal || proposal.status !== status || proposalRecoveryHash(proposal) !== manifest.proposalHash
+    || Date.parse(manifest.appliedAt) < Date.parse(proposal.createdAt)
+  ) {
+    throw new TransactionValidationError("database proposal does not exactly match recovery manifest");
+  }
+  return proposal;
+}
+
+function assertAppliedReconciliation(
+  manifest: RecoveryManifest,
+  store: OrganizerStore,
+  expectUndone: boolean,
+): TransactionRecord {
+  const transaction = store.getTransaction(manifest.id);
+  const expected = expectUndone ? transactionFromManifest(manifest) : appliedTransactionFromManifest(manifest);
+  if (!transaction || !isDeepStrictEqual(transaction, expected)) {
+    throw new TransactionValidationError("database transaction does not exactly match recovery manifest");
+  }
+  assertProposalReconciliation(manifest, store.getProposal(manifest.proposalId), "applied");
+  return transaction;
+}
+
+function assertPendingReconciliation(manifest: RecoveryManifest, store: OrganizerStore): void {
+  if (store.getTransaction(manifest.id)) throw new TransactionValidationError("database transaction unexpectedly exists during recovery");
+  assertProposalReconciliation(manifest, store.getProposal(manifest.proposalId), "pending");
+}
+
+function assertRolledBackReconciliation(manifest: RecoveryManifest, store: OrganizerStore): StoredProposal {
+  if (store.getTransaction(manifest.id)) throw new TransactionValidationError("database transaction unexpectedly exists for rolled-back recovery");
+  const proposal = store.getProposal(manifest.proposalId);
+  if (!proposal || proposal.status === "applied" || proposalRecoveryHash(proposal) !== manifest.proposalHash) {
+    throw new TransactionValidationError("database proposal does not exactly match rolled-back recovery manifest");
+  }
+  return proposal;
 }
 
 export class OrganizerTransactionEngine {
@@ -811,8 +1293,12 @@ export class OrganizerTransactionEngine {
   }
 
   public async apply(plan: TransactionPlan): Promise<TransactionRecord> {
-    const recoveryRoot = await ensureRecoveryRoot(this.options.recoveryRoot);
-    await this.recover();
+    const planRoot = await bindRoot(plan.vaultRoot);
+    const recoveryRoot = (await ensureRecoveryRoot(this.options.recoveryRoot, this.options, {
+      create: true,
+      vaultCanonical: planRoot.canonicalPath,
+    }))!;
+    await this.recoverRoot(recoveryRoot);
     const stored = this.options.store.getProposal(plan.proposal.id);
     if (!stored) throw new TransactionValidationError("proposal not found");
     let prepared: PreparedApply | undefined;
@@ -846,6 +1332,7 @@ export class OrganizerTransactionEngine {
         version: 1,
         id: plan.id,
         proposalId: stored.id,
+        proposalHash: proposalRecoveryHash(stored),
         vault: stored.vault,
         vaultRoot: prepared.root.canonicalPath,
         sourcePath: stored.sourcePath,
@@ -854,6 +1341,8 @@ export class OrganizerTransactionEngine {
         sourceHash: stored.sourceHash,
         sourceMode: prepared.source.mode,
         destinationHash: digest(plan.destinationContent),
+        destinationOwned: false,
+        appliedAt: this.now(),
         managed: managedManifest,
         state: "prepared",
       };
@@ -867,7 +1356,16 @@ export class OrganizerTransactionEngine {
       await revalidateFile(prepared.requiredMoc, prepared.requiredMoc.hash);
       vaultMutationStarted = true;
       try {
-        destinationPublished = await publishCreateOnly(prepared.destinationParent, prepared.destinationAbsolute, plan.destinationContent, 0o600);
+        destinationPublished = await publishCreateOnly(prepared.destinationParent, prepared.destinationAbsolute, plan.destinationContent, 0o600, {
+          id: manifest.id,
+          role: "destination",
+          options: this.options,
+          onOwned: async () => {
+            destinationPublished = true;
+            manifest = { ...manifest!, destinationOwned: true };
+            await writeManifest(transactionDirectory!, manifest);
+          },
+        });
       } catch (error: unknown) {
         if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new TransactionConflictError("destination collision during publication");
         throw error;
@@ -883,11 +1381,17 @@ export class OrganizerTransactionEngine {
           await validateCanvasReferences(prepared.root, parseCanvas(item.file.content, "current"), stored.destinationPath);
           await validateCanvasReferences(prepared.root, parseCanvas(item.replacement.content, "replacement"), stored.destinationPath);
         }
-        await replaceBoundFile(item.file, item.replacement.content, item.file.mode);
+        await replaceBoundFile(item.file, item.replacement.content, item.file.mode, {
+          id: manifest.id,
+          role: "apply-managed",
+          index,
+          afterTempSync: async () => emit(this.options, { name: "managed_temp_synced", managedIndex: index }),
+        });
         await emit(this.options, { name: "managed_published", managedIndex: index });
       }
 
       await requirePublishedDestination(prepared.root, stored.destinationPath, manifest.destinationHash);
+      await emit(this.options, { name: "before_source_unlink" });
       await revalidateSource(prepared.source, stored.sourceHash);
       await unlink(prepared.source.absolutePath);
       await syncDirectory(prepared.source.parent.canonicalPath);
@@ -895,26 +1399,25 @@ export class OrganizerTransactionEngine {
 
       manifest = { ...manifest, state: "vault_applied" };
       await writeManifest(transactionDirectory, manifest);
-      const appliedAt = this.now();
-      const transaction = transactionFromManifest(manifest, appliedAt);
+      const transaction = transactionFromManifest(manifest);
       await emit(this.options, { name: "before_database_commit" });
       databaseCommitStarted = true;
       this.options.store.applyProposalWithTransaction(transaction);
       await emit(this.options, { name: "database_committed" });
       return transaction;
     } catch (error: unknown) {
-      const existingTransaction = databaseCommitStarted && identifier.safeParse(plan.id).success
-        ? this.options.store.getTransaction(plan.id)
-        : undefined;
-      if (existingTransaction) return existingTransaction;
+      if (databaseCommitStarted && manifest) {
+        const existingTransaction = this.options.store.getTransaction(plan.id);
+        if (existingTransaction) return assertAppliedReconciliation(manifest, this.options.store, false);
+      }
       try {
-        if (manifest && transactionDirectory) {
+        if (transactionDirectory && !vaultMutationStarted && !destinationPublished) {
+          await this.removeUnpublishedRecoveryDirectory(recoveryRoot, transactionDirectory);
+        } else if (manifest && transactionDirectory) {
           await rollbackApply(manifest, transactionDirectory, this.options, destinationPublished);
           manifest = { ...manifest, state: "rolled_back" };
           await writeManifest(transactionDirectory, manifest);
           await writeRecoveryReport(transactionDirectory, { version: 1, id: manifest.id, outcome: "rolled_back", at: this.now() });
-        } else if (transactionDirectory && !vaultMutationStarted && !destinationPublished) {
-          await this.removeUnpublishedRecoveryDirectory(recoveryRoot, transactionDirectory);
         }
       } catch (rollbackError: unknown) {
         throw new AggregateError([error, rollbackError], "transaction failed and rollback could not complete");
@@ -927,18 +1430,18 @@ export class OrganizerTransactionEngine {
 
   public async undo(transactionId: string): Promise<TransactionRecord> {
     identifier.parse(transactionId);
-    const recoveryRoot = await ensureRecoveryRoot(this.options.recoveryRoot);
-    await this.recover();
+    const recoveryRoot = await ensureRecoveryRoot(this.options.recoveryRoot, this.options, { create: false });
+    if (!recoveryRoot) throw new TransactionValidationError("transaction recovery root does not exist");
+    await this.recoverRoot(recoveryRoot);
     const transaction = this.options.store.getTransaction(transactionId);
     if (!transaction) throw new TransactionValidationError("transaction not found");
     if (transaction.undoneAt) throw new TransactionConflictError("transaction already undone");
     const directory = path.join(recoveryRoot, transactionId);
     let manifest = await readManifest(directory, transactionId);
-    if (
-      manifest.proposalId !== transaction.proposalId || manifest.vault !== transaction.vault
-      || manifest.sourcePath !== transaction.sourcePath || manifest.destinationPath !== transaction.destinationPath
-      || manifest.sourceHash !== transaction.sourceHash || manifest.destinationHash !== transaction.destinationHash
-    ) throw new TransactionValidationError("recovery manifest does not match transaction");
+    const manifestRoot = await bindRoot(manifest.vaultRoot);
+    if (!isOutside(manifestRoot.canonicalPath, recoveryRoot)) throw new TransactionValidationError("recovery root must be outside the vault");
+    if (!isDeepStrictEqual(transaction, appliedTransactionFromManifest(manifest))) throw new TransactionValidationError("recovery manifest does not match transaction");
+    assertProposalReconciliation(manifest, this.options.store.getProposal(manifest.proposalId), "applied");
     if (!["vault_applied", "committed"].includes(manifest.state)) throw new TransactionConflictError("transaction is not in an undoable state");
 
     const root = await bindRoot(manifest.vaultRoot);
@@ -970,21 +1473,26 @@ export class OrganizerTransactionEngine {
     manifest = {
       ...manifest,
       state: "undo_prepared",
+      undoneAt: this.now(),
       undo: { destinationSnapshotFile, destinationMode: destination.mode, managed: undoManaged },
     };
     await writeManifest(directory, manifest);
+    await loadRecoverySnapshots(manifest, directory);
 
     try {
       for (const [index, item] of manifest.managed.entries()) {
         const current = managedFiles[index]!;
         const snapshot = await readRecoveryFile(directory, item.snapshotFile, MAX_ARTIFACT_BYTES);
         await revalidateFile(current, item.afterHash);
-        await replaceBoundFile(current, snapshot, item.mode);
+        await replaceBoundFile(current, snapshot, item.mode, { id: manifest.id, role: "undo-managed", index });
         await emit(this.options, { name: "after_undo_managed_publish", managedIndex: index });
       }
       await revalidateDirectory(sourceParent);
       await assertDestinationAbsent(sourceParent, path.posix.basename(manifest.sourcePath), "undo conflict at restored source");
-      await publishCreateOnly(sourceParent, path.join(sourceParent.canonicalPath, path.posix.basename(manifest.sourcePath)), originalSnapshot, manifest.sourceMode);
+      await publishCreateOnly(sourceParent, path.join(sourceParent.canonicalPath, path.posix.basename(manifest.sourcePath)), originalSnapshot, manifest.sourceMode, {
+        id: manifest.id,
+        role: "undo-source",
+      });
       await emit(this.options, { name: "after_undo_source_publish" });
 
       await revalidateFile(destination, manifest.destinationHash);
@@ -994,14 +1502,14 @@ export class OrganizerTransactionEngine {
       manifest = { ...manifest, state: "undo_vault_applied" };
       await writeManifest(directory, manifest);
       await emit(this.options, { name: "before_undo_database_commit" });
-      const undone = this.options.store.markUndone(transactionId, this.now());
+      const undone = this.options.store.markUndone(transactionId, manifest.undoneAt!);
       await emit(this.options, { name: "undo_database_committed" });
       return undone;
     } catch (error: unknown) {
       const currentTransaction = this.options.store.getTransaction(transactionId);
-      if (currentTransaction?.undoneAt) return currentTransaction;
+      if (currentTransaction?.undoneAt) return assertAppliedReconciliation(manifest, this.options.store, true);
       try {
-        await rollbackUndo(manifest, directory);
+        await rollbackUndo(manifest, directory, this.options);
         manifest = { ...manifest, state: "committed" };
         await writeManifest(directory, manifest);
         await writeRecoveryReport(directory, { version: 1, id: manifest.id, outcome: "undo_rolled_back", at: this.now() });
@@ -1013,32 +1521,118 @@ export class OrganizerTransactionEngine {
   }
 
   public async recover(): Promise<RecoveryReport[]> {
-    const recoveryRoot = await ensureRecoveryRoot(this.options.recoveryRoot);
+    const recoveryRoot = await ensureRecoveryRoot(this.options.recoveryRoot, this.options, { create: false });
+    if (!recoveryRoot) return [];
+    return this.recoverRoot(recoveryRoot);
+  }
+
+  /**
+   * Explicit Task 9/orchestration hook. Recovery is never deleted by apply,
+   * undo, or recover; callers must independently verify a backup first.
+   */
+  public async cleanupRecovery(input: RecoveryCleanupInput): Promise<string[]> {
+    if (!input?.backupVerified) throw new TransactionValidationError("verified backup is required before recovery cleanup");
+    const now = timestampSchema.parse(input.now);
+    const cutoff = Date.parse(now) - 30 * 86_400_000;
+    const recoveryRoot = await ensureRecoveryRoot(this.options.recoveryRoot, this.options, { create: false });
+    if (!recoveryRoot) return [];
+    const entries = await readdir(recoveryRoot, { withFileTypes: true });
+    if (entries.length > 1_000) throw new TransactionValidationError("recovery directory entry count exceeds limit");
+    const removed: string[] = [];
+    for (const entry of entries.sort((left, right) => Buffer.compare(Buffer.from(left.name), Buffer.from(right.name)))) {
+      if (!entry.isDirectory() || !identifier.safeParse(entry.name).success) continue;
+      const directory = path.join(recoveryRoot, entry.name);
+      const info = await lstat(directory, { bigint: true });
+      if (info.isSymbolicLink() || !info.isDirectory()) throw new TransactionValidationError("recovery transaction directory is unsafe");
+      assertPrivateMode(info, 0o700, "recovery transaction directory");
+      const manifest = await readManifest(directory, entry.name);
+      const manifestRoot = await bindRoot(manifest.vaultRoot);
+      if (!isOutside(manifestRoot.canonicalPath, recoveryRoot)) throw new TransactionValidationError("recovery root must be outside the vault");
+      if (!["committed", "rolled_back", "undone"].includes(manifest.state)) continue;
+      const report = await readRecoveryReport(directory, manifest.id);
+      if (!report || Date.parse(report.at) > cutoff) continue;
+      const expectedOutcome: RecoveryReport["outcome"] = manifest.state === "rolled_back"
+        ? "rolled_back"
+        : manifest.state === "undone"
+          ? "undone"
+          : manifest.undo ? "undo_rolled_back" : "committed";
+      if (report.outcome !== expectedOutcome) throw new TransactionValidationError("recovery report does not match terminal manifest");
+      await loadRecoverySnapshots(manifest, directory);
+      await assertNoUnknownRecoveryArtifacts(manifest, directory);
+      if (manifest.state === "rolled_back") assertRolledBackReconciliation(manifest, this.options.store);
+      else assertAppliedReconciliation(manifest, this.options.store, manifest.state === "undone");
+      const resolved = path.resolve(directory);
+      if (path.dirname(resolved) !== path.resolve(recoveryRoot) || path.basename(resolved) !== manifest.id) {
+        throw new TransactionValidationError("refusing unsafe recovery cleanup target");
+      }
+      await rm(resolved, { recursive: true, force: false });
+      await syncDirectory(recoveryRoot);
+      removed.push(manifest.id);
+    }
+    return removed;
+  }
+
+  private async recoverRoot(recoveryRoot: string): Promise<RecoveryReport[]> {
     const entries = await readdir(recoveryRoot, { withFileTypes: true });
     if (entries.length > 1_000) throw new TransactionValidationError("recovery directory entry count exceeds limit");
     const reports: RecoveryReport[] = [];
     for (const entry of entries.sort((left, right) => Buffer.compare(Buffer.from(left.name), Buffer.from(right.name)))) {
       if (!entry.isDirectory() || !identifier.safeParse(entry.name).success) continue;
       const directory = path.join(recoveryRoot, entry.name);
-      const info = await lstat(directory);
+      const info = await lstat(directory, { bigint: true });
       if (info.isSymbolicLink() || !info.isDirectory()) throw new TransactionValidationError("recovery transaction directory is unsafe");
-      await chmod(directory, 0o700);
+      assertPrivateMode(info, 0o700, "recovery transaction directory");
       const manifest = await readManifest(directory, entry.name);
-      if (["committed", "rolled_back", "undone"].includes(manifest.state)) continue;
+      const manifestRoot = await bindRoot(manifest.vaultRoot);
+      if (!isOutside(manifestRoot.canonicalPath, recoveryRoot)) throw new TransactionValidationError("recovery root must be outside the vault");
+      await discardAtomicRecoveryTemp(directory, "manifest.json", MAX_MANIFEST_BYTES);
+      await discardAtomicRecoveryTemp(directory, "recovery-report.json", MAX_REPORT_BYTES);
+      if (["committed", "rolled_back", "undone"].includes(manifest.state)) {
+        const outcome: RecoveryReport["outcome"] = manifest.state === "rolled_back"
+          ? "rolled_back"
+          : manifest.state === "undone"
+            ? "undone"
+            : manifest.undo ? "undo_rolled_back" : "committed";
+        const rolledProposal = manifest.state === "rolled_back"
+          ? assertRolledBackReconciliation(manifest, this.options.store)
+          : undefined;
+        if (!rolledProposal) assertAppliedReconciliation(manifest, this.options.store, manifest.state === "undone");
+        const existing = await readRecoveryReport(directory, manifest.id);
+        if (existing?.outcome !== outcome) {
+          const report: RecoveryReport = { version: 1, id: manifest.id, outcome, at: this.now() };
+          await writeRecoveryReport(directory, report);
+          reports.push(report);
+        }
+        if (rolledProposal?.status === "pending") this.options.store.markProposal(rolledProposal.id, "rejected");
+        continue;
+      }
       const transaction = this.options.store.getTransaction(manifest.id);
       let outcome: RecoveryReport["outcome"];
       let next: RecoveryManifest["state"];
       if (manifest.state === "prepared" || manifest.state === "vault_applied") {
-        if (transaction) { outcome = "committed"; next = "committed"; }
+        if (transaction) {
+          assertAppliedReconciliation(manifest, this.options.store, false);
+          outcome = "committed";
+          next = "committed";
+        }
         else {
+          assertPendingReconciliation(manifest, this.options.store);
           await rollbackApply(manifest, directory, this.options);
           outcome = "rolled_back";
           next = "rolled_back";
         }
       } else {
-        if (transaction?.undoneAt) { outcome = "undone"; next = "undone"; }
+        if (transaction?.undoneAt) {
+          assertAppliedReconciliation(manifest, this.options.store, true);
+          outcome = "undone";
+          next = "undone";
+        }
         else {
-          await rollbackUndo(manifest, directory);
+          if (!transaction || !isDeepStrictEqual(transaction, appliedTransactionFromManifest(manifest))) {
+            throw new TransactionValidationError("database transaction does not exactly match recovery manifest");
+          }
+          assertProposalReconciliation(manifest, this.options.store.getProposal(manifest.proposalId), "applied");
+          await rollbackUndo(manifest, directory, this.options);
           outcome = "undo_rolled_back";
           next = "committed";
         }
@@ -1047,6 +1641,10 @@ export class OrganizerTransactionEngine {
       await writeManifest(directory, updated);
       const report: RecoveryReport = { version: 1, id: manifest.id, outcome, at: this.now() };
       await writeRecoveryReport(directory, report);
+      if (next === "rolled_back") {
+        const proposal = assertRolledBackReconciliation(updated, this.options.store);
+        if (proposal.status === "pending") this.options.store.markProposal(proposal.id, "rejected");
+      }
       reports.push(report);
     }
     return reports;
@@ -1054,8 +1652,9 @@ export class OrganizerTransactionEngine {
 
   private now(): string {
     const value = this.options.now?.() ?? new Date().toISOString();
-    if (!Number.isFinite(Date.parse(value))) throw new TransactionValidationError("transaction timestamp is invalid");
-    return value;
+    const parsed = timestampSchema.safeParse(value);
+    if (!parsed.success) throw new TransactionValidationError("transaction timestamp is invalid");
+    return parsed.data;
   }
 
   private async replaceRecoverySnapshot(directory: string, filename: string, content: Buffer): Promise<void> {
