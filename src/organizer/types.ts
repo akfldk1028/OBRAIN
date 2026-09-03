@@ -79,10 +79,31 @@ export interface InboxListResult {
   nextCursor?: number;
 }
 
+/**
+ * Stable, content-free integrity finding identifiers. Additive changes require a documented
+ * compatibility review because operator reports and MCP clients may persist these values.
+ */
+export type IntegrityFindingCode =
+  | "ambiguous_link"
+  | "audit_limit_exceeded"
+  | "broken_link"
+  | "canvas_missing_file"
+  | "forbidden_artifact"
+  | "invalid_canvas"
+  | "invalid_managed_markers"
+  | "invalid_path"
+  | "max_depth"
+  | "missing_required_file"
+  | "orphan_note"
+  | "unsafe_link";
+
+/** Never includes note text, matched credentials, link targets, or exception messages. */
 export interface IntegrityFinding {
-  code: "ambiguous_link" | "broken_link" | "canvas_missing_file" | "invalid_canvas" | "invalid_managed_markers" | "max_depth" | "missing_required_file" | "orphan_note";
+  code: IntegrityFindingCode;
+  /** A fixed, documented category such as `environment` or `missing`. */
+  category: string;
+  /** POSIX-style vault-relative path, or `.` when the supplied root itself is unsafe. */
   path: string;
-  detail: string;
 }
 
 export interface IntegrityReport {
