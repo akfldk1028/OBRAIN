@@ -12,6 +12,10 @@ describe("generated Brain Canvas", () => {
     expect(parsed.nodes.filter((node: { type: string }) => node.type === "file")).toHaveLength(11);
     expect(parsed.nodes.map((node: { file: string }) => node.file)).toContain("000_Home_MOC.md");
     expect(parsed.edges).toHaveLength(10);
+    const home = parsed.nodes.find((node: { file: string }) => node.file === "000_Home_MOC.md");
+    expect(parsed.edges.every((edge: { label: string; toNode: string }) => (
+      edge.label === "parent" && edge.toNode === home.id
+    ))).toBe(true);
   });
 
   it("renders a standalone area canvas with one file node", () => {
@@ -59,6 +63,31 @@ describe("generated Brain Canvas", () => {
   it("rejects edges that point to missing nodes", () => {
     const parsed = JSON.parse(renderBrainCanvas(BRAIN_FOUNDATION_POLICY));
     expect(validateGeneratedCanvas({ ...parsed, edges: [{ ...parsed.edges[0], toNode: "0123456789abcdef" }, ...parsed.edges.slice(1)] })).toBe(false);
+  });
+
+  it.each([
+    "parent",
+    "related",
+    "prerequisite",
+    "next",
+    "evidence",
+    "applies-to",
+    "produces",
+    "contradicts",
+  ])("accepts the relationship label %s", (label) => {
+    const parsed = JSON.parse(renderBrainCanvas(BRAIN_FOUNDATION_POLICY));
+    expect(validateGeneratedCanvas({
+      ...parsed,
+      edges: [{ ...parsed.edges[0], label }, ...parsed.edges.slice(1)],
+    })).toBe(true);
+  });
+
+  it.each(["영역", "depends-on", "Parent", ""])("rejects the relationship label %j", (label) => {
+    const parsed = JSON.parse(renderBrainCanvas(BRAIN_FOUNDATION_POLICY));
+    expect(validateGeneratedCanvas({
+      ...parsed,
+      edges: [{ ...parsed.edges[0], label }, ...parsed.edges.slice(1)],
+    })).toBe(false);
   });
 
   it("renders globally unique 16-character lowercase IDs", () => {

@@ -20,7 +20,16 @@ const edgeSchema = z.object({
   id: idSchema,
   fromNode: idSchema,
   toNode: idSchema,
-  label: z.string(),
+  label: z.enum([
+    "parent",
+    "related",
+    "prerequisite",
+    "next",
+    "evidence",
+    "applies-to",
+    "produces",
+    "contradicts",
+  ]),
 }).strict();
 
 const canvasSchema = z.object({ nodes: z.array(nodeSchema), edges: z.array(edgeSchema) }).strict();
@@ -65,10 +74,10 @@ export function renderBrainCanvas(policy: VaultFoundationPolicy): string {
     height: 200,
   }));
   const edges = areaNodes.map((node) => ({
-    id: idFor(`${homeId}:parent:${node.id}`),
-    fromNode: homeId,
-    toNode: node.id,
-    label: "영역",
+    id: idFor(`${node.id}:parent:${homeId}`),
+    fromNode: node.id,
+    toNode: homeId,
+    label: "parent" as const,
   }));
 
   return `${JSON.stringify({ nodes: [home, ...areaNodes], edges }, null, 2)}\n`;

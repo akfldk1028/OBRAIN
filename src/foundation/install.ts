@@ -197,7 +197,15 @@ export async function installFoundation(input: {
 
   const result: FoundationResult = { created: [], skippedExisting: [], preview: !input.apply };
   if (!input.apply) {
-    result.created.push(...changes.map((change) => change.path));
+    for (const change of planned) {
+      try {
+        await lstat(change.target);
+        result.skippedExisting.push(change.path);
+      } catch (error: unknown) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        result.created.push(change.path);
+      }
+    }
     return result;
   }
 

@@ -1,4 +1,4 @@
-import { mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -88,6 +88,33 @@ afterEach(async () => {
 });
 
 describe("foundation installer", () => {
+  it("classifies seeded files during preview without creating missing parents", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "brain-foundation-"));
+    roots.push(root);
+    await writeFile(path.join(root, "000_Home_MOC.md"), "human home", "utf8");
+    await mkdir(path.join(root, "20_Study"));
+    await writeFile(path.join(root, "20_Study/000_Study_MOC.md"), "human study", "utf8");
+
+    const preview = await installFoundation({
+      vaultRoot: root,
+      policy: BRAIN_FOUNDATION_POLICY,
+      apply: false,
+    });
+
+    expect(preview.created).toHaveLength(31);
+    expect(preview.created).not.toContain("000_Home_MOC.md");
+    expect(preview.created).not.toContain("20_Study/000_Study_MOC.md");
+    expect(preview.skippedExisting).toEqual([
+      "000_Home_MOC.md",
+      "20_Study/000_Study_MOC.md",
+    ]);
+    expect(await pathsOnDisk(root)).toEqual([
+      "000_Home_MOC.md",
+      "20_Study",
+      "20_Study/000_Study_MOC.md",
+    ]);
+  });
+
   it("previews without writing, then creates only missing foundation files", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "brain-foundation-"));
     roots.push(root);

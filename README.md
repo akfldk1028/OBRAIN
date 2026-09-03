@@ -64,7 +64,13 @@ output before adding `--apply`, which creates only files that do not already exi
 The Vault path must be absolute according to the host running the command: use a drive-rooted path
 such as `D:\obsidian\Brain` on Windows and a slash-rooted path such as `/srv/obsidian/Brain` on
 Oracle Linux. A Windows-shaped path is rejected on Unix-like hosts because it resolves relative
-there; likewise, the CLI never treats a host-relative path as a writable Vault.
+there; likewise, the CLI never treats a host-relative path as a writable Vault. On Windows,
+root-relative paths such as `\srv\obsidian\Brain` or `/srv/obsidian/Brain` are rejected; use a
+fully qualified drive-rooted or UNC path.
+
+Markdown is the source of truth. Only files named `000_*_Map.canvas` are AI-managed generated
+visualizations; every other Canvas file is human-managed and must not be regenerated or overwritten
+by automation.
 
 ```powershell
 npm run build

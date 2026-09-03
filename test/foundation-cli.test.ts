@@ -13,18 +13,29 @@ describe("foundation CLI", () => {
     expect(() => parseFoundationArgs(["--vault", "relative"])).toThrow("absolute");
   });
 
-  it("handles Windows and POSIX paths using the current host path rules", () => {
-    const windowsPath = "D:\\obsidian\\Brain";
-    const posixPath = "/srv/obsidian/Brain";
+  it.each([
+    "D:\\obsidian\\Brain",
+    "D:/obsidian/Brain",
+    "\\\\server\\share\\Brain",
+    "//server/share/Brain",
+  ])("accepts fully qualified Windows vault path %j", (vaultRoot) => {
+    expect(parseFoundationArgs(["--vault", vaultRoot], "win32")).toEqual({ vaultRoot, apply: false });
+  });
 
-    if (process.platform === "win32") {
-      expect(parseFoundationArgs(["--vault", windowsPath])).toEqual({ vaultRoot: windowsPath, apply: false });
-      expect(parseFoundationArgs(["--vault", posixPath])).toEqual({ vaultRoot: posixPath, apply: false });
-      return;
-    }
+  it.each([
+    "/srv/obsidian/Brain",
+    "\\srv\\obsidian\\Brain",
+    "D:obsidian\\Brain",
+    "relative",
+  ])("rejects ambiguous Windows vault path %j", (vaultRoot) => {
+    expect(() => parseFoundationArgs(["--vault", vaultRoot], "win32")).toThrow("absolute");
+  });
 
-    expect(parseFoundationArgs(["--vault", posixPath])).toEqual({ vaultRoot: posixPath, apply: false });
-    expect(() => parseFoundationArgs(["--vault", windowsPath])).toThrow("absolute");
+  it("requires slash-rooted paths under POSIX semantics", () => {
+    const vaultRoot = "/srv/obsidian/Brain";
+    expect(parseFoundationArgs(["--vault", vaultRoot], "linux")).toEqual({ vaultRoot, apply: false });
+    expect(() => parseFoundationArgs(["--vault", "srv/obsidian/Brain"], "linux")).toThrow("absolute");
+    expect(() => parseFoundationArgs(["--vault", "D:\\obsidian\\Brain"], "linux")).toThrow("absolute");
   });
 
   it("allows explicit apply", () => {

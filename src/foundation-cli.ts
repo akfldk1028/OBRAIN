@@ -3,7 +3,10 @@ import { fileURLToPath } from "node:url";
 import { installFoundation } from "./foundation/install.js";
 import { BRAIN_FOUNDATION_POLICY } from "./foundation/policy.js";
 
-export function parseFoundationArgs(args: string[]): { vaultRoot: string; apply: boolean } {
+export function parseFoundationArgs(
+  args: string[],
+  platform: NodeJS.Platform = process.platform,
+): { vaultRoot: string; apply: boolean } {
   let vaultRoot: string | undefined;
   let apply = false;
 
@@ -26,7 +29,13 @@ export function parseFoundationArgs(args: string[]): { vaultRoot: string; apply:
   }
 
   if (!vaultRoot) throw new Error("--vault is required");
-  if (!path.isAbsolute(vaultRoot)) throw new Error("--vault must be absolute");
+  const absolute = platform === "win32"
+    ? (() => {
+        const root = path.win32.parse(vaultRoot).root;
+        return path.win32.isAbsolute(vaultRoot) && root !== "\\" && root !== "/";
+      })()
+    : path.posix.isAbsolute(vaultRoot);
+  if (!absolute) throw new Error("--vault must be absolute");
   return { vaultRoot, apply };
 }
 
