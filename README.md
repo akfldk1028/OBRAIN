@@ -61,6 +61,11 @@ npm run inspect -- /absolute/path/to/a/vault
 Build the CLI, then preview the foundation files for an absolute Vault path. Review the preview
 output before adding `--apply`, which creates only files that do not already exist.
 
+The Vault path must be absolute according to the host running the command: use a drive-rooted path
+such as `D:\obsidian\Brain` on Windows and a slash-rooted path such as `/srv/obsidian/Brain` on
+Oracle Linux. A Windows-shaped path is rejected on Unix-like hosts because it resolves relative
+there; likewise, the CLI never treats a host-relative path as a writable Vault.
+
 ```powershell
 npm run build
 node dist/foundation-cli.js --vault "D:\obsidian\Brain"

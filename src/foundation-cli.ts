@@ -4,11 +4,30 @@ import { installFoundation } from "./foundation/install.js";
 import { BRAIN_FOUNDATION_POLICY } from "./foundation/policy.js";
 
 export function parseFoundationArgs(args: string[]): { vaultRoot: string; apply: boolean } {
-  const index = args.indexOf("--vault");
-  const vaultRoot = index >= 0 ? args[index + 1] : undefined;
+  let vaultRoot: string | undefined;
+  let apply = false;
+
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    if (argument === "--vault") {
+      if (vaultRoot !== undefined) throw new Error("--vault may only be provided once");
+      const value = args[index + 1];
+      if (!value || value.startsWith("--")) throw new Error("--vault requires a value");
+      vaultRoot = value;
+      index += 1;
+      continue;
+    }
+    if (argument === "--apply") {
+      if (apply) throw new Error("--apply may only be provided once");
+      apply = true;
+      continue;
+    }
+    throw new Error(`unknown argument: ${argument}`);
+  }
+
   if (!vaultRoot) throw new Error("--vault is required");
   if (!path.isAbsolute(vaultRoot)) throw new Error("--vault must be absolute");
-  return { vaultRoot, apply: args.includes("--apply") };
+  return { vaultRoot, apply };
 }
 
 async function main(): Promise<void> {
