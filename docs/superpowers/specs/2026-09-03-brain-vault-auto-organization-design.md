@@ -319,7 +319,8 @@ review, skipped, and failed counts.
 ### 7.4 Confidence Policy
 
 - `>= 0.90`: eligible for automatic apply after trial mode
-- `0.70` through `0.899...`: proposal only; move to or report under `Agent-Inbox/검토필요`
+- `0.70` through `0.899...`: proposal only; leave the source in place and include it in the review
+  report. It may enter `Agent-Inbox/검토필요` only after an explicit reviewed action.
 - `< 0.70`: leave unchanged in Inbox with the reason recorded
 
 Model confidence alone is insufficient. Automatic apply also requires every deterministic policy
