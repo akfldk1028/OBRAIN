@@ -17,6 +17,16 @@ describe("foundation Markdown", () => {
     expect(guide).toContain("> [!abstract] 한눈에 보기");
     expect(guide).toContain("원문을 그대로 보존");
     expect(guide).toContain("최대 5레벨");
+    for (const callout of [
+      "[!abstract]", "[!example]", "[!note]", "[!tip]", "[!warning]", "[!info]", "[!success]",
+    ]) {
+      expect(guide).toContain(callout);
+    }
+    for (const semantic of [
+      "parent", "related", "prerequisite", "next", "evidence", "applies-to", "produces", "contradicts",
+    ]) {
+      expect(guide).toContain(semantic);
+    }
     for (const heading of [
       "## Vault 전체 구조", "## MOC 규칙", "## 수식 설명 순서", "## PDF와 논문",
       "## 태그", "## 링크와 Canvas", "## 자동 정리", "## 사용자 선호", "## 작업 체크리스트",
@@ -24,6 +34,22 @@ describe("foundation Markdown", () => {
       expect(guide).toContain(heading);
     }
     expect(guide).toMatch(/#AI가이드 #인수인계 #시스템 #범용\n$/);
+  });
+
+  it("defines Markdown as the source of truth and Canvas ownership", () => {
+    const guide = renderRootGuide(BRAIN_FOUNDATION_POLICY);
+
+    expect(guide).toContain("Markdown은 source of truth");
+    expect(guide).toContain("Canvas는 사람이 보는 generated visualization");
+    expect(guide).toContain("\`000_*_Map.canvas\`뿐입니다");
+    expect(guide).toContain("모든 Canvas 파일은 사람이 관리합니다");
+  });
+
+  it("uses Agent-Inbox as the automatic-organization intake folder", () => {
+    const guide = renderRootGuide(BRAIN_FOUNDATION_POLICY);
+
+    expect(guide).toContain("1. 새 내용은 \`Agent-Inbox\`에 작성합니다.");
+    expect(guide).not.toContain("1. 새 내용은 Inbox에 작성합니다.");
   });
 
   it("links Home to every area MOC and reserves one managed block", () => {
