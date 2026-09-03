@@ -56,6 +56,24 @@ You can also drive it interactively with the MCP Inspector:
 npm run inspect -- /absolute/path/to/a/vault
 ```
 
+## Brain Vault foundation
+
+Build the CLI, then preview the foundation files for an absolute Vault path. Review the preview
+output before adding `--apply`, which creates only files that do not already exist.
+
+```powershell
+npm run build
+node dist/foundation-cli.js --vault "D:\obsidian\Brain"
+node dist/foundation-cli.js --vault "D:\obsidian\Brain" --apply
+```
+
+The package scripts are equivalent wrappers; append the quoted absolute Vault path after `--`:
+
+```powershell
+npm run foundation:preview -- --vault "D:\obsidian\Brain"
+npm run foundation:apply -- --vault "D:\obsidian\Brain"
+```
+
 ## Deploy to the VPS
 
 Requires **Node 20+** on the VPS.

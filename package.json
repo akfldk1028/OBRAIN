@@ -31,6 +31,8 @@
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "typecheck": "tsc --noEmit",
+    "foundation:preview": "node dist/foundation-cli.js",
+    "foundation:apply": "node dist/foundation-cli.js --apply",
     "smoke": "node scripts/smoke.mjs",
     "smoke:http": "node scripts/smoke-http.mjs",
     "inspect": "npx @modelcontextprotocol/inspector node dist/index.js",
