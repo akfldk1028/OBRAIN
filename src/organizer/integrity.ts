@@ -71,6 +71,12 @@ interface MarkdownLine {
   raw: string;
 }
 
+interface BacktickRun {
+  start: number;
+  length: number;
+  segment: number;
+}
+
 type FailureKind = "changed" | "unreadable" | "unsafe";
 
 const START = "<!-- brain-auto:start note-index -->";
@@ -123,6 +129,16 @@ function failureCode(kind: FailureKind): IntegrityFindingCode {
   if (kind === "unsafe") return "unsafe_link";
   if (kind === "unreadable") return "unreadable_file";
   return "changed_file";
+}
+
+const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false });
+
+function decodeUtf8(buffer: Buffer): string | undefined {
+  try {
+    return UTF8_DECODER.decode(buffer);
+  } catch {
+    return undefined;
+  }
 }
 
 class Findings {
@@ -209,6 +225,7 @@ async function bindDir(
   if (before.isSymbolicLink()) throw new UnsafeLinkError();
   if (!before.isDirectory()) throw new RaceError();
   const canonicalPath = await fs.realpath(pathname);
+  if (!parent && path.resolve(canonicalPath) !== path.resolve(pathname)) throw new UnsafeLinkError();
   const after = await fs.lstat(pathname);
   const resolved = await fs.lstat(canonicalPath);
   if (after.isSymbolicLink() || resolved.isSymbolicLink()) throw new UnsafeLinkError();
@@ -344,12 +361,7 @@ async function inventory(
   try {
     root = await bindDir(fs, rootName, initial, "integrity root");
   } catch (error) {
-    const kind = failureKind(error);
-    findings.add(
-      kind === "unreadable" ? "unreadable_file" : kind === "changed" && errorCode(error) ? "changed_file" : "unsafe_link",
-      "root",
-      ".",
-    );
+    addFailure(findings, error, "root", ".");
     return { files, complete: false };
   }
 
@@ -612,35 +624,41 @@ function maskMarkdownCode(text: string): { mask: Uint8Array; lines: MarkdownLine
     }
   }
 
-  const rangeIsClear = (start: number, end: number) => {
-    for (let index = start; index < end; index += 1) if (mask[index]) return false;
-    return true;
-  };
-
+  const runs: BacktickRun[] = [];
+  let segment = 0;
   for (let index = 0; index < text.length;) {
-    if (mask[index] || text[index] !== "`") {
+    if (mask[index]) {
+      while (index < text.length && mask[index]) index += 1;
+      segment += 1;
+      continue;
+    }
+    if (text[index] !== "`") {
       index += 1;
       continue;
     }
-    const openingLength = runLength(text, index, "`");
-    let search = index + openingLength;
-    let close = -1;
-    while (search < text.length) {
-      const candidate = text.indexOf("`", search);
-      if (candidate < 0) break;
-      const closingLength = runLength(text, candidate, "`");
-      if (closingLength === openingLength && rangeIsClear(candidate, candidate + closingLength)) {
-        close = candidate;
-        break;
-      }
-      search = candidate + closingLength;
-    }
-    if (close < 0) {
-      index += openingLength;
+    const length = runLength(text, index, "`");
+    runs.push({ start: index, length, segment });
+    index += length;
+  }
+
+  const nextSameRun = new Array<number>(runs.length).fill(-1);
+  const nextBySegmentAndLength = new Map<string, number>();
+  for (let index = runs.length - 1; index >= 0; index -= 1) {
+    const run = runs[index]!;
+    const runKey = `${run.segment}:${run.length}`;
+    nextSameRun[index] = nextBySegmentAndLength.get(runKey) ?? -1;
+    nextBySegmentAndLength.set(runKey, index);
+  }
+  for (let index = 0; index < runs.length;) {
+    const closeIndex = nextSameRun[index]!;
+    if (closeIndex < 0) {
+      index += 1;
       continue;
     }
-    block(index, close + openingLength);
-    index = close + openingLength;
+    const opener = runs[index]!;
+    const closer = runs[closeIndex]!;
+    block(opener.start, closer.start + closer.length);
+    index = closeIndex + 1;
   }
 
   return { mask, lines };
@@ -750,16 +768,22 @@ export async function auditVaultIntegrity(input: {
       findings.limit();
       return report(input.vault, findings);
     }
-    let text: string;
+    let contents: Buffer;
     try {
-      text = (await read(fs, file, cap.maxContentBytes)).toString("utf8");
+      contents = await read(fs, file, cap.maxContentBytes);
     } catch (error) {
       const kind = error instanceof ReadError ? error.kind : failureKind(error);
       findings.add(failureCode(kind), "markdown", file.path);
       complete = false;
       continue;
     }
-    parsedBytes += Buffer.byteLength(text);
+    parsedBytes += contents.length;
+    const text = decodeUtf8(contents);
+    if (text === undefined) {
+      findings.add("unreadable_file", "invalid_text", file.path);
+      findings.suppressIncompleteConclusions();
+      return report(input.vault, findings);
+    }
     const scan = scanMarkdown(text, cap.maxLinks - parsedLinks);
     if (scan.overflow) {
       findings.limit();

@@ -42,6 +42,18 @@ async function inventoryByteCost(root: string, relative = ""): Promise<number> {
   return total;
 }
 
+async function markdownByteCost(root: string, relative = ""): Promise<number> {
+  let total = 0;
+  for (const entry of await readdir(path.join(root, ...relative.split("/").filter(Boolean)), { withFileTypes: true })) {
+    const entryPath = relative ? `${relative}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) total += await markdownByteCost(root, entryPath);
+    else if (entry.isFile() && entry.name.toLocaleLowerCase("en-US").endsWith(".md")) {
+      total += Number((await nativeLstat(path.join(root, ...entryPath.split("/")), { bigint: true })).size);
+    }
+  }
+  return total;
+}
+
 function orderedFs(reverse: boolean): IntegrityAuditFs {
   return {
     lstat: (pathname) => nativeLstat(pathname, { bigint: true }),
@@ -291,6 +303,8 @@ describe("Vault integrity auditor", () => {
     const root = await createValidVault();
     const relative = "20_Study/racy-link.md";
     const target = path.join(root, ...relative.split("/"));
+    await writeVaultFile(root, "00_Prompt/a-broken.md", "[[missing-before-link-replacement]]\n");
+    await writeVaultFile(root, areaMocPath(BRAIN_FOUNDATION_POLICY.areas[0]!), `${renderAreaMoc(BRAIN_FOUNDATION_POLICY.areas[0]!)}\n- [[00_Prompt/a-broken]]\n`);
     await writeVaultFile(root, relative, "# racy link\n");
     await writeVaultFile(root, areaMocPath(BRAIN_FOUNDATION_POLICY.areas[3]!), `${renderAreaMoc(BRAIN_FOUNDATION_POLICY.areas[3]!)}\n- [[20_Study/racy-link]]\n`);
     const outside = await mkdtemp(path.join(os.tmpdir(), "brain-integrity-link-stat-"));
@@ -312,6 +326,34 @@ describe("Vault integrity auditor", () => {
 
     expect(report.findings).toContainEqual(expect.objectContaining({ code: "unsafe_link", path: relative }));
     expect(report.findings).not.toContainEqual(expect.objectContaining({ code: "changed_file", path: relative }));
+    expect(report.findings.map((finding) => finding.code)).not.toEqual(expect.arrayContaining(["broken_link", "ambiguous_link", "orphan_note", "missing_required_file", "canvas_missing_file"]));
+  });
+
+  it("maps a pre-bind root identity replacement to changed_file without opening the replacement", async () => {
+    const root = await createValidVault();
+    const outside = await mkdtemp(path.join(os.tmpdir(), "brain-integrity-prebind-root-"));
+    vaults.push(outside);
+    const initial = await nativeLstat(root, { bigint: true });
+    const replacement = await nativeLstat(outside, { bigint: true });
+    let rootStats = 0;
+    let outsideRead = false;
+    const fs: IntegrityAuditFs = {
+      lstat: async (pathname) => {
+        if (pathname === root) return ++rootStats === 1 ? initial : replacement;
+        return nativeLstat(pathname, { bigint: true });
+      },
+      realpath: nativeRealpath,
+      opendir: async (pathname) => {
+        if (pathname === outside) outsideRead = true;
+        return nativeOpendir(pathname);
+      },
+      open: nativeOpen,
+    };
+
+    const report = await auditVaultIntegrity({ vault: "brain", root, policy: BRAIN_FOUNDATION_POLICY, fs });
+
+    expect(report.findings).toEqual([{ code: "changed_file", category: "root", path: "." }]);
+    expect(outsideRead).toBe(false);
   });
 
   it("closes the directory handle after a post-opendir identity replacement", async () => {
@@ -373,6 +415,45 @@ describe("Vault integrity auditor", () => {
     expect(report.findings).not.toContainEqual(expect.objectContaining({ code: "broken_link", path: "20_Study/exact-span.md" }));
     expect(report.findings).toContainEqual(expect.objectContaining({ code: "broken_link", path: "20_Study/non-exact-span.md" }));
     expect(report.findings).toContainEqual(expect.objectContaining({ code: "broken_link", path: "20_Study/unmatched-span.md" }));
+  });
+
+  it("indexes unmatched backtick runs once before masking exact inline spans", async () => {
+    const root = await createValidVault();
+    const area = BRAIN_FOUNDATION_POLICY.areas[0]!;
+    const runCount = 96;
+    const unmatchedRuns = Array.from(
+      { length: runCount },
+      (_, index) => `${"`".repeat(index + 1)} text`,
+    ).join(" ");
+    await writeVaultFile(root, areaMocPath(area), [
+      unmatchedRuns,
+      "[[missing-after-unmatched-runs]]",
+      "<!-- brain-auto:start note-index -->",
+      "<!-- brain-auto:end note-index -->",
+      "```md",
+      `${"`".repeat(8_192)} [[hidden-in-fence]]`,
+      "<!-- brain-auto:start note-index -->",
+      "```",
+    ].join("\n"));
+    const originalIndexOf = String.prototype.indexOf;
+    let backtickLookups = 0;
+    const indexOf = vi.spyOn(String.prototype, "indexOf").mockImplementation(function (
+      this: string,
+      searchString: string,
+      position?: number,
+    ) {
+      if (searchString === "`") backtickLookups += 1;
+      return originalIndexOf.call(this, searchString, position);
+    });
+    try {
+      const report = await auditVaultIntegrity({ vault: "brain", root, policy: BRAIN_FOUNDATION_POLICY });
+
+      expect(report.findings).toContainEqual(expect.objectContaining({ code: "broken_link", path: areaMocPath(area) }));
+      expect(report.findings).not.toContainEqual(expect.objectContaining({ code: "invalid_managed_markers", path: areaMocPath(area) }));
+      expect(backtickLookups).toBeLessThanOrEqual(runCount * 2);
+    } finally {
+      indexOf.mockRestore();
+    }
   });
 
   it("ignores a managed marker line inside a multiline inline code span", async () => {
@@ -446,6 +527,49 @@ describe("Vault integrity auditor", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("charges valid multibyte Markdown and its BOM by exact raw parsed-link bytes", async () => {
+    const root = await createValidVault();
+    await writeFile(
+      path.join(root, BRAIN_FOUNDATION_POLICY.rootGuide),
+      Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from("# 한글\n", "utf8")]),
+    );
+    const exact = await markdownByteCost(root);
+
+    const accepted = await auditVaultIntegrity({
+      vault: "brain", root, policy: BRAIN_FOUNDATION_POLICY,
+      limits: { maxParsedLinkBytes: exact },
+    });
+    const rejected = await auditVaultIntegrity({
+      vault: "brain", root, policy: BRAIN_FOUNDATION_POLICY,
+      limits: { maxParsedLinkBytes: exact - 1 },
+    });
+
+    expect(accepted.findings).toEqual([]);
+    expect(rejected.findings).toEqual([LIMIT_FINDING]);
+  });
+
+  it("limits invalid UTF-8 before decode when over budget and fails safely at the exact raw budget", async () => {
+    const root = await createValidVault();
+    const invalid = Buffer.from([0x23, 0x20, 0x80, 0x0a]);
+    await writeFile(path.join(root, BRAIN_FOUNDATION_POLICY.rootGuide), invalid);
+    await writeVaultFile(root, "00_Prompt/a-broken-after-invalid.md", "[[missing-after-invalid-text]]\n");
+
+    const overBudget = await auditVaultIntegrity({
+      vault: "brain", root, policy: BRAIN_FOUNDATION_POLICY,
+      limits: { maxParsedLinkBytes: invalid.length - 1 },
+    });
+    const exactBudget = await auditVaultIntegrity({
+      vault: "brain", root, policy: BRAIN_FOUNDATION_POLICY,
+      limits: { maxParsedLinkBytes: invalid.length },
+    });
+
+    expect(overBudget.findings).toEqual([LIMIT_FINDING]);
+    expect(exactBudget.findings).toEqual([{
+      code: "unreadable_file", category: "invalid_text", path: BRAIN_FOUNDATION_POLICY.rootGuide,
+    }]);
+    expect(exactBudget.findings.map((finding) => finding.code)).not.toEqual(expect.arrayContaining(["broken_link", "ambiguous_link", "orphan_note", "missing_required_file", "canvas_missing_file"]));
   });
 
   it("resolves uppercase .MD files by exact path and unique basename and credits incoming links", async () => {
