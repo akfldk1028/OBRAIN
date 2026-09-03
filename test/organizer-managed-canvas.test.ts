@@ -107,4 +107,31 @@ describe("managed area Canvas rendering", () => {
       representativeNotePaths: ["20_Study/01_Math/000_Math_MOC.md"],
     })).toThrow(/duplicate|category/i);
   });
+
+  it("orders nodes and edges bytewise independent of input order", () => {
+    const ordinary = "20_Study/ab.md";
+    const softHyphen = "20_Study/a\u00adb.md";
+    const bytewisePaths = new Set([...existingPaths, ordinary, softHyphen]);
+    const forward = renderManagedAreaCanvas({
+      ...input(),
+      existingPaths: bytewisePaths,
+      representativeNotePaths: [ordinary, softHyphen],
+      relationships: [
+        { from: ordinary, to: mocPath, label: "parent" },
+        { from: softHyphen, to: mocPath, label: "parent" },
+      ],
+    });
+    const reversed = renderManagedAreaCanvas({
+      ...input(),
+      existingPaths: bytewisePaths,
+      representativeNotePaths: [softHyphen, ordinary],
+      relationships: [
+        { from: softHyphen, to: mocPath, label: "parent" },
+        { from: ordinary, to: mocPath, label: "parent" },
+      ],
+    });
+
+    expect(reversed).toBe(forward);
+    expect(forward.indexOf(`\"file\": \"${ordinary}\"`)).toBeLessThan(forward.indexOf(`\"file\": \"${softHyphen}\"`));
+  });
 });

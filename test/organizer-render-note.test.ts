@@ -95,12 +95,31 @@ describe("organized note rendering", () => {
     expect(generated).not.toMatch(/(^|[^\\])!\[pixel\]\(https:\/\/evil\.example\/x\)/u);
     expect(generated).not.toMatch(/(^|[^\\])\[run\]\(javascript:alert\(1\)\)/u);
     expect(generated).toContain("&lt;iframe src=x&gt;&lt;/iframe&gt;");
-    expect(generated).toContain("\\![[embed]]");
-    expect(generated).toContain("\\[[invented]]");
-    expect(generated).toContain("\\![pixel](https://evil.example/x)");
-    expect(generated).toContain("\\[run](javascript:alert(1))");
+    expect(generated).toContain("!\\[\\[embed\\]\\]");
+    expect(generated).toContain("\\[\\[invented\\]\\]");
+    expect(generated).toContain("!\\[pixel\\](https://evil.example/x)");
+    expect(generated).toContain("\\[run\\](javascript:alert(1))");
     expect(generated).toContain("# 제목 --- evil: true");
     expect(rendered).toContain("## 원문\n\n원문에는 ![[사용자-임베드]]와 <span>사용자 HTML</span>이 있습니다.\n");
+  });
+
+  it("neutralizes reference-style, collapsed, shortcut links and link definitions", () => {
+    const malicious = "[run][x]\n[x][]\n[x]\n\n[x]: javascript:alert(1)";
+    const source = "사용자 원문 [run][x]\n\n[x]: https://human.example\n";
+    const rendered = renderOrganizedNote({
+      source,
+      proposal: proposal({ summary: malicious, analogy: undefined, notes: undefined, tips: undefined, warnings: undefined }),
+      transactionId: "ORG-reference",
+      now: "2026-09-03T00:00:00.000Z",
+      existingNotePaths: existingNotes,
+    });
+    const generated = rendered.slice(0, rendered.indexOf("## 원문"));
+
+    expect(generated).toContain("\\[run\\]\\[x\\]");
+    expect(generated).toContain("\\[x\\]\\[\\]");
+    expect(generated).toContain("\\[x\\]: javascript:alert(1)");
+    expect(generated).not.toMatch(/(^|[^\\])\[(?:run|x)\]/mu);
+    expect(rendered).toContain(`## 원문\n\n${source}`);
   });
 
   it("emits only real candidate links plus the destination area's real parent MOC", () => {
@@ -152,5 +171,40 @@ describe("organized note rendering", () => {
       existingNotePaths: existingNotes,
     };
     expect(renderOrganizedNote(input)).toBe(renderOrganizedNote(input));
+  });
+
+  it("orders related paths bytewise independent of provider input order", () => {
+    const paths = new Set([...existingNotes, "20_Study/ab.md", "20_Study/a\u00adb.md"]);
+    const base = {
+      source: "body\n",
+      transactionId: "ORG-bytewise",
+      now: "2026-09-03T00:00:00.000Z",
+      existingNotePaths: paths,
+    };
+    const forward = renderOrganizedNote({
+      ...base,
+      proposal: proposal({ relatedNotePaths: ["20_Study/ab.md", "20_Study/a\u00adb.md"] }),
+    });
+    const reversed = renderOrganizedNote({
+      ...base,
+      proposal: proposal({ relatedNotePaths: ["20_Study/a\u00adb.md", "20_Study/ab.md"] }),
+    });
+
+    expect(reversed).toBe(forward);
+    expect(forward.indexOf("[[20_Study/ab]]")).toBeLessThan(forward.indexOf("[[20_Study/a\u00adb]]"));
+  });
+
+  it.each([
+    ["timestamp", "organization: 2026-09-03"],
+    ["binary", "organization: !!binary SGVsbG8="],
+    ["array", "organization: []"],
+  ])("rejects non-plain %s organization metadata", (_name, organization) => {
+    expect(() => renderOrganizedNote({
+      source: `---\n${organization}\n---\nbody\n`,
+      proposal: proposal(),
+      transactionId: "ORG-frontmatter",
+      now: "2026-09-03T00:00:00.000Z",
+      existingNotePaths: existingNotes,
+    })).toThrow(/organization.*plain|organization.*malformed/i);
   });
 });

@@ -82,8 +82,13 @@ function parseCurrentCanvas(text: string, existing: Set<string>): JsonCanvas {
   return parsed;
 }
 
+/** Total ordering over UTF-8 bytes; unlike localeCompare, this cannot vary with host ICU data. */
+function compareUtf8(left: string, right: string): number {
+  return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
+}
+
 function comparePaths(left: string, right: string): number {
-  return collisionKey(left).localeCompare(collisionKey(right), "en-US") || left.localeCompare(right, "en-US");
+  return compareUtf8(collisionKey(left), collisionKey(right)) || compareUtf8(left, right);
 }
 
 function requireExisting(path: string, existing: Set<string>): string {
@@ -135,7 +140,7 @@ export function renderManagedAreaCanvas(input: ManagedAreaCanvasInput): string {
     if (relationshipKeys.has(key)) throw new Error("duplicate managed Canvas relationship");
     relationshipKeys.add(key);
     return { from, to, fromNode, toNode, label: relationship.label as RelationshipLabel, key };
-  }).sort((left, right) => left.key.localeCompare(right.key, "en-US"));
+  }).sort((left, right) => compareUtf8(left.key, right.key));
   const edges = relationships.map((relationship) => ({
     id: idFor(`${relationship.fromNode}:${relationship.label}:${relationship.toNode}`),
     fromNode: relationship.fromNode,

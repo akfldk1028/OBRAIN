@@ -26,6 +26,27 @@ function collisionKey(value: string): string {
   return value.normalize("NFKC").toLocaleLowerCase("en-US");
 }
 
+/** Total ordering over UTF-8 bytes; unlike localeCompare, this cannot vary with host ICU data. */
+function compareUtf8(left: string, right: string): number {
+  return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
+}
+
+function assertUniformNewlines(value: string): void {
+  let style: "lf" | "crlf" | undefined;
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index];
+    if (character === "\r") {
+      if (value[index + 1] !== "\n") throw new Error("managed MOC newline style contains bare CR");
+      if (style === "lf") throw new Error("managed MOC newline styles are mixed");
+      style = "crlf";
+      index += 1;
+    } else if (character === "\n") {
+      if (style === "crlf") throw new Error("managed MOC newline styles are mixed");
+      style = "lf";
+    }
+  }
+}
+
 function validatePath(path: string): string {
   if (
     !path
@@ -65,6 +86,7 @@ function safeTitle(value: string): string {
 export function replaceManagedMocIndex(existing: string, links: Array<{ path: string; title: string }>): string {
   if (typeof existing !== "string" || Buffer.byteLength(existing, "utf8") > MAX_MOC_BYTES) throw new Error("managed MOC exceeds limit");
   if (!Array.isArray(links) || links.length > MAX_LINKS) throw new Error("managed MOC links exceed limit");
+  assertUniformNewlines(existing);
 
   const starts = exactLineMarkers(existing, START);
   const ends = exactLineMarkers(existing, END);
@@ -80,14 +102,32 @@ export function replaceManagedMocIndex(existing: string, links: Array<{ path: st
   const contentStart = start.end + newline.length;
   if (contentStart > end.start) throw new Error("managed marker pair is malformed");
 
-  const keys = new Set<string>();
-  const entries = links.map((link) => {
-    if (!link || typeof link !== "object") throw new Error("managed MOC link is invalid");
+  const spellingByKey = new Map<string, string>();
+  for (const link of links) {
+    if (!link || typeof link !== "object" || typeof link.path !== "string") throw new Error("managed MOC link is invalid");
     const key = collisionKey(link.path);
-    if (keys.has(key)) throw new Error(`managed MOC link collision is ambiguous: ${link.path}`);
-    keys.add(key);
-    return { path: validatePath(link.path), title: safeTitle(link.title), key };
-  }).sort((left, right) => left.key.localeCompare(right.key, "en-US") || left.path.localeCompare(right.path, "en-US"));
+    const priorSpelling = spellingByKey.get(key);
+    if (priorSpelling !== undefined && priorSpelling !== link.path) {
+      throw new Error(`managed MOC link collision is ambiguous: ${link.path}`);
+    }
+    spellingByKey.set(key, link.path);
+  }
+
+  const entriesByKey = new Map<string, { path: string; title: string; key: string }>();
+  for (const link of links) {
+    const path = validatePath(link.path);
+    const title = safeTitle(link.title);
+    const key = collisionKey(path);
+    const prior = entriesByKey.get(key);
+    if (prior) {
+      if (prior.path === path && prior.title === title) continue;
+      throw new Error(`managed MOC link collision is ambiguous: ${path}`);
+    }
+    entriesByKey.set(key, { path, title, key });
+  }
+  const entries = [...entriesByKey.values()].sort((left, right) => (
+    compareUtf8(left.key, right.key) || compareUtf8(left.path, right.path) || compareUtf8(left.title, right.title)
+  ));
 
   const replacement = entries.length
     ? `${entries.map((link) => `- [[${link.path}|${link.title}]]`).join(newline)}${newline}`

@@ -32,6 +32,14 @@ describe("managed MOC replacement", () => {
   });
 
   it.each([
+    ["a second pair hidden behind bare CR", `${start}\nfirst\n${end}\r${start}\rhidden human text\r${end}\r`],
+    ["pure bare CR", `human before\r${start}\rold\r${end}\rhuman after\r`],
+    ["mixed CRLF and LF", `human before\r\n${start}\nold\n${end}\r\nhuman after\r\n`],
+  ])("rejects ambiguous newline ownership for %s", (_name, existing) => {
+    expect(() => replaceManagedMocIndex(existing, [{ path: "20_Study/a.md", title: "A" }])).toThrow(/newline/i);
+  });
+
+  it.each([
     ["missing", "human text only"],
     ["duplicate", `${start}\na\n${end}\n${start}\nb\n${end}\n`],
     ["nested", `${start}\n${start}\n${end}\n${end}\n`],
@@ -64,5 +72,25 @@ describe("managed MOC replacement", () => {
     expect(rendered.match(/\[\[/g)).toHaveLength(1);
     expect(rendered).not.toContain("\n# injected");
     expect(rendered).toContain("safe&#93;&#93; &#124; &#91;&#91;evil # injected");
+  });
+
+  it("collapses byte-identical duplicate links but rejects conflicting duplicate identities", () => {
+    const existing = `${start}\nold\n${end}\n`;
+    const duplicate = { path: "20_Study/same.md", title: "Same" };
+    const rendered = replaceManagedMocIndex(existing, [duplicate, duplicate]);
+
+    expect(rendered.match(/20_Study\/same\.md/gu)).toHaveLength(1);
+    expect(() => replaceManagedMocIndex(existing, [duplicate, { ...duplicate, title: "Different" }])).toThrow(/ambiguous|collision/i);
+  });
+
+  it("orders paths by a host-independent bytewise comparator", () => {
+    const existing = `${start}\nold\n${end}\n`;
+    const ordinary = { path: "20_Study/ab.md", title: "ordinary" };
+    const softHyphen = { path: "20_Study/a\u00adb.md", title: "soft hyphen" };
+
+    const forward = replaceManagedMocIndex(existing, [ordinary, softHyphen]);
+    const reversed = replaceManagedMocIndex(existing, [softHyphen, ordinary]);
+    expect(reversed).toBe(forward);
+    expect(forward.indexOf("20_Study/ab.md")).toBeLessThan(forward.indexOf("20_Study/a\u00adb.md"));
   });
 });

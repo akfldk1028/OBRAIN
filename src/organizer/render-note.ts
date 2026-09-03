@@ -14,6 +14,15 @@ function collisionKey(value: string): string {
   return value.normalize("NFKC").toLocaleLowerCase("en-US");
 }
 
+/** Total ordering over UTF-8 bytes; unlike localeCompare, this cannot vary with host ICU data. */
+function compareUtf8(left: string, right: string): number {
+  return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
+}
+
+function comparePaths(left: string, right: string): number {
+  return compareUtf8(collisionKey(left), collisionKey(right)) || compareUtf8(left, right);
+}
+
 function assertMarkdownPath(value: string): string {
   if (
     !value
@@ -57,12 +66,11 @@ function assertProviderText(value: string, maxCharacters: number, field: string)
 export function renderSafeMarkdownText(value: string): string {
   return value
     .replaceAll("&", "&amp;")
+    .replaceAll("\\", "&#92;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
-    .replace(/(?<![!\\])\[\[/gu, "\\[[")
-    .replace(/!\[\[/gu, "\\![[")
-    .replace(/!\[(?!\[)/gu, "\\![")
-    .replace(/(?<!!)\[([^\]\r\n]*)\]\(([^)\r\n]*)\)/gu, "\\[$1]($2)");
+    .replaceAll("[", "\\[")
+    .replaceAll("]", "\\]");
 }
 
 function singleLine(value: string): string {
@@ -82,7 +90,9 @@ function linkTarget(path: string): string {
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const prototype: unknown = Object.getPrototypeOf(value);
+  return prototype === null || prototype === Object.prototype;
 }
 
 export function renderOrganizedNote(input: {
@@ -159,7 +169,7 @@ export function renderOrganizedNote(input: {
 
   const related = [...new Set(input.proposal.relatedNotePaths)]
     .filter((path) => existing.has(path) && path !== parentPath)
-    .sort((left, right) => collisionKey(left).localeCompare(collisionKey(right), "en-US"));
+    .sort(comparePaths);
   lines.push("", "## 연결된 노트", "", `- 상위 목차: [[${linkTarget(parentPath)}]]`);
   for (const path of related) lines.push(`- 관련 개념: [[${linkTarget(path)}]]`);
   lines.push("", "## 원문", "");
