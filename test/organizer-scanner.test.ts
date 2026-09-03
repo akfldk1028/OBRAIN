@@ -17,6 +17,8 @@ const readProbe = vi.hoisted(() => ({ paths: [] as string[] }));
 const ioProbe = vi.hoisted(() => ({
   beforeOpen: undefined as undefined | ((filePath: string) => Promise<void>),
   beforeRead: undefined as undefined | ((filePath: string) => Promise<void>),
+  beforeRealpath: undefined as undefined | ((filePath: string) => Promise<string | null | undefined>),
+  lstatReplacement: undefined as undefined | { path: string; replacementPath: string },
   handleReads: [] as Array<{ path: string; requestedBytes: number }>,
 }));
 
@@ -24,6 +26,25 @@ vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
   return {
     ...actual,
+    lstat: async (filePath: string, options?: { bigint?: boolean }) => {
+      const replacement = ioProbe.lstatReplacement;
+      const selectedPath = replacement?.path === filePath ? replacement.replacementPath : filePath;
+      if (replacement?.path === filePath) ioProbe.lstatReplacement = undefined;
+      return options?.bigint
+        ? actual.lstat(selectedPath, { bigint: true })
+        : actual.lstat(selectedPath);
+    },
+    realpath: async (filePath: string) => {
+      const beforeRealpath = ioProbe.beforeRealpath;
+      if (beforeRealpath) {
+        const result = await beforeRealpath(filePath);
+        if (result !== undefined) {
+          ioProbe.beforeRealpath = undefined;
+          if (result !== null) return result;
+        }
+      }
+      return actual.realpath(filePath);
+    },
     readFile: async (...args: Parameters<typeof actual.readFile>) => {
       readProbe.paths.push(String(args[0]));
       return actual.readFile(...args);
@@ -79,6 +100,8 @@ afterEach(async () => {
   readProbe.paths.length = 0;
   ioProbe.beforeOpen = undefined;
   ioProbe.beforeRead = undefined;
+  ioProbe.beforeRealpath = undefined;
+  ioProbe.lstatReplacement = undefined;
   ioProbe.handleReads.length = 0;
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
@@ -242,5 +265,71 @@ describe("stable Inbox scanner", () => {
     expect(readProbe.paths).toEqual([]);
     expect(ioProbe.handleReads.length).toBeGreaterThan(0);
     expect(ioProbe.handleReads.every((read) => read.requestedBytes <= 5)).toBe(true);
+  });
+
+  it("rejects a root replaced by a junction between lstat and realpath", async () => {
+    const root = await makeVault();
+    const outside = await makeVault();
+    await writeAgedFile(path.join(outside, "Agent-Inbox", "escaped.md"), "escaped", 600);
+    ioProbe.beforeRealpath = async (filePath) => {
+      if (filePath !== root) return undefined;
+      await rm(root, { recursive: true, force: true });
+      await symlink(outside, root, "junction");
+      return null;
+    };
+
+    await expect(scanStableInbox({ root, minStableSeconds: 300, nowMs })).rejects.toThrow(/root.*(?:changed|symlink)/i);
+    expect(ioProbe.handleReads).toEqual([]);
+  });
+
+  it("rejects an Inbox replaced by an internal junction during resolution", async () => {
+    const root = await makeVault();
+    const inbox = path.join(root, "Agent-Inbox");
+    const replacement = path.join(root, ".alternate-inbox");
+    await writeAgedFile(path.join(replacement, "escaped.md"), "escaped", 600);
+    ioProbe.beforeRealpath = async (filePath) => {
+      if (filePath !== inbox) return undefined;
+      await rm(inbox, { recursive: true, force: true });
+      await symlink(replacement, inbox, "junction");
+      return null;
+    };
+
+    await expect(scanStableInbox({ root, minStableSeconds: 300, nowMs })).rejects.toThrow(/Inbox.*(?:changed|symlink)/i);
+    expect(ioProbe.handleReads).toEqual([]);
+  });
+
+  it("skips a traversed directory replaced by an internal junction during resolution", async () => {
+    const root = await makeVault();
+    const inbox = path.join(root, "Agent-Inbox");
+    const directory = path.join(inbox, "race");
+    const replacement = path.join(inbox, ".replacement");
+    await writeAgedFile(path.join(directory, "original.md"), "original", 600);
+    await writeAgedFile(path.join(replacement, "escaped.md"), "escaped", 600);
+    ioProbe.beforeRealpath = async (filePath) => {
+      if (filePath !== directory) return undefined;
+      await rm(directory, { recursive: true, force: true });
+      await symlink(replacement, directory, "junction");
+      return null;
+    };
+
+    expect(await scanStableInbox({ root, minStableSeconds: 300, nowMs })).toEqual([]);
+    expect(ioProbe.handleReads).toEqual([]);
+  });
+
+  it("discards a pathname replaced between the final lstat and realpath", async () => {
+    const root = await makeVault();
+    const candidate = path.join(root, "Agent-Inbox", "candidate.md");
+    const replacement = path.join(root, "Agent-Inbox", ".replacement", "candidate.md");
+    await writeAgedFile(candidate, "inside", 600);
+    await writeAgedFile(replacement, "other!", 600);
+    ioProbe.beforeRead = async (filePath) => {
+      ioProbe.beforeRealpath = async (resolvedPath) => {
+        if (resolvedPath !== filePath) return undefined;
+        ioProbe.lstatReplacement = { path: filePath, replacementPath: replacement };
+        return replacement;
+      };
+    };
+
+    expect(await scanStableInbox({ root, minStableSeconds: 300, nowMs })).toEqual([]);
   });
 });

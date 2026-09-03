@@ -100,6 +100,26 @@ describe("organizer paths", () => {
     const longDestination = `20_Study/${longSegment}/${longSegment}/${longSegment}/${longSegment}`;
     expect(() => buildDestinationPath(longDestination, "한".repeat(100), new Set())).toThrow(/byte/i);
   });
+
+  it("also enforces UTF-8 bounds on exact compatibility-character spelling", () => {
+    const exactOversizedButNormalizedShort = "Ａ".repeat(81);
+    expect(() => assertInboxSource(`Agent-Inbox/${exactOversizedButNormalizedShort}/note.md`))
+      .toThrow(/byte/i);
+
+    const exactLongSegment = "Ａ".repeat(70);
+    const exactLongFilename = "Ｂ".repeat(56);
+    const exactLongPath = [
+      "Agent-Inbox",
+      exactLongSegment,
+      exactLongSegment,
+      exactLongSegment,
+      exactLongSegment,
+      `${exactLongFilename}.md`,
+    ].join("/");
+    expect(Buffer.byteLength(exactLongPath, "utf8")).toBeGreaterThan(1_024);
+    expect(Buffer.byteLength(exactLongPath.normalize("NFKC"), "utf8")).toBeLessThan(1_024);
+    expect(() => assertInboxSource(exactLongPath)).toThrow(/byte/i);
+  });
 });
 
 function pathBasename(value: string): string {

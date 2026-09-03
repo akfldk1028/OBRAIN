@@ -94,6 +94,64 @@ function sameSnapshot(left: BigIntStats, right: BigIntStats): boolean {
     && left.mtimeNs === right.mtimeNs;
 }
 
+function sameDirectorySnapshot(left: BigIntStats, right: BigIntStats): boolean {
+  return left.isDirectory()
+    && right.isDirectory()
+    && sameIdentity(left, right)
+    && left.size === right.size
+    && left.mtimeNs === right.mtimeNs;
+}
+
+class PathResolutionRaceError extends Error {}
+
+async function resolveBoundDirectory(
+  pathname: string,
+  before: BigIntStats,
+  label: string,
+): Promise<string> {
+  if (before.isSymbolicLink() || !before.isDirectory()) {
+    throw new PathResolutionRaceError(`${label} is not a safe directory`);
+  }
+  const canonicalPath = await realpath(pathname);
+  const after = await lstat(pathname, { bigint: true });
+  const resolved = await lstat(canonicalPath, { bigint: true });
+  if (
+    after.isSymbolicLink()
+    || !sameDirectorySnapshot(before, after)
+    || !sameDirectorySnapshot(before, resolved)
+  ) {
+    throw new PathResolutionRaceError(`${label} changed or became a symlink during resolution`);
+  }
+  return canonicalPath;
+}
+
+interface BoundFilePath {
+  canonicalPath: string;
+  after: BigIntStats;
+  resolved: BigIntStats;
+}
+
+async function resolveBoundFile(
+  pathname: string,
+  before: BigIntStats,
+  label: string,
+): Promise<BoundFilePath> {
+  if (before.isSymbolicLink() || !before.isFile()) {
+    throw new PathResolutionRaceError(`${label} is not a safe file`);
+  }
+  const canonicalPath = await realpath(pathname);
+  const after = await lstat(pathname, { bigint: true });
+  const resolved = await lstat(canonicalPath, { bigint: true });
+  if (
+    after.isSymbolicLink()
+    || !sameSnapshot(before, after)
+    || !sameSnapshot(before, resolved)
+  ) {
+    throw new PathResolutionRaceError(`${label} changed or became a symlink during resolution`);
+  }
+  return { canonicalPath, after, resolved };
+}
+
 async function readAtMost(handle: FileHandle, byteLimit: number): Promise<Buffer> {
   const buffer = Buffer.alloc(byteLimit);
   let offset = 0;
@@ -119,11 +177,7 @@ export async function scanStableInbox(input: {
   const suppliedRootStat = await lstat(input.root, { bigint: true });
   if (suppliedRootStat.isSymbolicLink()) throw new Error("scanner root is a symlink");
   if (!suppliedRootStat.isDirectory()) throw new Error("scanner root is not a directory");
-  const canonicalRoot = await realpath(input.root);
-  const rootStat = await lstat(canonicalRoot, { bigint: true });
-  if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
-    throw new Error("scanner root is not a safe directory");
-  }
+  const canonicalRoot = await resolveBoundDirectory(input.root, suppliedRootStat, "scanner root");
 
   const inbox = path.join(canonicalRoot, BRAIN_FOUNDATION_POLICY.inbox);
   let inboxStat;
@@ -136,7 +190,7 @@ export async function scanStableInbox(input: {
   if (inboxStat.isSymbolicLink()) throw new Error("scanner Inbox is a symlink");
   if (!inboxStat.isDirectory()) throw new Error("scanner Inbox is not a directory");
 
-  const canonicalInbox = await realpath(inbox);
+  const canonicalInbox = await resolveBoundDirectory(inbox, inboxStat, "scanner Inbox");
   if (isOutside(canonicalRoot, canonicalInbox)) throw new Error("scanner Inbox escaped the vault root");
 
   const discovered: DiscoveredFile[] = [];
@@ -163,7 +217,17 @@ export async function scanStableInbox(input: {
         } catch {
           continue;
         }
-        const canonicalDirectory = await realpath(absolutePath);
+        let canonicalDirectory: string;
+        try {
+          canonicalDirectory = await resolveBoundDirectory(
+            absolutePath,
+            stat,
+            `scanner directory ${relativePath}`,
+          );
+        } catch (error: unknown) {
+          if (error instanceof PathResolutionRaceError || raceDisappeared(error)) continue;
+          throw error;
+        }
         if (
           isOutside(canonicalRoot, canonicalDirectory)
           || isOutside(canonicalInbox, canonicalDirectory)
@@ -181,7 +245,17 @@ export async function scanStableInbox(input: {
       } catch {
         continue;
       }
-      const canonicalFile = await realpath(absolutePath);
+      let canonicalFile: string;
+      try {
+        canonicalFile = (await resolveBoundFile(
+          absolutePath,
+          stat,
+          `scanner file ${sourcePath}`,
+        )).canonicalPath;
+      } catch (error: unknown) {
+        if (error instanceof PathResolutionRaceError || raceDisappeared(error)) continue;
+        throw error;
+      }
       if (isOutside(canonicalRoot, canonicalFile) || isOutside(canonicalInbox, canonicalFile)) continue;
       discovered.push({ sourcePath, absolutePath: canonicalFile, stat });
     }
@@ -219,22 +293,27 @@ export async function scanStableInbox(input: {
 
       const content = await readAtMost(handle, maxBytes + 1);
       const finalHandleStat = await handle.stat({ bigint: true });
-      let finalPathStat: BigIntStats;
-      let finalCanonicalPath: string;
+      let finalPathBefore: BigIntStats;
+      let finalBoundPath: BoundFilePath;
       try {
-        finalPathStat = await lstat(file.absolutePath, { bigint: true });
-        finalCanonicalPath = await realpath(file.absolutePath);
+        finalPathBefore = await lstat(file.absolutePath, { bigint: true });
+        finalBoundPath = await resolveBoundFile(
+          file.absolutePath,
+          finalPathBefore,
+          `scanner final file ${file.sourcePath}`,
+        );
       } catch (error: unknown) {
-        if (raceDisappeared(error)) continue;
+        if (error instanceof PathResolutionRaceError || raceDisappeared(error)) continue;
         throw error;
       }
       if (
         content.length > maxBytes
-        || finalPathStat.isSymbolicLink()
         || !sameSnapshot(file.stat, finalHandleStat)
-        || !sameSnapshot(file.stat, finalPathStat)
-        || isOutside(canonicalRoot, finalCanonicalPath)
-        || isOutside(canonicalInbox, finalCanonicalPath)
+        || !sameSnapshot(file.stat, finalPathBefore)
+        || !sameSnapshot(file.stat, finalBoundPath.after)
+        || !sameSnapshot(file.stat, finalBoundPath.resolved)
+        || isOutside(canonicalRoot, finalBoundPath.canonicalPath)
+        || isOutside(canonicalInbox, finalBoundPath.canonicalPath)
       ) {
         continue;
       }

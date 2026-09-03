@@ -53,12 +53,16 @@ function normalizeRelativePath(value: string): string {
     throw unsafePath(value);
   }
 
-  if (normalizedSegments.some((segment) => (
+  if (identitySegments.some((segment, index) => (
     Buffer.byteLength(segment, "utf8") > MAX_COMPONENT_UTF8_BYTES
+    || Buffer.byteLength(normalizedSegments[index], "utf8") > MAX_COMPONENT_UTF8_BYTES
   ))) {
     throw new Error(`organizer path component exceeds UTF-8 byte limit: ${value}`);
   }
-  if (Buffer.byteLength(normalizedSegments.join("/"), "utf8") > MAX_RELATIVE_PATH_UTF8_BYTES) {
+  if (
+    Buffer.byteLength(identitySegments.join("/"), "utf8") > MAX_RELATIVE_PATH_UTF8_BYTES
+    || Buffer.byteLength(normalizedSegments.join("/"), "utf8") > MAX_RELATIVE_PATH_UTF8_BYTES
+  ) {
     throw new Error(`organizer relative path exceeds UTF-8 byte limit: ${value}`);
   }
 
