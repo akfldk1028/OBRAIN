@@ -4,30 +4,44 @@ import type { AreaDefinition, VaultFoundationPolicy } from "./policy.js";
 import { areaMocPath } from "./policy.js";
 
 const idFor = (value: string) => createHash("sha256").update(value).digest("hex").slice(0, 16);
+const idSchema = z.string().regex(/^[0-9a-f]{16}$/);
 
 const nodeSchema = z.object({
-  id: z.string(),
+  id: idSchema,
   type: z.literal("file"),
   file: z.string(),
   x: z.number(),
   y: z.number(),
   width: z.number().positive(),
   height: z.number().positive(),
-});
+}).strict();
 
 const edgeSchema = z.object({
-  id: z.string(),
-  fromNode: z.string(),
-  toNode: z.string(),
+  id: idSchema,
+  fromNode: idSchema,
+  toNode: idSchema,
   label: z.string(),
-});
+}).strict();
 
-const canvasSchema = z.object({ nodes: z.array(nodeSchema), edges: z.array(edgeSchema) });
+const canvasSchema = z.object({ nodes: z.array(nodeSchema), edges: z.array(edgeSchema) }).strict();
 
 export type JsonCanvas = z.infer<typeof canvasSchema>;
 
 export function validateGeneratedCanvas(value: unknown): value is JsonCanvas {
-  return canvasSchema.safeParse(value).success;
+  const parsed = canvasSchema.safeParse(value);
+  if (!parsed.success) return false;
+
+  const nodeIds = new Set(parsed.data.nodes.map((node) => node.id));
+  if (nodeIds.size !== parsed.data.nodes.length) return false;
+
+  const allIds = new Set(nodeIds);
+  for (const edge of parsed.data.edges) {
+    if (allIds.has(edge.id)) return false;
+    allIds.add(edge.id);
+    if (!nodeIds.has(edge.fromNode) || !nodeIds.has(edge.toNode)) return false;
+  }
+
+  return true;
 }
 
 export function renderBrainCanvas(policy: VaultFoundationPolicy): string {

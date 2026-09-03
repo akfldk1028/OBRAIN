@@ -27,4 +27,44 @@ describe("generated Brain Canvas", () => {
   it("rejects malformed generated Canvas values", () => {
     expect(validateGeneratedCanvas({ nodes: [], edges: [{ id: "edge" }] })).toBe(false);
   });
+
+  it("rejects extra fields at the root, node, and edge levels", () => {
+    const parsed = JSON.parse(renderBrainCanvas(BRAIN_FOUNDATION_POLICY));
+    expect(validateGeneratedCanvas({ ...parsed, extra: true })).toBe(false);
+    expect(validateGeneratedCanvas({ ...parsed, nodes: [{ ...parsed.nodes[0], extra: true }, ...parsed.nodes.slice(1)] })).toBe(false);
+    expect(validateGeneratedCanvas({ ...parsed, edges: [{ ...parsed.edges[0], extra: true }, ...parsed.edges.slice(1)] })).toBe(false);
+  });
+
+  it("rejects unknown node shapes including text nodes", () => {
+    const parsed = JSON.parse(renderBrainCanvas(BRAIN_FOUNDATION_POLICY));
+    const textNode = { id: "0123456789abcdef", type: "text", text: "not a file", x: 0, y: 0, width: 100, height: 100 };
+    expect(validateGeneratedCanvas({ ...parsed, nodes: [textNode] })).toBe(false);
+  });
+
+  it("requires every node and edge ID to be a lowercase 16-character hex prefix", () => {
+    const parsed = JSON.parse(renderBrainCanvas(BRAIN_FOUNDATION_POLICY));
+    for (const id of ["short", "0123456789ABCDEf", "0123456789abcdeg"]) {
+      expect(validateGeneratedCanvas({ ...parsed, nodes: [{ ...parsed.nodes[0], id }] })).toBe(false);
+      expect(validateGeneratedCanvas({ ...parsed, edges: [{ ...parsed.edges[0], id }] })).toBe(false);
+    }
+  });
+
+  it("rejects duplicate IDs across nodes and edges", () => {
+    const parsed = JSON.parse(renderBrainCanvas(BRAIN_FOUNDATION_POLICY));
+    expect(validateGeneratedCanvas({ ...parsed, nodes: [{ ...parsed.nodes[0], id: parsed.nodes[1].id }, ...parsed.nodes.slice(1)] })).toBe(false);
+    expect(validateGeneratedCanvas({ ...parsed, edges: [{ ...parsed.edges[0], id: parsed.edges[1].id }, ...parsed.edges.slice(1)] })).toBe(false);
+    expect(validateGeneratedCanvas({ ...parsed, edges: [{ ...parsed.edges[0], id: parsed.nodes[0].id }, ...parsed.edges.slice(1)] })).toBe(false);
+  });
+
+  it("rejects edges that point to missing nodes", () => {
+    const parsed = JSON.parse(renderBrainCanvas(BRAIN_FOUNDATION_POLICY));
+    expect(validateGeneratedCanvas({ ...parsed, edges: [{ ...parsed.edges[0], toNode: "0123456789abcdef" }, ...parsed.edges.slice(1)] })).toBe(false);
+  });
+
+  it("renders globally unique 16-character lowercase IDs", () => {
+    const parsed = JSON.parse(renderBrainCanvas(BRAIN_FOUNDATION_POLICY));
+    const ids = [...parsed.nodes.map((node: { id: string }) => node.id), ...parsed.edges.map((edge: { id: string }) => edge.id)];
+    expect(ids.every((id: string) => /^[0-9a-f]{16}$/.test(id))).toBe(true);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
 });
