@@ -8,7 +8,7 @@ const organizerConfigSchema = z.object({
   enabledVaults: z.array(z.string().min(1)).min(1),
   mode: z.enum(["disabled", "dry-run", "automatic"]).default("dry-run"),
   minStableSeconds: z.number().int().min(0).max(86_400).default(300),
-  autoApplyConfidence: z.number().min(0).max(1).default(0.90),
+  autoApplyConfidence: z.number().min(0.90).max(1).default(0.90),
   maxNotesPerRun: z.number().int().min(1).max(1_000).default(20),
   maxNoteBytes: z.number().int().min(1).max(1_048_576).default(131_072),
   maxContextBytes: z.number().int().min(1).max(1_048_576).default(262_144),

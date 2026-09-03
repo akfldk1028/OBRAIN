@@ -72,4 +72,25 @@ describe("organizer environment", () => {
       await fx.cleanup();
     }
   });
+
+  it.each(["dry-run", "automatic"] as const)("rejects confidence below 0.90 in %s mode", async (mode) => {
+    const fx = await makeTempVaultSet(["brain"]);
+    const configPath = path.join(fx.root, "config.json");
+    await writeFile(configPath, JSON.stringify({
+      dataDir: path.join(fx.root, "data"),
+      owner: {
+        id: "owner",
+        passphrase: "a-long-test-passphrase",
+        allowedVaults: ["brain"],
+      },
+      vaults: fx.vaults,
+      organizer: { enabledVaults: ["brain"], mode, autoApplyConfidence: 0.89 },
+    }), { mode: 0o600 });
+
+    try {
+      await expect(loadKnowledgeConfig(configPath)).rejects.toThrow(/greater than or equal to 0.9/i);
+    } finally {
+      await fx.cleanup();
+    }
+  });
 });
