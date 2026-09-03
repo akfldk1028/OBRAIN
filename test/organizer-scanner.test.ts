@@ -8,6 +8,7 @@ import {
   utimes,
   writeFile,
 } from "node:fs/promises";
+import type { BigIntStats } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -18,7 +19,9 @@ const ioProbe = vi.hoisted(() => ({
   beforeOpen: undefined as undefined | ((filePath: string) => Promise<void>),
   beforeRead: undefined as undefined | ((filePath: string) => Promise<void>),
   beforeRealpath: undefined as undefined | ((filePath: string) => Promise<string | null | undefined>),
+  beforeReaddir: undefined as undefined | ((directory: string) => Promise<boolean>),
   lstatReplacement: undefined as undefined | { path: string; replacementPath: string },
+  stableDirectoryStats: new Map<string, BigIntStats>(),
   handleReads: [] as Array<{ path: string; requestedBytes: number }>,
 }));
 
@@ -30,6 +33,8 @@ vi.mock("node:fs/promises", async (importOriginal) => {
       const replacement = ioProbe.lstatReplacement;
       const selectedPath = replacement?.path === filePath ? replacement.replacementPath : filePath;
       if (replacement?.path === filePath) ioProbe.lstatReplacement = undefined;
+      const stableDirectoryStat = ioProbe.stableDirectoryStats.get(filePath);
+      if (stableDirectoryStat && options?.bigint) return stableDirectoryStat;
       return options?.bigint
         ? actual.lstat(selectedPath, { bigint: true })
         : actual.lstat(selectedPath);
@@ -44,6 +49,11 @@ vi.mock("node:fs/promises", async (importOriginal) => {
         }
       }
       return actual.realpath(filePath);
+    },
+    readdir: async (directory: string, options: { withFileTypes: true }) => {
+      const beforeReaddir = ioProbe.beforeReaddir;
+      if (beforeReaddir && await beforeReaddir(directory)) ioProbe.beforeReaddir = undefined;
+      return actual.readdir(directory, options);
     },
     readFile: async (...args: Parameters<typeof actual.readFile>) => {
       readProbe.paths.push(String(args[0]));
@@ -101,7 +111,9 @@ afterEach(async () => {
   ioProbe.beforeOpen = undefined;
   ioProbe.beforeRead = undefined;
   ioProbe.beforeRealpath = undefined;
+  ioProbe.beforeReaddir = undefined;
   ioProbe.lstatReplacement = undefined;
+  ioProbe.stableDirectoryStats.clear();
   ioProbe.handleReads.length = 0;
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
@@ -238,14 +250,17 @@ describe("stable Inbox scanner", () => {
 
   it("discards a candidate replaced by an escaping junction before its handle opens", async () => {
     const root = await makeVault();
+    const inbox = path.join(root, "Agent-Inbox");
     const candidateDirectory = path.join(root, "Agent-Inbox", "race");
     await writeAgedFile(path.join(candidateDirectory, "note.md"), "inside", 600);
     const outside = await mkdtemp(path.join(os.tmpdir(), "brain-scanner-outside-"));
     roots.push(outside);
     await writeAgedFile(path.join(outside, "note.md"), "secret", 600);
+    const inboxStat = await lstat(inbox, { bigint: true });
     ioProbe.beforeOpen = async () => {
       await rm(candidateDirectory, { recursive: true, force: true });
       await symlink(outside, candidateDirectory, "junction");
+      ioProbe.stableDirectoryStats.set(inbox, inboxStat);
     };
 
     expect(await scanStableInbox({ root, minStableSeconds: 300, nowMs })).toEqual([]);
@@ -305,10 +320,12 @@ describe("stable Inbox scanner", () => {
     const replacement = path.join(inbox, ".replacement");
     await writeAgedFile(path.join(directory, "original.md"), "original", 600);
     await writeAgedFile(path.join(replacement, "escaped.md"), "escaped", 600);
+    const inboxStat = await lstat(inbox, { bigint: true });
     ioProbe.beforeRealpath = async (filePath) => {
       if (filePath !== directory) return undefined;
       await rm(directory, { recursive: true, force: true });
       await symlink(replacement, directory, "junction");
+      ioProbe.stableDirectoryStats.set(inbox, inboxStat);
       return null;
     };
 
@@ -328,6 +345,57 @@ describe("stable Inbox scanner", () => {
         ioProbe.lstatReplacement = { path: filePath, replacementPath: replacement };
         return replacement;
       };
+    };
+
+    expect(await scanStableInbox({ root, minStableSeconds: 300, nowMs })).toEqual([]);
+  });
+
+  it("rejects root replacement after resolution when final lineage validation fails", async () => {
+    const root = await makeVault();
+    const outside = await makeVault();
+    const inbox = path.join(root, "Agent-Inbox");
+    await writeAgedFile(path.join(outside, "Agent-Inbox", "redirected.md"), "redirected", 600);
+    ioProbe.beforeReaddir = async (directory) => {
+      if (directory !== inbox) return false;
+      await rm(root, { recursive: true, force: true });
+      await symlink(outside, root, "junction");
+      return true;
+    };
+
+    await expect(scanStableInbox({ root, minStableSeconds: 300, nowMs })).rejects.toThrow(/root.*(?:changed|symlink)/i);
+  });
+
+  it("rejects Inbox replacement after resolution when final lineage validation fails", async () => {
+    const root = await makeVault();
+    const inbox = path.join(root, "Agent-Inbox");
+    const replacement = path.join(root, ".alternate-inbox");
+    await writeAgedFile(path.join(replacement, "redirected.md"), "redirected", 600);
+    const rootStat = await lstat(root, { bigint: true });
+    ioProbe.beforeReaddir = async (directory) => {
+      if (directory !== inbox) return false;
+      await rm(inbox, { recursive: true, force: true });
+      await symlink(replacement, inbox, "junction");
+      ioProbe.stableDirectoryStats.set(root, rootStat);
+      return true;
+    };
+
+    await expect(scanStableInbox({ root, minStableSeconds: 300, nowMs })).rejects.toThrow(/Inbox.*(?:changed|symlink)/i);
+  });
+
+  it("skips a child replaced by an internal junction after resolution and before traversal", async () => {
+    const root = await makeVault();
+    const inbox = path.join(root, "Agent-Inbox");
+    const child = path.join(inbox, "child");
+    const replacement = path.join(inbox, ".replacement-after-resolve");
+    await writeAgedFile(path.join(child, "original.md"), "original", 600);
+    await writeAgedFile(path.join(replacement, "redirected.md"), "redirected", 600);
+    const inboxStat = await lstat(inbox, { bigint: true });
+    ioProbe.beforeReaddir = async (directory) => {
+      if (directory !== child) return false;
+      await rm(child, { recursive: true, force: true });
+      await symlink(replacement, child, "junction");
+      ioProbe.stableDirectoryStats.set(inbox, inboxStat);
+      return true;
     };
 
     expect(await scanStableInbox({ root, minStableSeconds: 300, nowMs })).toEqual([]);

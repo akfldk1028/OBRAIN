@@ -71,6 +71,7 @@ interface DiscoveredFile {
   sourcePath: string;
   absolutePath: string;
   stat: BigIntStats;
+  lineage: readonly BoundDirectory[];
 }
 
 function collisionKey(value: string): string {
@@ -104,11 +105,27 @@ function sameDirectorySnapshot(left: BigIntStats, right: BigIntStats): boolean {
 
 class PathResolutionRaceError extends Error {}
 
+interface BoundDirectory {
+  pathname: string;
+  canonicalPath: string;
+  snapshot: BigIntStats;
+  label: string;
+}
+
+function isStrictlyInside(parent: string, child: string): boolean {
+  const relative = path.relative(parent, child);
+  return relative !== ""
+    && relative !== ".."
+    && !relative.startsWith(`..${path.sep}`)
+    && !path.isAbsolute(relative);
+}
+
 async function resolveBoundDirectory(
   pathname: string,
   before: BigIntStats,
   label: string,
-): Promise<string> {
+  parent?: BoundDirectory,
+): Promise<BoundDirectory> {
   if (before.isSymbolicLink() || !before.isDirectory()) {
     throw new PathResolutionRaceError(`${label} is not a safe directory`);
   }
@@ -119,10 +136,45 @@ async function resolveBoundDirectory(
     after.isSymbolicLink()
     || !sameDirectorySnapshot(before, after)
     || !sameDirectorySnapshot(before, resolved)
+    || (parent !== undefined && !isStrictlyInside(parent.canonicalPath, canonicalPath))
   ) {
     throw new PathResolutionRaceError(`${label} changed or became a symlink during resolution`);
   }
-  return canonicalPath;
+  return { pathname, canonicalPath, snapshot: before, label };
+}
+
+class DirectoryLineageError extends Error {
+  constructor(message: string, readonly critical: boolean) {
+    super(message);
+  }
+}
+
+async function revalidateDirectoryLineage(lineage: readonly BoundDirectory[]): Promise<void> {
+  let currentParent: BoundDirectory | undefined;
+  for (const [index, original] of lineage.entries()) {
+    try {
+      const before = await lstat(original.pathname, { bigint: true });
+      const current = await resolveBoundDirectory(
+        original.pathname,
+        before,
+        original.label,
+        currentParent,
+      );
+      if (
+        current.canonicalPath !== original.canonicalPath
+        || !sameDirectorySnapshot(original.snapshot, current.snapshot)
+      ) {
+        throw new PathResolutionRaceError(`${original.label} no longer names its bound directory`);
+      }
+      currentParent = current;
+    } catch (error: unknown) {
+      if (!(error instanceof PathResolutionRaceError) && !raceDisappeared(error)) throw error;
+      throw new DirectoryLineageError(
+        `${original.label} changed or became a symlink after resolution`,
+        index < 2,
+      );
+    }
+  }
 }
 
 interface BoundFilePath {
@@ -177,12 +229,12 @@ export async function scanStableInbox(input: {
   const suppliedRootStat = await lstat(input.root, { bigint: true });
   if (suppliedRootStat.isSymbolicLink()) throw new Error("scanner root is a symlink");
   if (!suppliedRootStat.isDirectory()) throw new Error("scanner root is not a directory");
-  const canonicalRoot = await resolveBoundDirectory(input.root, suppliedRootStat, "scanner root");
+  const root = await resolveBoundDirectory(input.root, suppliedRootStat, "scanner root");
 
-  const inbox = path.join(canonicalRoot, BRAIN_FOUNDATION_POLICY.inbox);
+  const inboxPath = path.join(root.canonicalPath, BRAIN_FOUNDATION_POLICY.inbox);
   let inboxStat;
   try {
-    inboxStat = await lstat(inbox, { bigint: true });
+    inboxStat = await lstat(inboxPath, { bigint: true });
   } catch (error: unknown) {
     if (isGone(error)) return [];
     throw error;
@@ -190,15 +242,28 @@ export async function scanStableInbox(input: {
   if (inboxStat.isSymbolicLink()) throw new Error("scanner Inbox is a symlink");
   if (!inboxStat.isDirectory()) throw new Error("scanner Inbox is not a directory");
 
-  const canonicalInbox = await resolveBoundDirectory(inbox, inboxStat, "scanner Inbox");
-  if (isOutside(canonicalRoot, canonicalInbox)) throw new Error("scanner Inbox escaped the vault root");
+  const inbox = await resolveBoundDirectory(inboxPath, inboxStat, "scanner Inbox", root);
+  if (isOutside(root.canonicalPath, inbox.canonicalPath)) {
+    throw new Error("scanner Inbox escaped the vault root");
+  }
 
   const discovered: DiscoveredFile[] = [];
-  const walk = async (directory: string, relativeDirectory: string): Promise<void> => {
-    const entries = await readdir(directory, { withFileTypes: true });
+  const walk = async (
+    directory: BoundDirectory,
+    relativeDirectory: string,
+    lineage: readonly BoundDirectory[],
+  ): Promise<void> => {
+    try {
+      await revalidateDirectoryLineage(lineage);
+    } catch (error: unknown) {
+      if (error instanceof DirectoryLineageError && !error.critical) return;
+      throw error;
+    }
+
+    const entries = await readdir(directory.canonicalPath, { withFileTypes: true });
     for (const entry of entries) {
       if (normalizedDiskName(entry.name) === undefined) continue;
-      const absolutePath = path.join(directory, entry.name);
+      const absolutePath = path.join(directory.canonicalPath, entry.name);
       const relativePath = path.posix.join(relativeDirectory, entry.name);
 
       let stat;
@@ -217,24 +282,25 @@ export async function scanStableInbox(input: {
         } catch {
           continue;
         }
-        let canonicalDirectory: string;
+        let child: BoundDirectory;
         try {
-          canonicalDirectory = await resolveBoundDirectory(
+          child = await resolveBoundDirectory(
             absolutePath,
             stat,
             `scanner directory ${relativePath}`,
+            directory,
           );
         } catch (error: unknown) {
           if (error instanceof PathResolutionRaceError || raceDisappeared(error)) continue;
           throw error;
         }
         if (
-          isOutside(canonicalRoot, canonicalDirectory)
-          || isOutside(canonicalInbox, canonicalDirectory)
+          isOutside(root.canonicalPath, child.canonicalPath)
+          || isOutside(inbox.canonicalPath, child.canonicalPath)
         ) {
           continue;
         }
-        await walk(canonicalDirectory, relativePath);
+        await walk(child, relativePath, [...lineage, child]);
         continue;
       }
 
@@ -256,12 +322,26 @@ export async function scanStableInbox(input: {
         if (error instanceof PathResolutionRaceError || raceDisappeared(error)) continue;
         throw error;
       }
-      if (isOutside(canonicalRoot, canonicalFile) || isOutside(canonicalInbox, canonicalFile)) continue;
-      discovered.push({ sourcePath, absolutePath: canonicalFile, stat });
+      if (
+        !isStrictlyInside(directory.canonicalPath, canonicalFile)
+        || isOutside(root.canonicalPath, canonicalFile)
+        || isOutside(inbox.canonicalPath, canonicalFile)
+      ) {
+        continue;
+      }
+      discovered.push({ sourcePath, absolutePath: canonicalFile, stat, lineage });
+    }
+
+    try {
+      await revalidateDirectoryLineage(lineage);
+    } catch (error: unknown) {
+      if (error instanceof DirectoryLineageError && !error.critical) return;
+      throw error;
     }
   };
 
-  await walk(canonicalInbox, BRAIN_FOUNDATION_POLICY.inbox);
+  const rootInboxLineage = [root, inbox] as const;
+  await walk(inbox, BRAIN_FOUNDATION_POLICY.inbox, rootInboxLineage);
   const inventory = new Map<string, string>();
   for (const file of discovered) {
     const key = collisionKey(file.sourcePath);
@@ -272,7 +352,7 @@ export async function scanStableInbox(input: {
     inventory.set(key, file.sourcePath);
   }
 
-  const candidates: InboxCandidate[] = [];
+  const candidates: Array<{ candidate: InboxCandidate; lineage: readonly BoundDirectory[] }> = [];
   for (const file of discovered) {
     if (file.stat.size > BigInt(maxBytes)) continue;
     const mtimeMs = Number(file.stat.mtimeNs) / 1_000_000;
@@ -312,25 +392,46 @@ export async function scanStableInbox(input: {
         || !sameSnapshot(file.stat, finalPathBefore)
         || !sameSnapshot(file.stat, finalBoundPath.after)
         || !sameSnapshot(file.stat, finalBoundPath.resolved)
-        || isOutside(canonicalRoot, finalBoundPath.canonicalPath)
-        || isOutside(canonicalInbox, finalBoundPath.canonicalPath)
+        || isOutside(root.canonicalPath, finalBoundPath.canonicalPath)
+        || isOutside(inbox.canonicalPath, finalBoundPath.canonicalPath)
       ) {
         continue;
       }
 
+      try {
+        await revalidateDirectoryLineage(file.lineage);
+      } catch (error: unknown) {
+        if (error instanceof DirectoryLineageError && !error.critical) continue;
+        throw error;
+      }
+
       candidates.push({
-        path: file.sourcePath,
-        absolutePath: file.absolutePath,
-        hash: createHash("sha256").update(content).digest("hex"),
-        size: Number(file.stat.size),
-        mtimeMs,
+        lineage: file.lineage,
+        candidate: {
+          path: file.sourcePath,
+          absolutePath: file.absolutePath,
+          hash: createHash("sha256").update(content).digest("hex"),
+          size: Number(file.stat.size),
+          mtimeMs,
+        },
       });
     } finally {
       await handle.close();
     }
   }
 
-  return candidates.sort((left, right) => (
+  const finalCandidates: InboxCandidate[] = [];
+  for (const accepted of candidates) {
+    try {
+      await revalidateDirectoryLineage(accepted.lineage);
+    } catch (error: unknown) {
+      if (error instanceof DirectoryLineageError && !error.critical) continue;
+      throw error;
+    }
+    finalCandidates.push(accepted.candidate);
+  }
+  await revalidateDirectoryLineage(rootInboxLineage);
+  return finalCandidates.sort((left, right) => (
     left.path < right.path ? -1 : left.path > right.path ? 1 : 0
   ));
 }
