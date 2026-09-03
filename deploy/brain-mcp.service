@@ -1,0 +1,30 @@
+[Unit]
+Description=Multi-Vault Obsidian Brain MCP
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=brain
+Group=brain
+WorkingDirectory=/opt/brain-mcp
+EnvironmentFile=/etc/brain-mcp.env
+Environment=NODE_OPTIONS=--max-old-space-size=256
+ExecStart=/usr/bin/node /opt/brain-mcp/dist/index.js --http --host 127.0.0.1 --port 8787
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/srv/brain /opt/brain-mcp/oauth-clients.json
+MemoryMax=384M
+TasksMax=96
+
+[Install]
+WantedBy=multi-user.target

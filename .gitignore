@@ -1,0 +1,18 @@
+node_modules/
+dist/
+.npm-cache/
+.test-tmp/
+.worktrees/
+work/
+*.log
+.DS_Store
+
+# Secrets and runtime state — never commit these
+.env
+*.env
+oauth-clients.json
+
+# Local deployment material
+work/keys/
+work/release/
+oracle-deployment-target.json

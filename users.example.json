@@ -1,0 +1,13 @@
+{
+  "_comment": "Legacy filename retained for compatibility. Copy to a private mode-600 file and point MCP_CONFIG_FILE at it. One owner is authorized for every listed vault.",
+  "dataDir": "/srv/brain/data",
+  "owner": {
+    "id": "owner",
+    "passphrase": "example-only-not-a-production-secret",
+    "allowedVaults": ["personal", "work"]
+  },
+  "vaults": [
+    { "id": "personal", "root": "/srv/brain/vaults/personal" },
+    { "id": "work", "root": "/srv/brain/vaults/work" }
+  ]
+}
