@@ -1,13 +1,14 @@
-import { lstat as nativeLstat, mkdtemp, mkdir, open as nativeOpen, opendir as nativeOpendir, readFile, realpath as nativeRealpath, rm, symlink, writeFile } from "node:fs/promises";
+import { lstat as nativeLstat, mkdtemp, mkdir, open as nativeOpen, opendir as nativeOpendir, readFile, readdir, realpath as nativeRealpath, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { renderAreaCanvas, renderBrainCanvas } from "../src/foundation/canvas.js";
 import { renderAreaGuide, renderAreaMoc, renderHomeMoc, renderRootGuide } from "../src/foundation/markdown.js";
 import { BRAIN_FOUNDATION_POLICY, areaCanvasPath, areaGuidePath, areaMocPath } from "../src/foundation/policy.js";
 import { auditVaultIntegrity, type IntegrityAuditFs } from "../src/organizer/integrity.js";
 
 const vaults: string[] = [];
+const LIMIT_FINDING = { code: "audit_limit_exceeded", category: "limit", path: "." } as const;
 
 async function writeVaultFile(root: string, relativePath: string, content: string): Promise<void> {
   const target = path.join(root, ...relativePath.split("/"));
@@ -28,6 +29,37 @@ async function createValidVault(): Promise<string> {
     await writeVaultFile(root, areaCanvasPath(area), renderAreaCanvas(area));
   }
   return root;
+}
+
+async function inventoryByteCost(root: string, relative = ""): Promise<number> {
+  let total = 0;
+  for (const entry of await readdir(path.join(root, ...relative.split("/").filter(Boolean)), { withFileTypes: true })) {
+    const entryPath = relative ? `${relative}/${entry.name}` : entry.name;
+    total += Buffer.byteLength(entryPath, "utf8");
+    if (entry.isDirectory()) total += await inventoryByteCost(root, entryPath);
+    else if (entry.isFile()) total += Number((await nativeLstat(path.join(root, ...entryPath.split("/")), { bigint: true })).size);
+  }
+  return total;
+}
+
+function orderedFs(reverse: boolean): IntegrityAuditFs {
+  return {
+    lstat: (pathname) => nativeLstat(pathname, { bigint: true }),
+    realpath: nativeRealpath,
+    opendir: async (pathname) => {
+      const entries = await readdir(pathname, { withFileTypes: true });
+      if (reverse) entries.reverse();
+      return {
+        async *[Symbol.asyncIterator]() { yield* entries; },
+        async close() {},
+      };
+    },
+    open: nativeOpen,
+  };
+}
+
+function errno(code: string): NodeJS.ErrnoException {
+  return Object.assign(new Error(code), { code });
 }
 
 afterEach(async () => {
@@ -164,7 +196,7 @@ describe("Vault integrity auditor", () => {
       limits: { maxFiles: 1 },
     });
 
-    expect(report.findings).toContainEqual(expect.objectContaining({ code: "audit_limit_exceeded", category: "files" }));
+    expect(report.findings).toEqual([LIMIT_FINDING]);
     expect(report.findings.map((finding) => finding.code)).not.toContain("missing_required_file");
     expect(report.findings.map((finding) => finding.code)).not.toContain("orphan_note");
     expect(report.findings.map((finding) => finding.code)).not.toContain("broken_link");
@@ -173,12 +205,261 @@ describe("Vault integrity auditor", () => {
   it.each([
     ["entries", { maxEntries: 1 }],
     ["directories", { maxDirectories: 1 }],
-  ])("reports a root-level %s cap without deriving cross-file conclusions", async (category, limits) => {
+  ])("reports a root-level %s cap without deriving cross-file conclusions", async (_category, limits) => {
     const root = await createValidVault();
     const report = await auditVaultIntegrity({ vault: "brain", root, policy: BRAIN_FOUNDATION_POLICY, limits });
 
-    expect(report.findings).toContainEqual(expect.objectContaining({ code: "audit_limit_exceeded", category, path: "." }));
+    expect(report.findings).toEqual([LIMIT_FINDING]);
     expect(report.findings.map((finding) => finding.code)).not.toEqual(expect.arrayContaining(["missing_required_file", "orphan_note", "broken_link", "ambiguous_link", "canvas_missing_file"]));
+  });
+
+  it("accumulates every relative-path byte and accepts the exact inventory-byte budget", async () => {
+    const root = await createValidVault();
+    const exact = await inventoryByteCost(root);
+
+    const accepted = await auditVaultIntegrity({
+      vault: "brain", root, policy: BRAIN_FOUNDATION_POLICY,
+      limits: { maxInventoryBytes: exact },
+    });
+    const rejected = await auditVaultIntegrity({
+      vault: "brain", root, policy: BRAIN_FOUNDATION_POLICY,
+      limits: { maxInventoryBytes: exact - 1 },
+    });
+
+    expect(accepted.findings).toEqual([]);
+    expect(rejected.findings).toEqual([LIMIT_FINDING]);
+  });
+
+  it.each([
+    ["traversal", "ENOENT", "changed_file"],
+    ["traversal", "ESTALE", "changed_file"],
+    ["traversal", "EACCES", "unreadable_file"],
+    ["traversal", "EPERM", "unreadable_file"],
+    ["read", "ENOENT", "changed_file"],
+    ["read", "ESTALE", "changed_file"],
+    ["read", "EACCES", "unreadable_file"],
+    ["read", "EPERM", "unreadable_file"],
+  ])("maps %s %s to %s", async (phase, code, expectedCode) => {
+    const root = await createValidVault();
+    const relative = "20_Study/racy.md";
+    const target = path.join(root, ...relative.split("/"));
+    await writeVaultFile(root, relative, "# racy\n");
+    await writeVaultFile(root, areaMocPath(BRAIN_FOUNDATION_POLICY.areas[3]!), `${renderAreaMoc(BRAIN_FOUNDATION_POLICY.areas[3]!)}\n- [[20_Study/racy]]\n`);
+    let injected = false;
+    const fs: IntegrityAuditFs = {
+      lstat: async (pathname) => {
+        if (phase === "traversal" && pathname === target && !injected) {
+          injected = true;
+          throw errno(code);
+        }
+        return nativeLstat(pathname, { bigint: true });
+      },
+      realpath: nativeRealpath,
+      opendir: (pathname) => nativeOpendir(pathname),
+      open: async (pathname, flags) => {
+        if (phase === "read" && pathname === target) throw errno(code);
+        return nativeOpen(pathname, flags);
+      },
+    };
+
+    const report = await auditVaultIntegrity({ vault: "brain", root, policy: BRAIN_FOUNDATION_POLICY, fs });
+
+    expect(report.findings).toContainEqual(expect.objectContaining({ code: expectedCode, path: relative }));
+  });
+
+  it("suppresses earlier cross-file conclusions after a later incomplete read", async () => {
+    const root = await createValidVault();
+    await writeVaultFile(root, "00_Prompt/a-broken.md", "[[missing-target]]\n");
+    await writeVaultFile(root, "99_Archive/z-racy.md", "# unreadable\n");
+    await writeVaultFile(root, areaMocPath(BRAIN_FOUNDATION_POLICY.areas[0]!), `${renderAreaMoc(BRAIN_FOUNDATION_POLICY.areas[0]!)}\n- [[00_Prompt/a-broken]]\n`);
+    const target = path.join(root, "99_Archive", "z-racy.md");
+    const fs: IntegrityAuditFs = {
+      ...orderedFs(false),
+      open: async (pathname, flags) => {
+        if (pathname === target) throw errno("EACCES");
+        return nativeOpen(pathname, flags);
+      },
+    };
+
+    const report = await auditVaultIntegrity({ vault: "brain", root, policy: BRAIN_FOUNDATION_POLICY, fs });
+
+    expect(report.findings).toContainEqual(expect.objectContaining({ code: "unreadable_file", path: "99_Archive/z-racy.md" }));
+    expect(report.findings.map((finding) => finding.code)).not.toEqual(expect.arrayContaining(["broken_link", "ambiguous_link", "orphan_note", "missing_required_file", "canvas_missing_file"]));
+  });
+
+  it("maps a file replaced by a link before its read to unsafe_link", async () => {
+    const root = await createValidVault();
+    const relative = "20_Study/racy-link.md";
+    const target = path.join(root, ...relative.split("/"));
+    await writeVaultFile(root, relative, "# racy link\n");
+    await writeVaultFile(root, areaMocPath(BRAIN_FOUNDATION_POLICY.areas[3]!), `${renderAreaMoc(BRAIN_FOUNDATION_POLICY.areas[3]!)}\n- [[20_Study/racy-link]]\n`);
+    const outside = await mkdtemp(path.join(os.tmpdir(), "brain-integrity-link-stat-"));
+    vaults.push(outside);
+    const outsideFile = path.join(outside, "outside.md");
+    const outsideLink = path.join(outside, "outside-link.md");
+    await writeFile(outsideFile, "outside", "utf8");
+    await symlink(outsideFile, outsideLink);
+    const linkStat = await nativeLstat(outsideLink, { bigint: true });
+    let targetStats = 0;
+    const fs: IntegrityAuditFs = {
+      ...orderedFs(false),
+      lstat: async (pathname) => pathname === target && ++targetStats >= 4
+        ? linkStat
+        : nativeLstat(pathname, { bigint: true }),
+    };
+
+    const report = await auditVaultIntegrity({ vault: "brain", root, policy: BRAIN_FOUNDATION_POLICY, fs });
+
+    expect(report.findings).toContainEqual(expect.objectContaining({ code: "unsafe_link", path: relative }));
+    expect(report.findings).not.toContainEqual(expect.objectContaining({ code: "changed_file", path: relative }));
+  });
+
+  it("closes the directory handle after a post-opendir identity replacement", async () => {
+    const root = await createValidVault();
+    const outside = await mkdtemp(path.join(os.tmpdir(), "brain-integrity-replacement-"));
+    vaults.push(outside);
+    const replacement = await nativeLstat(outside, { bigint: true });
+    let opened = false;
+    let closed = false;
+    const fs: IntegrityAuditFs = {
+      lstat: async (pathname) => pathname === root && opened ? replacement : nativeLstat(pathname, { bigint: true }),
+      realpath: nativeRealpath,
+      opendir: async () => {
+        opened = true;
+        return { async *[Symbol.asyncIterator]() {}, async close() { closed = true; } };
+      },
+      open: nativeOpen,
+    };
+
+    const report = await auditVaultIntegrity({ vault: "brain", root, policy: BRAIN_FOUNDATION_POLICY, fs });
+
+    expect(closed).toBe(true);
+    expect(report.findings).toContainEqual(expect.objectContaining({ code: "changed_file", path: "." }));
+  });
+
+  it("closes the directory handle after an iterator permission error", async () => {
+    const root = await createValidVault();
+    let closed = false;
+    const fs: IntegrityAuditFs = {
+      lstat: (pathname) => nativeLstat(pathname, { bigint: true }),
+      realpath: nativeRealpath,
+      opendir: async () => ({
+        async *[Symbol.asyncIterator]() { throw errno("EACCES"); },
+        async close() { closed = true; },
+      }),
+      open: nativeOpen,
+    };
+
+    const report = await auditVaultIntegrity({ vault: "brain", root, policy: BRAIN_FOUNDATION_POLICY, fs });
+
+    expect(closed).toBe(true);
+    expect(report.findings).toContainEqual(expect.objectContaining({ code: "unreadable_file", path: "." }));
+  });
+
+  it("masks multiline inline code only when an exact backtick run closes it", async () => {
+    const root = await createValidVault();
+    await writeVaultFile(root, "20_Study/exact-span.md", "``\n[[hidden-exact]]\n``\n");
+    await writeVaultFile(root, "20_Study/non-exact-span.md", "``\n[[visible-non-exact]]\ntext ``` is a longer run\n");
+    await writeVaultFile(root, "20_Study/unmatched-span.md", "`\n[[visible-unmatched]]\n");
+    await writeVaultFile(root, areaMocPath(BRAIN_FOUNDATION_POLICY.areas[3]!), [
+      renderAreaMoc(BRAIN_FOUNDATION_POLICY.areas[3]!),
+      "- [[20_Study/exact-span]]",
+      "- [[20_Study/non-exact-span]]",
+      "- [[20_Study/unmatched-span]]",
+    ].join("\n"));
+
+    const report = await auditVaultIntegrity({ vault: "brain", root, policy: BRAIN_FOUNDATION_POLICY });
+
+    expect(report.findings).not.toContainEqual(expect.objectContaining({ code: "broken_link", path: "20_Study/exact-span.md" }));
+    expect(report.findings).toContainEqual(expect.objectContaining({ code: "broken_link", path: "20_Study/non-exact-span.md" }));
+    expect(report.findings).toContainEqual(expect.objectContaining({ code: "broken_link", path: "20_Study/unmatched-span.md" }));
+  });
+
+  it("ignores a managed marker line inside a multiline inline code span", async () => {
+    const root = await createValidVault();
+    const area = BRAIN_FOUNDATION_POLICY.areas[0]!;
+    await writeVaultFile(root, areaMocPath(area), [
+      "`",
+      "<!-- brain-auto:start note-index -->",
+      "`",
+      "<!-- brain-auto:start note-index -->",
+      "<!-- brain-auto:end note-index -->",
+    ].join("\n"));
+
+    const report = await auditVaultIntegrity({ vault: "brain", root, policy: BRAIN_FOUNDATION_POLICY });
+
+    expect(report.findings).not.toContainEqual(expect.objectContaining({ code: "invalid_managed_markers", path: areaMocPath(area) }));
+  });
+
+  it.each([" \t", "  \t", "   \t"])("uses four-column tab stops for %j indented code", async (indent) => {
+    const root = await createValidVault();
+    await writeVaultFile(root, "20_Study/indented.md", `${indent}[[hidden-by-tab-stop]]\n`);
+    await writeVaultFile(root, areaMocPath(BRAIN_FOUNDATION_POLICY.areas[3]!), `${renderAreaMoc(BRAIN_FOUNDATION_POLICY.areas[3]!)}\n- [[20_Study/indented]]\n`);
+
+    const report = await auditVaultIntegrity({ vault: "brain", root, policy: BRAIN_FOUNDATION_POLICY });
+
+    expect(report.findings).not.toContainEqual(expect.objectContaining({ code: "broken_link", path: "20_Study/indented.md" }));
+  });
+
+  it.each([
+    ["entries", { maxEntries: 1 }],
+    ["directories", { maxDirectories: 1 }],
+    ["files", { maxFiles: 1 }],
+    ["inventory", { maxInventoryBytes: 1 }],
+    ["content", { maxContentBytes: 1 }],
+    ["parsed-link bytes", { maxParsedLinkBytes: 1 }],
+    ["links", { maxLinks: 1 }],
+    ["findings", { maxFindings: 1 }],
+  ])("returns one byte-identical generic finding for the %s cap in either enumeration order", async (_name, limits) => {
+    const root = await createValidVault();
+    await writeVaultFile(root, ".env", "not-a-secret\n");
+    await writeVaultFile(root, "secrets", "not-a-secret\n");
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-03T00:00:00.000Z"));
+    try {
+      const forward = await auditVaultIntegrity({ vault: "brain", root, policy: BRAIN_FOUNDATION_POLICY, limits, fs: orderedFs(false) });
+      const reversed = await auditVaultIntegrity({ vault: "brain", root, policy: BRAIN_FOUNDATION_POLICY, limits, fs: orderedFs(true) });
+
+      expect(forward.findings).toEqual([LIMIT_FINDING]);
+      expect(JSON.stringify(reversed)).toBe(JSON.stringify(forward));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("returns the same generic cap finding when a generated Canvas exceeds the content bound", async () => {
+    const root = await createValidVault();
+    const canvas = JSON.parse(renderBrainCanvas(BRAIN_FOUNDATION_POLICY)) as Record<string, unknown>;
+    canvas.padding = "x".repeat(32_768);
+    await writeVaultFile(root, BRAIN_FOUNDATION_POLICY.brainCanvas, JSON.stringify(canvas));
+    const maxMarkdownBytes = Math.max(...await Promise.all((await readdir(root, { recursive: true, withFileTypes: true }))
+      .filter((entry) => entry.isFile() && entry.name.toLocaleLowerCase("en-US").endsWith(".md"))
+      .map(async (entry) => Number((await nativeLstat(path.join(entry.parentPath, entry.name), { bigint: true })).size))));
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-03T00:00:00.000Z"));
+    try {
+      const forward = await auditVaultIntegrity({ vault: "brain", root, policy: BRAIN_FOUNDATION_POLICY, limits: { maxContentBytes: maxMarkdownBytes }, fs: orderedFs(false) });
+      const reversed = await auditVaultIntegrity({ vault: "brain", root, policy: BRAIN_FOUNDATION_POLICY, limits: { maxContentBytes: maxMarkdownBytes }, fs: orderedFs(true) });
+
+      expect(forward.findings).toEqual([LIMIT_FINDING]);
+      expect(JSON.stringify(reversed)).toBe(JSON.stringify(forward));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("resolves uppercase .MD files by exact path and unique basename and credits incoming links", async () => {
+    const root = await createValidVault();
+    await writeVaultFile(root, "20_Study/Exact.MD", "# exact\n");
+    await writeVaultFile(root, "40_Research/Unique.MD", "# unique\n");
+    await writeVaultFile(root, "20_Study/uppercase-links.md", "[[20_Study/Exact]]\n[[Unique]]\n");
+    await writeVaultFile(root, areaMocPath(BRAIN_FOUNDATION_POLICY.areas[3]!), `${renderAreaMoc(BRAIN_FOUNDATION_POLICY.areas[3]!)}\n- [[20_Study/uppercase-links]]\n`);
+
+    const report = await auditVaultIntegrity({ vault: "brain", root, policy: BRAIN_FOUNDATION_POLICY });
+
+    expect(report.findings).not.toContainEqual(expect.objectContaining({ code: "broken_link", path: "20_Study/uppercase-links.md" }));
+    expect(report.findings).not.toContainEqual(expect.objectContaining({ code: "orphan_note", path: "20_Study/Exact.MD" }));
+    expect(report.findings).not.toContainEqual(expect.objectContaining({ code: "orphan_note", path: "40_Research/Unique.MD" }));
   });
 
   it("accounts for an uppercase .MD file as Markdown in link and orphan analysis", async () => {
