@@ -1,401 +1,144 @@
-import { constants, type Dirent } from "node:fs";
+import { constants, type BigIntStats, type Dirent } from "node:fs";
 import { lstat, open, readdir, realpath, type FileHandle } from "node:fs/promises";
 import path from "node:path";
 import { validateGeneratedCanvas } from "../foundation/canvas.js";
 import { areaCanvasPath, areaGuidePath, areaMocPath, type VaultFoundationPolicy } from "../foundation/policy.js";
 import type { IntegrityFinding, IntegrityFindingCode, IntegrityReport } from "./types.js";
 
-/** Bounds make an audit safe to run against an accidentally mounted or hostile vault. */
-const MAX_DIRECTORIES = 4_096;
-const MAX_FILES = 8_192;
-const MAX_RELATIVE_PATH_BYTES = 1_024;
-const MAX_MARKDOWN_BYTES = 2_097_152;
-const MAX_CANVAS_BYTES = 1_048_576;
-const MAX_FINDINGS = 2_048;
-const MARKER_START = "<!-- brain-auto:start note-index -->";
-const MARKER_END = "<!-- brain-auto:end note-index -->";
-const TEMPORARY_NAME = /(?:^|[._-])(?:tmp|temp|partial|part|swp|swo)(?:[._-]|$)/iu;
-const WINDOWS_INVALID = /[:<>"|?*\u0000-\u001f\u007f-\u009f]/u;
-const RESERVED_WINDOWS_NAME = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/iu;
+export interface IntegrityAuditLimits { maxDirectories: number; maxFiles: number; maxInventoryBytes: number; maxContentBytes: number; maxParsedLinkBytes: number; maxLinks: number; maxFindings: number; }
+export const INTEGRITY_AUDIT_DEFAULTS: IntegrityAuditLimits = Object.freeze({ maxDirectories: 4096, maxFiles: 8192, maxInventoryBytes: 16_777_216, maxContentBytes: 2_097_152, maxParsedLinkBytes: 8_388_608, maxLinks: 16_384, maxFindings: 2_048 });
+export interface IntegrityAuditFs { lstat(pathname: string): Promise<BigIntStats>; realpath(pathname: string): Promise<string>; readdir(pathname: string): Promise<Dirent[]>; open(pathname: string, flags: number): Promise<FileHandle>; }
+interface BoundDirectory { pathname: string; canonicalPath: string; snapshot: BigIntStats; label: string; }
+interface BoundFile { pathname: string; canonicalPath: string; snapshot: BigIntStats; lineage: readonly BoundDirectory[]; path: string; }
+interface MarkdownScan { links: string[]; starts: number[]; ends: number[]; overflow: boolean; }
 
-interface InventoryFile {
-  path: string;
-  absolutePath: string;
-  size: bigint;
-  isMarkdown: boolean;
-  isCanvas: boolean;
-}
+const START = "<!-- brain-auto:start note-index -->";
+const END = "<!-- brain-auto:end note-index -->";
+const TEMP = /(?:^|[._-])(?:tmp|temp|partial|part|swp|swo)(?:[._-]|$)/iu;
+const INVALID = /[:<>"|?*\u0000-\u001f\u007f-\u009f]/u;
+const RESERVED = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/iu;
+const cmp = (a: string, b: string) => Buffer.compare(Buffer.from(a), Buffer.from(b));
+const key = (value: string) => value.normalize("NFKC").toLocaleLowerCase("en-US");
+const gone = (e: unknown) => ["ENOENT", "ENOTDIR", "ELOOP"].includes((e as NodeJS.ErrnoException).code ?? "");
+const denied = (e: unknown) => gone(e) || ["EACCES", "EPERM"].includes((e as NodeJS.ErrnoException).code ?? "");
+const outside = (parent: string, child: string) => { const r = path.relative(parent, child); return r === ".." || r.startsWith(`..${path.sep}`) || path.isAbsolute(r); };
+const inside = (parent: string, child: string) => child !== parent && !outside(parent, child);
+const sameId = (a: BigIntStats, b: BigIntStats) => (a.dev === 0n && a.ino === 0n && b.dev === 0n && b.ino === 0n) || a.dev === b.dev && a.ino === b.ino;
+const sameDir = (a: BigIntStats, b: BigIntStats) => a.isDirectory() && b.isDirectory() && sameId(a, b) && a.size === b.size && a.mtimeNs === b.mtimeNs;
+const sameFile = (a: BigIntStats, b: BigIntStats) => a.isFile() && b.isFile() && sameId(a, b) && a.size === b.size && a.mtimeNs === b.mtimeNs;
+class RaceError extends Error {}
+class ReadError extends Error { constructor(readonly kind: "changed" | "unreadable") { super(kind); } }
 
-interface Inventory {
-  files: InventoryFile[];
-  directories: string[];
-  findings: IntegrityFinding[];
-}
-
-function compareUtf8(left: string, right: string): number {
-  return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
-}
-
-function compareFindings(left: IntegrityFinding, right: IntegrityFinding): number {
-  return compareUtf8(left.path, right.path)
-    || compareUtf8(left.code, right.code)
-    || compareUtf8(left.category, right.category);
-}
-
-function collisionKey(value: string): string {
-  return value.normalize("NFKC").toLocaleLowerCase("en-US");
-}
-
-function posixPath(segments: readonly string[]): string {
-  return segments.join("/");
-}
-
-function isMissing(error: unknown): boolean {
-  return (error as NodeJS.ErrnoException).code === "ENOENT";
-}
-
-function isSameFile(before: Awaited<ReturnType<typeof lstat>>, after: Awaited<ReturnType<FileHandle["stat"]>>): boolean {
-  return before.isFile()
-    && after.isFile()
-    && before.size === after.size
-    && before.mtimeMs === after.mtimeMs
-    && before.dev === after.dev
-    && before.ino === after.ino;
-}
-
-function pushFinding(findings: IntegrityFinding[], code: IntegrityFindingCode, category: string, relativePath: string): void {
-  if (findings.length >= MAX_FINDINGS) return;
-  if (!findings.some((finding) => finding.code === code && finding.category === category && finding.path === relativePath)) {
-    findings.push({ code, category, path: relativePath });
+class Findings {
+  values: IntegrityFinding[] = []; private hitLimit = false;
+  constructor(private readonly max: number) {}
+  add(code: IntegrityFindingCode, category: string, pathValue: string): void {
+    if (this.values.some((f) => f.code === code && f.category === category && f.path === pathValue)) return;
+    if (this.values.length >= this.max - 1) { this.hitLimit = true; return; }
+    this.values.push({ code, category, path: pathValue });
   }
+  get exceeded(): boolean { return this.hitLimit; }
+  finish(): boolean { if (this.hitLimit) this.values.push({ code: "audit_limit_exceeded", category: "findings", path: "." }); this.values.sort((a, b) => cmp(a.path, b.path) || cmp(a.code, b.code) || cmp(a.category, b.category)); return this.hitLimit; }
 }
 
-function pathCategory(relativePath: string, isDirectory: boolean, policy: VaultFoundationPolicy): string | undefined {
-  const parts = relativePath.split("/");
-  const basename = parts.at(-1) ?? "";
-  const normalized = basename.normalize("NFKC");
-  const lower = normalized.toLocaleLowerCase("en-US");
-  if (normalized !== basename) return "nfkc";
-  if (WINDOWS_INVALID.test(basename) || /[ .]$/u.test(basename) || RESERVED_WINDOWS_NAME.test(basename)) return "unsafe_name";
-  if (parts.some((part) => Buffer.byteLength(part, "utf8") > 255) || Buffer.byteLength(relativePath, "utf8") > MAX_RELATIVE_PATH_BYTES) return "path_bytes";
-  if (basename === ".obsidian") return "application";
-  if (lower === ".env" || lower.startsWith(".env.") || lower.endsWith(".env")) return "environment";
-  if (
-    /\.(?:key|pem|p8|p12|pfx)$/iu.test(normalized)
-    || /^(?:id_rsa|id_ed25519|credentials(?:\.json)?|oauth-clients\.json|secrets?)$/iu.test(normalized)
-  ) return "key";
-  if (
-    basename.startsWith("~") || basename.endsWith("~") || TEMPORARY_NAME.test(lower)
-    || /\.(?:tmp|temp|partial|swp|swo)$/iu.test(normalized)
-    || lower.includes("sync-conflict")
-  ) return "temporary";
-  if (basename.startsWith(".")) return "hidden";
-  if (isDirectory && parts.length > 0 && parts[0] !== "Agent-Inbox" && !isApprovedTopLevel(parts[0] ?? "", policy)) return "unapproved_top_level";
+function limits(partial: Partial<IntegrityAuditLimits> | undefined): IntegrityAuditLimits { const result = { ...INTEGRITY_AUDIT_DEFAULTS, ...partial }; if (Object.values(result).some((v) => !Number.isSafeInteger(v) || v < 1)) throw new Error("integrity audit limit is invalid"); return result; }
+function fsNative(): IntegrityAuditFs { return { lstat: (p) => lstat(p, { bigint: true }), realpath, readdir: (p) => readdir(p, { withFileTypes: true }) as Promise<Dirent[]>, open }; }
+function foundation(policy: VaultFoundationPolicy) { return { markdown: new Set([policy.rootGuide, policy.homeMoc, ...policy.areas.flatMap((a) => [areaMocPath(a), areaGuidePath(a)])]), canvases: new Set([policy.brainCanvas, ...policy.areas.map(areaCanvasPath)]) }; }
+
+async function bindDir(fs: IntegrityAuditFs, pathname: string, before: BigIntStats, label: string, parent?: BoundDirectory): Promise<BoundDirectory> {
+  if (before.isSymbolicLink() || !before.isDirectory()) throw new RaceError();
+  const canonicalPath = await fs.realpath(pathname); const after = await fs.lstat(pathname); const resolved = await fs.lstat(canonicalPath);
+  if (after.isSymbolicLink() || !sameDir(before, after) || !sameDir(before, resolved) || parent && !inside(parent.canonicalPath, canonicalPath)) throw new RaceError();
+  return { pathname, canonicalPath, snapshot: before, label };
+}
+async function revalidate(fs: IntegrityAuditFs, lineage: readonly BoundDirectory[]): Promise<void> {
+  let parent: BoundDirectory | undefined;
+  for (const original of lineage) { const now = await fs.lstat(original.pathname); const bound = await bindDir(fs, original.pathname, now, original.label, parent); if (bound.canonicalPath !== original.canonicalPath || !sameDir(bound.snapshot, original.snapshot)) throw new RaceError(); parent = bound; }
+}
+async function bindFile(fs: IntegrityAuditFs, pathname: string, before: BigIntStats, parent: BoundDirectory): Promise<string> {
+  if (before.isSymbolicLink() || !before.isFile()) throw new RaceError();
+  const canonical = await fs.realpath(pathname); const after = await fs.lstat(pathname); const resolved = await fs.lstat(canonical);
+  if (after.isSymbolicLink() || !sameFile(before, after) || !sameFile(before, resolved) || !inside(parent.canonicalPath, canonical)) throw new RaceError();
+  return canonical;
+}
+function classification(relative: string, directory: boolean, policy: VaultFoundationPolicy): [IntegrityFindingCode, string] | undefined {
+  const segments = relative.split("/"); const normal = segments.map((v) => v.normalize("NFKC")); const name = segments.at(-1) ?? ""; const normalized = normal.at(-1) ?? "";
+  if (segments.some((v, i) => Buffer.byteLength(v) > 240 || Buffer.byteLength(normal[i] ?? "") > 240) || Buffer.byteLength(relative) > 1024 || Buffer.byteLength(normal.join("/")) > 1024) return ["invalid_path", "path_bytes"];
+  if (normal.some((v) => !v || v.includes("/") || v.includes("\\") || v === "." || v === ".." || INVALID.test(v) || /[ .]$/u.test(v) || RESERVED.test(v))) return ["invalid_path", "unsafe_name"];
+  if (name !== normalized) return ["invalid_path", "nfkc"];
+  const lower = name.toLocaleLowerCase("en-US");
+  if (name === ".obsidian") return ["forbidden_artifact", "application"];
+  if (lower === ".env" || lower.startsWith(".env.") || lower.endsWith(".env")) return ["forbidden_artifact", "environment"];
+  if (/\.(?:key|pem|p8|p12|pfx)$/iu.test(name) || /^(?:id_rsa|id_ed25519|credentials(?:\.json)?|oauth-clients\.json|secrets?)$/iu.test(name)) return ["forbidden_artifact", "key"];
+  if (name.startsWith("~") || name.endsWith("~") || TEMP.test(lower) || /\.(?:tmp|temp|partial|swp|swo)$/iu.test(name) || lower.includes("sync-conflict")) return ["forbidden_artifact", "temporary"];
+  if (name.startsWith(".")) return ["forbidden_artifact", "hidden"];
+  const allowedTop = new Set([policy.inbox, ...policy.areas.map((a) => a.directory), policy.rootGuide, policy.homeMoc, policy.brainCanvas]);
+  if (segments.length === 1 && !allowedTop.has(name)) return ["invalid_path", "unapproved_top_level"];
+  if (directory && !new Set([policy.inbox, ...policy.areas.map((a) => a.directory)]).has(segments[0] ?? "")) return ["invalid_path", "unapproved_top_level"];
   return undefined;
 }
+function tooDeep(relative: string, directory: boolean, policy: VaultFoundationPolicy): boolean { return relative.split("/").length - (directory ? 0 : 1) > policy.maxDepth; }
 
-function isApprovedTopLevel(value: string, policy: VaultFoundationPolicy): boolean {
-  return value === policy.inbox || policy.areas.some((area) => area.directory === value);
-}
-
-function depthViolation(relativePath: string, isDirectory: boolean, policy: VaultFoundationPolicy): boolean {
-  const segments = relativePath.split("/");
-  const depth = isDirectory ? segments.length : segments.length - 1;
-  return depth > policy.maxDepth;
-}
-
-function requiredPaths(policy: VaultFoundationPolicy): { markdown: Set<string>; canvases: Set<string> } {
-  return {
-    markdown: new Set([
-      policy.rootGuide,
-      policy.homeMoc,
-      ...policy.areas.flatMap((area) => [areaMocPath(area), areaGuidePath(area)]),
-    ]),
-    canvases: new Set([
-      policy.brainCanvas,
-      ...policy.areas.map(areaCanvasPath),
-    ]),
-  };
-}
-
-function isUnapprovedManagedCanvas(relativePath: string, policy: VaultFoundationPolicy): boolean {
-  return /^000_[^/]+_Map\.canvas$/iu.test(relativePath.split("/").at(-1) ?? "")
-    && !requiredPaths(policy).canvases.has(relativePath);
-}
-
-function exactLineMarkerCount(text: string, marker: string): number {
-  const escaped = marker.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
-  return [...text.matchAll(new RegExp(`(?:^|\\r?\\n)${escaped}(?=\\r?\\n|$)`, "gu"))].length;
-}
-
-function stripCodeExamples(markdown: string): string {
-  const lines = markdown.split(/\r?\n/u);
-  let fenced = false;
-  return lines.map((line) => {
-    if (/^\s*(?:```|~~~)/u.test(line)) {
-      fenced = !fenced;
-      return "";
-    }
-    if (fenced) return "";
-    return line.replace(/`[^`]*`/gu, "");
-  }).join("\n");
-}
-
-function linkReference(raw: string): string | undefined {
-  const target = raw.split("|")[0]?.split("#")[0]?.split("^")[0] ?? "";
-  return target ? target : undefined;
-}
-
-function linkCandidates(sourcePath: string, reference: string): string[] {
-  const extension = path.posix.extname(reference) ? "" : ".md";
-  const direct = `${reference}${extension}`;
-  const sourceDirectory = path.posix.dirname(sourcePath);
-  const relative = sourceDirectory === "." ? direct : path.posix.normalize(path.posix.join(sourceDirectory, direct));
-  return [...new Set([direct, relative])].filter((candidate) => !candidate.startsWith("../") && candidate !== "..");
-}
-
-function isRootPermittedFile(relativePath: string, policy: VaultFoundationPolicy): boolean {
-  const requirements = requiredPaths(policy);
-  return requirements.markdown.has(relativePath) || requirements.canvases.has(relativePath);
-}
-
-async function readBoundedFile(file: InventoryFile, limit: number): Promise<string | undefined> {
-  if (file.size > BigInt(limit)) return undefined;
-  let handle: FileHandle | undefined;
-  try {
-    const noFollow = constants.O_NOFOLLOW ?? 0;
-    handle = await open(file.absolutePath, constants.O_RDONLY | noFollow);
-    const before = await lstat(file.absolutePath);
-    if (before.isSymbolicLink() || !before.isFile() || before.size > limit) return undefined;
-    const opened = await handle.stat();
-    if (!isSameFile(before, opened)) return undefined;
-    const buffer = Buffer.alloc(Number(before.size));
-    let offset = 0;
-    while (offset < buffer.length) {
-      const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset);
-      if (bytesRead === 0) break;
-      offset += bytesRead;
-    }
-    const after = await handle.stat();
-    if (offset !== buffer.length || !isSameFile(before, after)) return undefined;
-    return buffer.toString("utf8");
-  } catch (error: unknown) {
-    if (isMissing(error)) return undefined;
-    throw error;
-  } finally {
-    await handle?.close();
-  }
-}
-
-async function inventoryVault(root: string, policy: VaultFoundationPolicy): Promise<Inventory> {
-  const findings: IntegrityFinding[] = [];
-  const files: InventoryFile[] = [];
-  const directories: string[] = [];
-  const rootStat = await lstat(root);
-  if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
-    pushFinding(findings, "unsafe_link", "root", ".");
-    return { files, directories, findings };
-  }
-  const canonicalRoot = await realpath(root);
-  const pending: Array<{ absolutePath: string; segments: string[] }> = [{ absolutePath: canonicalRoot, segments: [] }];
-  let limitHit = false;
-  while (pending.length && !limitHit) {
-    const current = pending.pop()!;
-    let entries: Dirent[];
-    try {
-      entries = await readdir(current.absolutePath, { withFileTypes: true });
-    } catch (error: unknown) {
-      if (isMissing(error)) continue;
-      throw error;
-    }
-    entries.sort((left, right) => compareUtf8(left.name, right.name));
+async function inventory(fs: IntegrityAuditFs, rootName: string, policy: VaultFoundationPolicy, cap: IntegrityAuditLimits, findings: Findings): Promise<{ files: BoundFile[]; complete: boolean }> {
+  const files: BoundFile[] = []; let complete = true; let directories = 0; let bytes = 0n; let initial: BigIntStats;
+  try { initial = await fs.lstat(rootName); } catch { findings.add("unreadable_file", "root", "."); return { files, complete: false }; }
+  let root: BoundDirectory; try { root = await bindDir(fs, rootName, initial, "integrity root"); } catch { findings.add("unsafe_link", "root", "."); return { files, complete: false }; }
+  const queue: Array<{ bound: BoundDirectory; parts: string[]; lineage: BoundDirectory[] }> = [{ bound: root, parts: [], lineage: [root] }];
+  for (let cursor = 0; cursor < queue.length; cursor += 1) {
+    const current = queue[cursor]!; try { await revalidate(fs, current.lineage); } catch { findings.add("changed_file", "ancestor", current.parts.join("/") || "."); complete = false; continue; }
+    let entries: Dirent[]; try { entries = await fs.readdir(current.bound.canonicalPath); } catch (error) { findings.add(denied(error) ? "unreadable_file" : "changed_file", "directory", current.parts.join("/") || "."); complete = false; continue; }
+    entries.sort((a, b) => cmp(a.name, b.name));
     for (const entry of entries) {
-      const segments = [...current.segments, entry.name];
-      const relativePath = posixPath(segments);
-      const absolutePath = path.join(current.absolutePath, entry.name);
-      let stat;
-      try {
-        stat = await lstat(absolutePath, { bigint: true });
-      } catch (error: unknown) {
-        if (isMissing(error)) continue;
-        throw error;
-      }
-      if (stat.isSymbolicLink()) {
-        pushFinding(findings, "unsafe_link", "symlink", relativePath);
-        continue;
-      }
-      const directory = stat.isDirectory();
-      const category = pathCategory(relativePath, directory, policy);
-      if (category !== undefined) {
-        const code = ["application", "hidden", "environment", "key", "temporary"].includes(category)
-          ? "forbidden_artifact" as const
-          : "invalid_path" as const;
-        pushFinding(findings, code, category, relativePath);
-        if (directory) continue;
-      }
-      if (depthViolation(relativePath, directory, policy)) {
-        pushFinding(findings, "max_depth", "depth", relativePath);
-        if (directory) continue;
-      }
-      if (directory) {
-        directories.push(relativePath);
-        if (directories.length > MAX_DIRECTORIES) {
-          pushFinding(findings, "audit_limit_exceeded", "directories", relativePath);
-          limitHit = true;
-          break;
-        }
-        if (relativePath.startsWith(".") || category !== undefined) continue;
-        pending.push({ absolutePath, segments });
-        continue;
-      }
-      if (!stat.isFile()) {
-        pushFinding(findings, "invalid_path", "unsupported_filesystem_type", relativePath);
-        continue;
-      }
-      if (segments.length === 1 && !isRootPermittedFile(relativePath, policy)) {
-        pushFinding(findings, "invalid_path", "unapproved_top_level", relativePath);
-      }
-      if (isUnapprovedManagedCanvas(relativePath, policy)) {
-        pushFinding(findings, "forbidden_artifact", "unapproved_managed_canvas", relativePath);
-      }
-      files.push({
-        path: relativePath,
-        absolutePath,
-        size: stat.size,
-        isMarkdown: path.posix.extname(relativePath).toLocaleLowerCase("en-US") === ".md",
-        isCanvas: path.posix.extname(relativePath).toLocaleLowerCase("en-US") === ".canvas",
-      });
-      if (files.length > MAX_FILES) {
-        pushFinding(findings, "audit_limit_exceeded", "files", relativePath);
-        limitHit = true;
-        break;
-      }
+      const parts = [...current.parts, entry.name]; const relative = parts.join("/"); const pathname = path.join(current.bound.canonicalPath, entry.name); let stat: BigIntStats;
+      try { stat = await fs.lstat(pathname); } catch (error) { findings.add(denied(error) ? "unreadable_file" : "changed_file", "entry", relative); complete = false; continue; }
+      if (stat.isSymbolicLink()) { findings.add("unsafe_link", "symlink", relative); continue; }
+      const directory = stat.isDirectory(); const invalid = classification(relative, directory, policy); if (invalid) { findings.add(...invalid, relative); if (directory) continue; }
+      if (tooDeep(relative, directory, policy)) { findings.add("max_depth", "depth", relative); if (directory) continue; }
+      if (directory) { if (directories === cap.maxDirectories) { findings.add("audit_limit_exceeded", "directories", relative); complete = false; break; } directories += 1; try { const child = await bindDir(fs, pathname, stat, `integrity directory ${relative}`, current.bound); queue.push({ bound: child, parts, lineage: [...current.lineage, child] }); } catch { findings.add("unsafe_link", "directory", relative); complete = false; } continue; }
+      if (!stat.isFile()) { findings.add("invalid_path", "unsupported_filesystem_type", relative); continue; }
+      if (files.length === cap.maxFiles) { findings.add("audit_limit_exceeded", "files", relative); complete = false; break; }
+      if (bytes + stat.size > BigInt(cap.maxInventoryBytes)) { findings.add("audit_limit_exceeded", "inventory_bytes", relative); complete = false; break; }
+      try { const canonicalPath = await bindFile(fs, pathname, stat, current.bound); files.push({ pathname, canonicalPath, snapshot: stat, lineage: current.lineage, path: relative }); bytes += stat.size; if (/^000_[^/]+_Map\.canvas$/iu.test(entry.name) && !foundation(policy).canvases.has(relative)) findings.add("forbidden_artifact", "unapproved_managed_canvas", relative); } catch { findings.add("unsafe_link", "file", relative); complete = false; }
     }
   }
-  return { files, directories, findings };
+  return { files, complete };
 }
-
-function isRequiredMoc(filePath: string, policy: VaultFoundationPolicy): boolean {
-  return filePath === policy.homeMoc || policy.areas.some((area) => areaMocPath(area) === filePath);
+async function read(fs: IntegrityAuditFs, file: BoundFile, max: number): Promise<Buffer> {
+  try {
+    await revalidate(fs, file.lineage); const before = await fs.lstat(file.pathname); const canonical = await bindFile(fs, file.pathname, before, file.lineage.at(-1)!); if (canonical !== file.canonicalPath || !sameFile(before, file.snapshot)) throw new RaceError();
+    const handle = await fs.open(canonical, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0)); try { const opened = await handle.stat({ bigint: true }); if (!sameFile(opened, file.snapshot) || opened.size > BigInt(max)) throw new RaceError(); await revalidate(fs, file.lineage); const buf = Buffer.alloc(Number(opened.size)); let offset = 0; while (offset < buf.length) { const got = await handle.read(buf, offset, buf.length - offset, offset); if (!got.bytesRead) break; offset += got.bytesRead; } const after = await handle.stat({ bigint: true }); await revalidate(fs, file.lineage); const final = await fs.lstat(file.pathname); await bindFile(fs, file.pathname, final, file.lineage.at(-1)!); if (offset !== buf.length || !sameFile(after, file.snapshot) || !sameFile(final, file.snapshot)) throw new RaceError(); return buf; } finally { await handle.close(); }
+  } catch (error) { throw new ReadError(error instanceof RaceError || gone(error) ? "changed" : denied(error) ? "unreadable" : "changed"); }
 }
+function scanMarkdown(text: string, remaining: number): MarkdownScan {
+  const links: string[] = []; const starts: number[] = []; const ends: number[] = []; let fence: { char: "`" | "~"; count: number } | undefined; let offset = 0;
+  for (const line of text.split(/\r?\n/u)) {
+    const quote = /^\s{0,3}>/u.test(line); const indent = /^(?: {4}|\t)/u.test(line); const opener = !quote && !indent ? /^ {0,3}(`{3,}|~{3,})/u.exec(line) : undefined;
+    if (fence) { if (!quote && !indent && new RegExp(`^ {0,3}${fence.char}{${fence.count},}\\s*$`, "u").test(line)) fence = undefined; offset += line.length + 1; continue; }
+    if (opener) { fence = { char: opener[1]![0] as "`" | "~", count: opener[1]!.length }; offset += line.length + 1; continue; }
+    if (!quote && !indent) { if (line === START) starts.push(offset); if (line === END) ends.push(offset); for (let i = 0; i < line.length;) { if (line[i] === "`") { let size = 1; while (line[i + size] === "`") size += 1; const close = line.indexOf("`".repeat(size), i + size); i = close < 0 ? line.length : close + size; continue; } const begin = line.startsWith("![[", i) ? i + 1 : line.startsWith("[[", i) ? i : -1; if (begin >= 0) { const close = line.indexOf("]]", begin + 2); if (close >= 0) { if (links.length === remaining) return { links, starts, ends, overflow: true }; links.push(line.slice(begin + 2, close)); i = close + 2; continue; } } i += 1; } }
+    offset += line.length + 1;
+  }
+  return { links, starts, ends, overflow: false };
+}
+function linkTarget(raw: string): string | undefined { const target = raw.split("|")[0]?.split("#")[0]?.split("^")[0] ?? ""; return target || undefined; }
+function options(source: string, target: string): string[] { const suffix = /\.(?:md|canvas)$/iu.test(target) ? "" : ".md"; const direct = `${target}${suffix}`; const relative = path.posix.normalize(path.posix.join(path.posix.dirname(source), direct)); return [...new Set([direct, relative])].filter((v) => v !== ".." && !v.startsWith("../")); }
 
-export async function auditVaultIntegrity(input: {
-  vault: string;
-  root: string;
-  policy: VaultFoundationPolicy;
-}): Promise<IntegrityReport> {
-  if (!input || typeof input.vault !== "string" || typeof input.root !== "string" || !input.policy) {
-    throw new Error("integrity audit input is invalid");
+export async function auditVaultIntegrity(input: { vault: string; root: string; policy: VaultFoundationPolicy; limits?: Partial<IntegrityAuditLimits>; fs?: IntegrityAuditFs }): Promise<IntegrityReport> {
+  if (!input || typeof input.vault !== "string" || typeof input.root !== "string" || !input.policy) throw new Error("integrity audit input is invalid");
+  const cap = limits(input.limits); const findings = new Findings(cap.maxFindings); const fs = input.fs ?? fsNative(); const inventoryResult = await inventory(fs, input.root, input.policy, cap, findings); const files = new Map(inventoryResult.files.map((f) => [f.path, f])); const required = foundation(input.policy); let complete = inventoryResult.complete; let parsedBytes = 0; let parsedLinks = 0; const incoming = new Set<string>(); const markdown = inventoryResult.files.filter((f) => f.path.toLocaleLowerCase("en-US").endsWith(".md"));
+  for (const file of markdown) {
+    if (file.snapshot.size > BigInt(cap.maxContentBytes) || parsedBytes + Number(file.snapshot.size) > cap.maxParsedLinkBytes) { findings.add("audit_limit_exceeded", "content_bytes", file.path); complete = false; break; }
+    let text: string; try { text = (await read(fs, file, cap.maxContentBytes)).toString("utf8"); } catch (error) { findings.add(error instanceof ReadError && error.kind === "unreadable" ? "unreadable_file" : "changed_file", "markdown", file.path); complete = false; continue; }
+    parsedBytes += Buffer.byteLength(text); const scan = scanMarkdown(text, cap.maxLinks - parsedLinks); if (scan.overflow) { findings.add("audit_limit_exceeded", "links", file.path); complete = false; break; } parsedLinks += scan.links.length;
+    if (file.path === input.policy.homeMoc || input.policy.areas.some((a) => areaMocPath(a) === file.path)) if (scan.starts.length !== 1 || scan.ends.length !== 1 || scan.starts[0]! >= scan.ends[0]!) findings.add("invalid_managed_markers", "note_index", file.path);
+    if (!complete) continue;
+    for (const raw of scan.links) { if (raw.startsWith("#") || raw.startsWith("^")) { incoming.add(file.path); continue; } const target = linkTarget(raw); if (!target) { findings.add("broken_link", "wiki_link", file.path); continue; } const choices = options(file.path, target); const exact = choices.find((v) => files.has(v)); if (exact) { if (exact.toLocaleLowerCase("en-US").endsWith(".md")) incoming.add(exact); continue; } if (choices.some((v) => required.markdown.has(v))) continue; const basename = path.posix.basename(choices[0] ?? target); const matches = inventoryResult.files.filter((f) => path.posix.basename(f.path) === basename); if (matches.length === 1) { if (matches[0]!.path.endsWith(".md")) incoming.add(matches[0]!.path); continue; } const near = inventoryResult.files.filter((f) => choices.some((v) => key(v) === key(f.path)) || key(path.posix.basename(f.path)) === key(basename)); findings.add(matches.length > 1 || near.length > 1 ? "ambiguous_link" : "broken_link", "wiki_link", file.path); }
   }
-  const inventory = await inventoryVault(input.root, input.policy);
-  const findings = inventory.findings;
-  if (findings.some((finding) => finding.code === "unsafe_link" && finding.category === "root" && finding.path === ".")) {
-    findings.sort(compareFindings);
-    return { vault: input.vault, checkedAt: new Date().toISOString(), findings };
-  }
-  const requirements = requiredPaths(input.policy);
-  const filesByPath = new Map(inventory.files.map((file) => [file.path, file]));
-  for (const required of [...requirements.markdown, ...requirements.canvases]) {
-    if (!filesByPath.has(required)) pushFinding(findings, "missing_required_file", "missing", required);
-  }
-
-  const readableMarkdown = new Map<string, string>();
-  for (const file of inventory.files.filter((candidate) => candidate.isMarkdown)) {
-    if (file.size > BigInt(MAX_MARKDOWN_BYTES)) {
-      pushFinding(findings, "audit_limit_exceeded", "content_bytes", file.path);
-      continue;
-    }
-    const text = await readBoundedFile(file, MAX_MARKDOWN_BYTES);
-    if (text === undefined) continue;
-    readableMarkdown.set(file.path, text);
-    if (isRequiredMoc(file.path, input.policy)) {
-      if (exactLineMarkerCount(text, MARKER_START) !== 1 || exactLineMarkerCount(text, MARKER_END) !== 1) {
-        pushFinding(findings, "invalid_managed_markers", "note_index", file.path);
-      } else {
-        const start = text.indexOf(MARKER_START);
-        const end = text.indexOf(MARKER_END);
-        if (start >= end) pushFinding(findings, "invalid_managed_markers", "note_index", file.path);
-      }
-    }
-  }
-
-  const allPaths = new Set(inventory.files.map((file) => file.path));
-  const incoming = new Set<string>();
-  for (const [sourcePath, text] of readableMarkdown) {
-    for (const match of stripCodeExamples(text).matchAll(/!?\[\[([^\]\r\n]+)\]\]/gu)) {
-      const rawReference = match[1] ?? "";
-      if (rawReference.startsWith("#") || rawReference.startsWith("^")) {
-        incoming.add(sourcePath);
-        continue;
-      }
-      const reference = linkReference(rawReference);
-      if (!reference) {
-        pushFinding(findings, "broken_link", "wiki_link", sourcePath);
-        continue;
-      }
-      const candidates = linkCandidates(sourcePath, reference);
-      const exact = candidates.find((candidate) => allPaths.has(candidate));
-      if (exact !== undefined) {
-        if (filesByPath.get(exact)?.isMarkdown) incoming.add(exact);
-        continue;
-      }
-      if (candidates.some((candidate) => requirements.markdown.has(candidate))) {
-        // A missing foundation document is already reported once as a root cause. Do not turn
-        // every guide that references it into a noisy cascade of secondary broken links.
-        continue;
-      }
-      const wantedBasename = path.posix.basename(candidates[0] ?? reference);
-      const basenameMatches = inventory.files.filter((candidate) => path.posix.basename(candidate.path) === wantedBasename);
-      if (basenameMatches.length === 1) {
-        if (basenameMatches[0]?.isMarkdown) incoming.add(basenameMatches[0].path);
-        continue;
-      }
-      const nearMatches = inventory.files.filter((candidate) => (
-        candidates.some((value) => collisionKey(value) === collisionKey(candidate.path))
-        || collisionKey(path.posix.basename(candidate.path)) === collisionKey(wantedBasename)
-      ));
-      pushFinding(findings, basenameMatches.length > 1 || nearMatches.length > 1 ? "ambiguous_link" : "broken_link", "wiki_link", sourcePath);
-    }
-  }
-
-  for (const requiredCanvas of requirements.canvases) {
-    const canvas = filesByPath.get(requiredCanvas);
-    if (!canvas) continue;
-    if (canvas.size > BigInt(MAX_CANVAS_BYTES)) {
-      pushFinding(findings, "invalid_canvas", "content_bytes", requiredCanvas);
-      continue;
-    }
-    const text = await readBoundedFile(canvas, MAX_CANVAS_BYTES);
-    if (text === undefined) {
-      pushFinding(findings, "invalid_canvas", "unreadable", requiredCanvas);
-      continue;
-    }
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(text);
-    } catch {
-      pushFinding(findings, "invalid_canvas", "json", requiredCanvas);
-      continue;
-    }
-    if (!validateGeneratedCanvas(parsed)) {
-      pushFinding(findings, "invalid_canvas", "schema", requiredCanvas);
-      continue;
-    }
-    for (const node of parsed.nodes) {
-      if (!filesByPath.has(node.file) || !filesByPath.get(node.file)?.isMarkdown) {
-        pushFinding(findings, "canvas_missing_file", "file_reference", requiredCanvas);
-      }
-    }
-  }
-
-  const requiredMarkdown = requirements.markdown;
-  for (const file of inventory.files) {
-    if (!file.isMarkdown || requiredMarkdown.has(file.path) || file.path === input.policy.rootGuide) continue;
-    if (file.path === input.policy.inbox || file.path.startsWith(`${input.policy.inbox}/`)) continue;
-    if (file.path.split("/").some((segment) => segment.startsWith("."))) continue;
-    if (!incoming.has(file.path)) pushFinding(findings, "orphan_note", "no_inbound_link", file.path);
-  }
-
-  findings.sort(compareFindings);
-  return { vault: input.vault, checkedAt: new Date().toISOString(), findings };
+  if (findings.exceeded) complete = false;
+  if (complete) for (const expected of [...required.markdown, ...required.canvases]) if (!files.has(expected)) findings.add("missing_required_file", "missing", expected);
+  const normal = new Map<string, BoundFile[]>(); for (const f of inventoryResult.files) normal.set(key(f.path), [...(normal.get(key(f.path)) ?? []), f]);
+  for (const canvasPath of required.canvases) { const file = files.get(canvasPath); if (!file) continue; let value: unknown; try { value = JSON.parse((await read(fs, file, cap.maxContentBytes)).toString("utf8")); } catch (error) { findings.add("invalid_canvas", error instanceof ReadError ? error.kind : "json", canvasPath); continue; } if (!validateGeneratedCanvas(value)) { findings.add("invalid_canvas", "schema", canvasPath); continue; } for (const node of value.nodes) { const match = files.get(node.file); if (!match || !match.path.endsWith(".md") || (normal.get(key(node.file)) ?? []).length !== 1) findings.add("canvas_missing_file", (normal.get(key(node.file)) ?? []).length > 1 ? "ambiguous_reference" : "file_reference", canvasPath); } }
+  if (findings.exceeded) complete = false;
+  if (complete) for (const file of markdown) if (!required.markdown.has(file.path) && !file.path.startsWith(`${input.policy.inbox}/`) && !file.path.split("/").some((s) => s.startsWith(".")) && !incoming.has(file.path)) findings.add("orphan_note", "no_inbound_link", file.path);
+  findings.finish(); return { vault: input.vault, checkedAt: new Date().toISOString(), findings: findings.values };
 }

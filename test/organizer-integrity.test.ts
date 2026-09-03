@@ -1,11 +1,11 @@
-import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { lstat as nativeLstat, mkdtemp, mkdir, open as nativeOpen, readFile, readdir as nativeReaddir, realpath as nativeRealpath, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { renderAreaCanvas, renderBrainCanvas } from "../src/foundation/canvas.js";
 import { renderAreaGuide, renderAreaMoc, renderHomeMoc, renderRootGuide } from "../src/foundation/markdown.js";
 import { BRAIN_FOUNDATION_POLICY, areaCanvasPath, areaGuidePath, areaMocPath } from "../src/foundation/policy.js";
-import { auditVaultIntegrity } from "../src/organizer/integrity.js";
+import { auditVaultIntegrity, type IntegrityAuditFs } from "../src/organizer/integrity.js";
 
 const vaults: string[] = [];
 
@@ -106,7 +106,7 @@ describe("Vault integrity auditor", () => {
     expect(report.findings).toContainEqual(expect.objectContaining({ path: "00_Prompt/links.md", code: "ambiguous_link" }));
   });
 
-  it("accepts a uniquely named embedded asset without guessing Markdown-only links", async () => {
+  it("treats an embed with an unrecognized extension as an extensionless Markdown target", async () => {
     const root = await createValidVault();
     await writeVaultFile(root, "20_Study/assets/diagram.png", "not an image fixture");
     await writeVaultFile(root, "20_Study/links.md", "![[diagram.png]]\n");
@@ -114,7 +114,70 @@ describe("Vault integrity auditor", () => {
 
     const report = await auditVaultIntegrity({ vault: "brain", root, policy: BRAIN_FOUNDATION_POLICY });
 
+    expect(report.findings).toContainEqual(expect.objectContaining({ path: "20_Study/links.md", code: "broken_link" }));
+  });
+
+  it("treats dotted extensionless targets as Markdown and ignores code spans, indented code, blockquotes, and matching fences", async () => {
+    const root = await createValidVault();
+    await writeVaultFile(root, "20_Study/release.v1.md", "# release\n");
+    await writeVaultFile(root, "20_Study/links.md", [
+      "[[release.v1]]",
+      "````md",
+      "[[fenced-example]]",
+      "```",
+      "[[still-fenced]]",
+      "````",
+      "``[[span-example]]``",
+      "    [[indented-example]]",
+      "> [[blockquote-example]]",
+    ].join("\n"));
+    await writeVaultFile(root, areaMocPath(BRAIN_FOUNDATION_POLICY.areas[3]!), `${renderAreaMoc(BRAIN_FOUNDATION_POLICY.areas[3]!)}\n- [[20_Study/links]]\n- [[20_Study/release.v1]]\n`);
+
+    const report = await auditVaultIntegrity({ vault: "brain", root, policy: BRAIN_FOUNDATION_POLICY });
+
     expect(report.findings).not.toContainEqual(expect.objectContaining({ path: "20_Study/links.md", code: "broken_link" }));
+  });
+
+  it("uses exact marker lines outside code blocks and rejects a reversed marker pair", async () => {
+    const root = await createValidVault();
+    const area = BRAIN_FOUNDATION_POLICY.areas[0]!;
+    await writeVaultFile(root, areaMocPath(area), [
+      "<!-- brain-auto:end note-index -->",
+      "text <!-- brain-auto:start note-index -->",
+      "<!-- brain-auto:start note-index -->",
+      "```html",
+      "<!-- brain-auto:start note-index -->",
+      "<!-- brain-auto:end note-index -->",
+      "```",
+    ].join("\n"));
+
+    const report = await auditVaultIntegrity({ vault: "brain", root, policy: BRAIN_FOUNDATION_POLICY });
+
+    expect(report.findings).toContainEqual(expect.objectContaining({ path: areaMocPath(area), code: "invalid_managed_markers" }));
+  });
+
+  it("reports a bounded incomplete inventory without deriving missing, orphan, or link conclusions", async () => {
+    const root = await createValidVault();
+
+    const report = await auditVaultIntegrity({
+      vault: "brain", root, policy: BRAIN_FOUNDATION_POLICY,
+      limits: { maxFiles: 1 },
+    });
+
+    expect(report.findings).toContainEqual(expect.objectContaining({ code: "audit_limit_exceeded", category: "files" }));
+    expect(report.findings.map((finding) => finding.code)).not.toContain("missing_required_file");
+    expect(report.findings.map((finding) => finding.code)).not.toContain("orphan_note");
+    expect(report.findings.map((finding) => finding.code)).not.toContain("broken_link");
+  });
+
+  it("matches the organizer's 240-byte exact and normalized component policy", async () => {
+    const root = await createValidVault();
+    await writeVaultFile(root, `20_Study/${"a".repeat(241)}.md`, "# too long\n");
+    await writeVaultFile(root, "20_Study/fullwidth／separator.md", "# normalized separator\n");
+
+    const report = await auditVaultIntegrity({ vault: "brain", root, policy: BRAIN_FOUNDATION_POLICY });
+
+    expect(report.findings.filter((finding) => finding.code === "invalid_path").map((finding) => finding.category)).toEqual(expect.arrayContaining(["path_bytes", "unsafe_name"]));
   });
 
   it("returns only the unsafe-root finding and makes no write when its root is not a directory", async () => {
@@ -128,6 +191,54 @@ describe("Vault integrity auditor", () => {
     expect(await readFile(notDirectory, "utf8")).toBe("unchanged");
   });
 
+  it.each(["root", "child"])("rejects an injected %s canonical-path replacement before it can read outside the vault", async (kind) => {
+    const root = await createValidVault();
+    const outside = await mkdtemp(path.join(os.tmpdir(), "brain-integrity-outside-"));
+    vaults.push(outside);
+    const child = path.join(root, "20_Study");
+    let outsideRead = false;
+    const fs: IntegrityAuditFs = {
+      lstat: (pathname) => nativeLstat(pathname, { bigint: true }),
+      realpath: async (pathname) => pathname === (kind === "root" ? root : child) ? outside : nativeRealpath(pathname),
+      readdir: async (pathname) => {
+        if (pathname === outside) outsideRead = true;
+        return nativeReaddir(pathname, { withFileTypes: true });
+      },
+      open: (pathname, flags) => nativeOpen(pathname, flags),
+    };
+
+    const report = await auditVaultIntegrity({ vault: "brain", root, policy: BRAIN_FOUNDATION_POLICY, fs });
+
+    expect(outsideRead).toBe(false);
+    expect(report.findings).toContainEqual(expect.objectContaining({ code: "unsafe_link", path: kind === "root" ? "." : "20_Study" }));
+    expect(report.findings.map((finding) => finding.code)).not.toContain("missing_required_file");
+  });
+
+  it("stops at an injected ancestor replacement before descending into a child", async () => {
+    const root = await createValidVault();
+    const outside = await mkdtemp(path.join(os.tmpdir(), "brain-integrity-outside-"));
+    vaults.push(outside);
+    let rootStats = 0;
+    let outsideRead = false;
+    const fs: IntegrityAuditFs = {
+      lstat: async (pathname) => {
+        if (pathname === root && ++rootStats >= 7) return nativeLstat(outside, { bigint: true });
+        return nativeLstat(pathname, { bigint: true });
+      },
+      realpath: nativeRealpath,
+      readdir: async (pathname) => {
+        if (pathname === outside) outsideRead = true;
+        return nativeReaddir(pathname, { withFileTypes: true });
+      },
+      open: nativeOpen,
+    };
+
+    const report = await auditVaultIntegrity({ vault: "brain", root, policy: BRAIN_FOUNDATION_POLICY, fs });
+
+    expect(outsideRead).toBe(false);
+    expect(report.findings).toContainEqual(expect.objectContaining({ code: "changed_file", category: "ancestor" }));
+  });
+
   it("reports forbidden artifacts and unsafe links by category without reading secret-looking note content", async () => {
     const root = await createValidVault();
     await writeVaultFile(root, "20_Study/.env", "API_KEY=example-not-a-real-secret\n");
@@ -136,11 +247,7 @@ describe("Vault integrity auditor", () => {
     await mkdir(path.join(root, ".obsidian"));
     await writeVaultFile(root, "20_Study/code-example.md", "```bash\nexport API_KEY=example-not-a-real-secret\n```\n");
     await writeVaultFile(root, areaMocPath(BRAIN_FOUNDATION_POLICY.areas[3]!), `${renderAreaMoc(BRAIN_FOUNDATION_POLICY.areas[3]!)}\n- [[20_Study/code-example]]\n`);
-    try {
-      await symlink(path.join(root, "20_Study", "code-example.md"), path.join(root, "20_Study", "unsafe-link.md"));
-    } catch {
-      // Symlink creation can be unavailable on locked-down Windows test hosts.
-    }
+    await symlink(path.join(root, "20_Study", "code-example.md"), path.join(root, "20_Study", "unsafe-link.md"));
 
     const report = await auditVaultIntegrity({ vault: "brain", root, policy: BRAIN_FOUNDATION_POLICY });
     const serialized = JSON.stringify(report);
@@ -150,8 +257,6 @@ describe("Vault integrity auditor", () => {
     ]);
     expect(serialized).not.toContain("example-not-a-real-secret");
     expect(serialized).not.toContain("BEGIN PRIVATE KEY");
-    if (report.findings.some((finding) => finding.path === "20_Study/unsafe-link.md")) {
-      expect(report.findings).toContainEqual(expect.objectContaining({ path: "20_Study/unsafe-link.md", code: "unsafe_link" }));
-    }
+    expect(report.findings).toContainEqual(expect.objectContaining({ path: "20_Study/unsafe-link.md", code: "unsafe_link" }));
   });
 });

@@ -95,6 +95,8 @@ export type IntegrityFindingCode =
   | "max_depth"
   | "missing_required_file"
   | "orphan_note"
+  | "changed_file"
+  | "unreadable_file"
   | "unsafe_link";
 
 /** Never includes note text, matched credentials, link targets, or exception messages. */
