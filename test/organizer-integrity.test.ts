@@ -1,4 +1,4 @@
-import { lstat as nativeLstat, mkdtemp, mkdir, open as nativeOpen, readFile, readdir as nativeReaddir, realpath as nativeRealpath, rm, symlink, writeFile } from "node:fs/promises";
+import { lstat as nativeLstat, mkdtemp, mkdir, open as nativeOpen, opendir as nativeOpendir, readFile, realpath as nativeRealpath, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -200,9 +200,9 @@ describe("Vault integrity auditor", () => {
     const fs: IntegrityAuditFs = {
       lstat: (pathname) => nativeLstat(pathname, { bigint: true }),
       realpath: async (pathname) => pathname === (kind === "root" ? root : child) ? outside : nativeRealpath(pathname),
-      readdir: async (pathname) => {
+      opendir: async (pathname) => {
         if (pathname === outside) outsideRead = true;
-        return nativeReaddir(pathname, { withFileTypes: true });
+        return nativeOpendir(pathname);
       },
       open: (pathname, flags) => nativeOpen(pathname, flags),
     };
@@ -226,9 +226,9 @@ describe("Vault integrity auditor", () => {
         return nativeLstat(pathname, { bigint: true });
       },
       realpath: nativeRealpath,
-      readdir: async (pathname) => {
+      opendir: async (pathname) => {
         if (pathname === outside) outsideRead = true;
-        return nativeReaddir(pathname, { withFileTypes: true });
+        return nativeOpendir(pathname);
       },
       open: nativeOpen,
     };
@@ -236,7 +236,7 @@ describe("Vault integrity auditor", () => {
     const report = await auditVaultIntegrity({ vault: "brain", root, policy: BRAIN_FOUNDATION_POLICY, fs });
 
     expect(outsideRead).toBe(false);
-    expect(report.findings).toContainEqual(expect.objectContaining({ code: "changed_file", category: "ancestor" }));
+    expect(report.findings).toContainEqual(expect.objectContaining({ code: "changed_file" }));
   });
 
   it("reports forbidden artifacts and unsafe links by category without reading secret-looking note content", async () => {

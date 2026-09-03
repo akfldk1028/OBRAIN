@@ -1,13 +1,14 @@
-import { constants, type BigIntStats, type Dirent } from "node:fs";
-import { lstat, open, readdir, realpath, type FileHandle } from "node:fs/promises";
+import { constants, type BigIntStats, type Dir, type Dirent } from "node:fs";
+import { lstat, open, opendir, realpath, type FileHandle } from "node:fs/promises";
 import path from "node:path";
 import { validateGeneratedCanvas } from "../foundation/canvas.js";
 import { areaCanvasPath, areaGuidePath, areaMocPath, type VaultFoundationPolicy } from "../foundation/policy.js";
 import type { IntegrityFinding, IntegrityFindingCode, IntegrityReport } from "./types.js";
 
-export interface IntegrityAuditLimits { maxDirectories: number; maxFiles: number; maxInventoryBytes: number; maxContentBytes: number; maxParsedLinkBytes: number; maxLinks: number; maxFindings: number; }
-export const INTEGRITY_AUDIT_DEFAULTS: IntegrityAuditLimits = Object.freeze({ maxDirectories: 4096, maxFiles: 8192, maxInventoryBytes: 16_777_216, maxContentBytes: 2_097_152, maxParsedLinkBytes: 8_388_608, maxLinks: 16_384, maxFindings: 2_048 });
-export interface IntegrityAuditFs { lstat(pathname: string): Promise<BigIntStats>; realpath(pathname: string): Promise<string>; readdir(pathname: string): Promise<Dirent[]>; open(pathname: string, flags: number): Promise<FileHandle>; }
+export interface IntegrityAuditLimits { maxDirectories: number; maxFiles: number; maxEntries: number; maxInventoryBytes: number; maxContentBytes: number; maxParsedLinkBytes: number; maxLinks: number; maxFindings: number; }
+export const INTEGRITY_AUDIT_DEFAULTS: IntegrityAuditLimits = Object.freeze({ maxDirectories: 4096, maxFiles: 8192, maxEntries: 16_384, maxInventoryBytes: 16_777_216, maxContentBytes: 2_097_152, maxParsedLinkBytes: 8_388_608, maxLinks: 16_384, maxFindings: 2_048 });
+export interface IntegrityAuditDirectory extends AsyncIterable<Dirent> { close(): Promise<void>; }
+export interface IntegrityAuditFs { lstat(pathname: string): Promise<BigIntStats>; realpath(pathname: string): Promise<string>; opendir(pathname: string): Promise<IntegrityAuditDirectory>; open(pathname: string, flags: number): Promise<FileHandle>; }
 interface BoundDirectory { pathname: string; canonicalPath: string; snapshot: BigIntStats; label: string; }
 interface BoundFile { pathname: string; canonicalPath: string; snapshot: BigIntStats; lineage: readonly BoundDirectory[]; path: string; }
 interface MarkdownScan { links: string[]; starts: number[]; ends: number[]; overflow: boolean; }
@@ -38,11 +39,12 @@ class Findings {
     this.values.push({ code, category, path: pathValue });
   }
   get exceeded(): boolean { return this.hitLimit; }
+  suppressIncompleteConclusions(): void { this.values = this.values.filter((f) => !["missing_required_file", "orphan_note", "broken_link", "ambiguous_link", "canvas_missing_file"].includes(f.code)); }
   finish(): boolean { if (this.hitLimit) this.values.push({ code: "audit_limit_exceeded", category: "findings", path: "." }); this.values.sort((a, b) => cmp(a.path, b.path) || cmp(a.code, b.code) || cmp(a.category, b.category)); return this.hitLimit; }
 }
 
 function limits(partial: Partial<IntegrityAuditLimits> | undefined): IntegrityAuditLimits { const result = { ...INTEGRITY_AUDIT_DEFAULTS, ...partial }; if (Object.values(result).some((v) => !Number.isSafeInteger(v) || v < 1)) throw new Error("integrity audit limit is invalid"); return result; }
-function fsNative(): IntegrityAuditFs { return { lstat: (p) => lstat(p, { bigint: true }), realpath, readdir: (p) => readdir(p, { withFileTypes: true }) as Promise<Dirent[]>, open }; }
+function fsNative(): IntegrityAuditFs { return { lstat: (p) => lstat(p, { bigint: true }), realpath, opendir: (p) => opendir(p) as Promise<Dir>, open }; }
 function foundation(policy: VaultFoundationPolicy) { return { markdown: new Set([policy.rootGuide, policy.homeMoc, ...policy.areas.flatMap((a) => [areaMocPath(a), areaGuidePath(a)])]), canvases: new Set([policy.brainCanvas, ...policy.areas.map(areaCanvasPath)]) }; }
 
 async function bindDir(fs: IntegrityAuditFs, pathname: string, before: BigIntStats, label: string, parent?: BoundDirectory): Promise<BoundDirectory> {
@@ -80,15 +82,23 @@ function classification(relative: string, directory: boolean, policy: VaultFound
 function tooDeep(relative: string, directory: boolean, policy: VaultFoundationPolicy): boolean { return relative.split("/").length - (directory ? 0 : 1) > policy.maxDepth; }
 
 async function inventory(fs: IntegrityAuditFs, rootName: string, policy: VaultFoundationPolicy, cap: IntegrityAuditLimits, findings: Findings): Promise<{ files: BoundFile[]; complete: boolean }> {
-  const files: BoundFile[] = []; let complete = true; let directories = 0; let bytes = 0n; let initial: BigIntStats;
+  const files: BoundFile[] = []; let complete = true; let directories = 0; let entriesSeen = 0; let bytes = 0n; let initial: BigIntStats;
   try { initial = await fs.lstat(rootName); } catch { findings.add("unreadable_file", "root", "."); return { files, complete: false }; }
   let root: BoundDirectory; try { root = await bindDir(fs, rootName, initial, "integrity root"); } catch { findings.add("unsafe_link", "root", "."); return { files, complete: false }; }
   const queue: Array<{ bound: BoundDirectory; parts: string[]; lineage: BoundDirectory[] }> = [{ bound: root, parts: [], lineage: [root] }];
   for (let cursor = 0; cursor < queue.length; cursor += 1) {
     const current = queue[cursor]!; try { await revalidate(fs, current.lineage); } catch { findings.add("changed_file", "ancestor", current.parts.join("/") || "."); complete = false; continue; }
-    let entries: Dirent[]; try { entries = await fs.readdir(current.bound.canonicalPath); } catch (error) { findings.add(denied(error) ? "unreadable_file" : "changed_file", "directory", current.parts.join("/") || "."); complete = false; continue; }
-    entries.sort((a, b) => cmp(a.name, b.name));
-    for (const entry of entries) {
+    let directoryHandle: IntegrityAuditDirectory;
+    try {
+      const parent = current.lineage.at(-2); const pre = await fs.lstat(current.bound.pathname); const bound = await bindDir(fs, current.bound.pathname, pre, current.bound.label, parent);
+      if (bound.canonicalPath !== current.bound.canonicalPath || !sameDir(bound.snapshot, current.bound.snapshot)) throw new RaceError();
+      directoryHandle = await fs.opendir(bound.canonicalPath);
+      const post = await fs.lstat(current.bound.pathname); const rebound = await bindDir(fs, current.bound.pathname, post, current.bound.label, parent);
+      if (rebound.canonicalPath !== current.bound.canonicalPath || !sameDir(rebound.snapshot, current.bound.snapshot)) throw new RaceError();
+    } catch (error) { findings.add(denied(error) ? "unreadable_file" : "changed_file", "directory", current.parts.join("/") || "."); complete = false; continue; }
+    try { for await (const entry of directoryHandle) {
+      if (entriesSeen === cap.maxEntries) { findings.add("audit_limit_exceeded", "entries", current.parts.join("/") || "."); complete = false; break; }
+      entriesSeen += 1;
       const parts = [...current.parts, entry.name]; const relative = parts.join("/"); const pathname = path.join(current.bound.canonicalPath, entry.name); let stat: BigIntStats;
       try { stat = await fs.lstat(pathname); } catch (error) { findings.add(denied(error) ? "unreadable_file" : "changed_file", "entry", relative); complete = false; continue; }
       if (stat.isSymbolicLink()) { findings.add("unsafe_link", "symlink", relative); continue; }
@@ -96,10 +106,11 @@ async function inventory(fs: IntegrityAuditFs, rootName: string, policy: VaultFo
       if (tooDeep(relative, directory, policy)) { findings.add("max_depth", "depth", relative); if (directory) continue; }
       if (directory) { if (directories === cap.maxDirectories) { findings.add("audit_limit_exceeded", "directories", relative); complete = false; break; } directories += 1; try { const child = await bindDir(fs, pathname, stat, `integrity directory ${relative}`, current.bound); queue.push({ bound: child, parts, lineage: [...current.lineage, child] }); } catch { findings.add("unsafe_link", "directory", relative); complete = false; } continue; }
       if (!stat.isFile()) { findings.add("invalid_path", "unsupported_filesystem_type", relative); continue; }
+      const pathBytes = BigInt(Buffer.byteLength(entry.name) + Buffer.byteLength(relative));
       if (files.length === cap.maxFiles) { findings.add("audit_limit_exceeded", "files", relative); complete = false; break; }
-      if (bytes + stat.size > BigInt(cap.maxInventoryBytes)) { findings.add("audit_limit_exceeded", "inventory_bytes", relative); complete = false; break; }
+      if (bytes + pathBytes + stat.size > BigInt(cap.maxInventoryBytes)) { findings.add("audit_limit_exceeded", "inventory_bytes", relative); complete = false; break; }
       try { const canonicalPath = await bindFile(fs, pathname, stat, current.bound); files.push({ pathname, canonicalPath, snapshot: stat, lineage: current.lineage, path: relative }); bytes += stat.size; if (/^000_[^/]+_Map\.canvas$/iu.test(entry.name) && !foundation(policy).canvases.has(relative)) findings.add("forbidden_artifact", "unapproved_managed_canvas", relative); } catch { findings.add("unsafe_link", "file", relative); complete = false; }
-    }
+    } } finally { try { await directoryHandle.close(); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ERR_DIR_CLOSED") throw error; } }
   }
   return { files, complete };
 }
@@ -110,13 +121,23 @@ async function read(fs: IntegrityAuditFs, file: BoundFile, max: number): Promise
   } catch (error) { throw new ReadError(error instanceof RaceError || gone(error) ? "changed" : denied(error) ? "unreadable" : "changed"); }
 }
 function scanMarkdown(text: string, remaining: number): MarkdownScan {
-  const links: string[] = []; const starts: number[] = []; const ends: number[] = []; let fence: { char: "`" | "~"; count: number } | undefined; let offset = 0;
-  for (const line of text.split(/\r?\n/u)) {
-    const quote = /^\s{0,3}>/u.test(line); const indent = /^(?: {4}|\t)/u.test(line); const opener = !quote && !indent ? /^ {0,3}(`{3,}|~{3,})/u.exec(line) : undefined;
-    if (fence) { if (!quote && !indent && new RegExp(`^ {0,3}${fence.char}{${fence.count},}\\s*$`, "u").test(line)) fence = undefined; offset += line.length + 1; continue; }
-    if (opener) { fence = { char: opener[1]![0] as "`" | "~", count: opener[1]!.length }; offset += line.length + 1; continue; }
-    if (!quote && !indent) { if (line === START) starts.push(offset); if (line === END) ends.push(offset); for (let i = 0; i < line.length;) { if (line[i] === "`") { let size = 1; while (line[i + size] === "`") size += 1; const close = line.indexOf("`".repeat(size), i + size); i = close < 0 ? line.length : close + size; continue; } const begin = line.startsWith("![[", i) ? i + 1 : line.startsWith("[[", i) ? i : -1; if (begin >= 0) { const close = line.indexOf("]]", begin + 2); if (close >= 0) { if (links.length === remaining) return { links, starts, ends, overflow: true }; links.push(line.slice(begin + 2, close)); i = close + 2; continue; } } i += 1; } }
-    offset += line.length + 1;
+  const links: string[] = []; const starts: number[] = []; const ends: number[] = []; const blocked: Array<[number, number]> = []; let fence: { char: "`" | "~"; count: number; start: number } | undefined; let offset = 0;
+  for (const line of text.split(/(?<=\n)/u)) {
+    const raw = line.endsWith("\n") ? line.slice(0, -1).replace(/\r$/u, "") : line; const quote = /^ {0,3}>/u.test(raw); const indent = /^(?: {4}|\t)/u.test(raw); const opener = !quote && !indent ? /^ {0,3}(`{3,}|~{3,})(.*)$/u.exec(raw) : undefined;
+    if (fence) { if (!quote && !indent && new RegExp(`^ {0,3}${fence.char}{${fence.count},}\\s*$`, "u").test(raw)) { blocked.push([fence.start, offset + line.length]); fence = undefined; } offset += line.length; continue; }
+    if (opener && !(opener[1]![0] === "`" && opener[2]!.includes("`"))) { fence = { char: opener[1]![0] as "`" | "~", count: opener[1]!.length, start: offset }; offset += line.length; continue; }
+    if (quote || indent) blocked.push([offset, offset + line.length]);
+    else { if (raw === START) starts.push(offset); if (raw === END) ends.push(offset); }
+    offset += line.length;
+  }
+  if (fence) blocked.push([fence.start, text.length]);
+  const inBlocked = (index: number) => blocked.some(([start, end]) => index >= start && index < end);
+  for (let index = 0; index < text.length;) {
+    if (inBlocked(index)) { index += 1; continue; }
+    if (text[index] === "`") { let size = 1; while (text[index + size] === "`") size += 1; const run = "`".repeat(size); const close = text.indexOf(run, index + size); if (close >= 0 && !inBlocked(close)) { blocked.push([index, close + size]); index = close + size; continue; } index += size; continue; }
+    const begin = text.startsWith("![[", index) ? index + 1 : text.startsWith("[[", index) ? index : -1;
+    if (begin >= 0 && !inBlocked(begin)) { const close = text.indexOf("]]", begin + 2); if (close >= 0 && !inBlocked(close)) { if (links.length === remaining) return { links, starts, ends, overflow: true }; links.push(text.slice(begin + 2, close)); index = close + 2; continue; } }
+    index += 1;
   }
   return { links, starts, ends, overflow: false };
 }
@@ -134,11 +155,13 @@ export async function auditVaultIntegrity(input: { vault: string; root: string; 
     if (!complete) continue;
     for (const raw of scan.links) { if (raw.startsWith("#") || raw.startsWith("^")) { incoming.add(file.path); continue; } const target = linkTarget(raw); if (!target) { findings.add("broken_link", "wiki_link", file.path); continue; } const choices = options(file.path, target); const exact = choices.find((v) => files.has(v)); if (exact) { if (exact.toLocaleLowerCase("en-US").endsWith(".md")) incoming.add(exact); continue; } if (choices.some((v) => required.markdown.has(v))) continue; const basename = path.posix.basename(choices[0] ?? target); const matches = inventoryResult.files.filter((f) => path.posix.basename(f.path) === basename); if (matches.length === 1) { if (matches[0]!.path.endsWith(".md")) incoming.add(matches[0]!.path); continue; } const near = inventoryResult.files.filter((f) => choices.some((v) => key(v) === key(f.path)) || key(path.posix.basename(f.path)) === key(basename)); findings.add(matches.length > 1 || near.length > 1 ? "ambiguous_link" : "broken_link", "wiki_link", file.path); }
   }
-  if (findings.exceeded) complete = false;
-  if (complete) for (const expected of [...required.markdown, ...required.canvases]) if (!files.has(expected)) findings.add("missing_required_file", "missing", expected);
   const normal = new Map<string, BoundFile[]>(); for (const f of inventoryResult.files) normal.set(key(f.path), [...(normal.get(key(f.path)) ?? []), f]);
-  for (const canvasPath of required.canvases) { const file = files.get(canvasPath); if (!file) continue; let value: unknown; try { value = JSON.parse((await read(fs, file, cap.maxContentBytes)).toString("utf8")); } catch (error) { findings.add("invalid_canvas", error instanceof ReadError ? error.kind : "json", canvasPath); continue; } if (!validateGeneratedCanvas(value)) { findings.add("invalid_canvas", "schema", canvasPath); continue; } for (const node of value.nodes) { const match = files.get(node.file); if (!match || !match.path.endsWith(".md") || (normal.get(key(node.file)) ?? []).length !== 1) findings.add("canvas_missing_file", (normal.get(key(node.file)) ?? []).length > 1 ? "ambiguous_reference" : "file_reference", canvasPath); } }
+  for (const canvasPath of required.canvases) { const file = files.get(canvasPath); if (!file) continue; if (file.snapshot.size > BigInt(cap.maxContentBytes)) { findings.add("audit_limit_exceeded", "content_bytes", canvasPath); complete = false; continue; } let value: unknown; try { value = JSON.parse((await read(fs, file, cap.maxContentBytes)).toString("utf8")); } catch (error) { findings.add("invalid_canvas", error instanceof ReadError ? error.kind : "json", canvasPath); continue; } if (!validateGeneratedCanvas(value)) { findings.add("invalid_canvas", "schema", canvasPath); continue; } if (complete) for (const node of value.nodes) { const match = files.get(node.file); if (!match || !match.path.toLocaleLowerCase("en-US").endsWith(".md") || (normal.get(key(node.file)) ?? []).length !== 1) findings.add("canvas_missing_file", (normal.get(key(node.file)) ?? []).length > 1 ? "ambiguous_reference" : "file_reference", canvasPath); } }
   if (findings.exceeded) complete = false;
+  if (!complete) findings.suppressIncompleteConclusions();
+  if (complete) for (const expected of [...required.markdown, ...required.canvases]) if (!files.has(expected)) findings.add("missing_required_file", "missing", expected);
+  if (findings.exceeded) { complete = false; findings.suppressIncompleteConclusions(); }
   if (complete) for (const file of markdown) if (!required.markdown.has(file.path) && !file.path.startsWith(`${input.policy.inbox}/`) && !file.path.split("/").some((s) => s.startsWith(".")) && !incoming.has(file.path)) findings.add("orphan_note", "no_inbound_link", file.path);
+  if (findings.exceeded) findings.suppressIncompleteConclusions();
   findings.finish(); return { vault: input.vault, checkedAt: new Date().toISOString(), findings: findings.values };
 }
