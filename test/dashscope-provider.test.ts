@@ -28,6 +28,33 @@ const environment = loadOrganizerEnvironment({
   DASHSCOPE_MODEL: "qwen-plus",
 });
 
+function streamFromText(content: string): ReadableStream<Uint8Array> {
+  return new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(content));
+      controller.close();
+    },
+  });
+}
+
+function responseWithJson(payload: unknown): Response {
+  return {
+    ok: true,
+    status: 200,
+    headers: new Headers(),
+    body: streamFromText(JSON.stringify(payload)),
+  } as Response;
+}
+
+function errorResponse(status: number, cancel = vi.fn(), retryAfter?: string): Response {
+  return {
+    ok: false,
+    status,
+    headers: new Headers(retryAfter ? { "Retry-After": retryAfter } : undefined),
+    body: { cancel } as unknown as ReadableStream<Uint8Array>,
+  } as Response;
+}
+
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
@@ -36,9 +63,7 @@ afterEach(() => {
 describe("DashScopeProvider", () => {
   it("sends the synthetic authorization only with the bounded outbound request", async () => {
     const fetchMock = vi.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      json: async () => ({ choices: [{ message: { content: JSON.stringify(validProposal) } }] }),
+      ...responseWithJson({ choices: [{ message: { content: JSON.stringify(validProposal) } }] }),
     });
     vi.stubGlobal("fetch", fetchMock);
 
@@ -51,15 +76,11 @@ describe("DashScopeProvider", () => {
       method: "POST",
       headers: { Authorization: "Bearer test-only-provider-key", "Content-Type": "application/json" },
     });
-    expect(JSON.parse(request.body)).toMatchObject({ model: "qwen-plus", temperature: 0 });
+    expect(JSON.parse(request.body)).toMatchObject({ model: "qwen-plus", temperature: 0, max_tokens: 2048 });
   });
 
   it("keeps authorization and response bodies out of deterministic HTTP errors", async () => {
-    const fetchMock = vi.fn().mockResolvedValue({
-      ok: false,
-      status: 503,
-      json: async () => ({ error: "test-only-provider-key" }),
-    });
+    const fetchMock = vi.fn().mockResolvedValue(errorResponse(503));
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
     vi.stubGlobal("fetch", fetchMock);
 
@@ -74,12 +95,8 @@ describe("DashScopeProvider", () => {
 
   it("retries only transient HTTP statuses and returns the later valid proposal", async () => {
     const fetchMock = vi.fn()
-      .mockResolvedValueOnce({ ok: false, status: 429, json: async () => ({}) })
-      .mockResolvedValueOnce({
-        ok: true,
-        status: 200,
-        json: async () => ({ choices: [{ message: { content: JSON.stringify(validProposal) } }] }),
-      });
+      .mockResolvedValueOnce(errorResponse(429))
+      .mockResolvedValueOnce(responseWithJson({ choices: [{ message: { content: JSON.stringify(validProposal) } }] }));
     vi.stubGlobal("fetch", fetchMock);
 
     await expect(new DashScopeProvider(environment).propose(context)).resolves.toEqual(validProposal);
@@ -101,24 +118,106 @@ describe("DashScopeProvider", () => {
   });
 
   it("rejects Markdown-fenced JSON instead of salvaging it", async () => {
-    const fetchMock = vi.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      json: async () => ({ choices: [{ message: { content: "```json\\n{}\\n```" } }] }),
-    });
+    const fetchMock = vi.fn().mockResolvedValue(responseWithJson({ choices: [{ message: { content: "```json\\n{}\\n```" } }] }));
     vi.stubGlobal("fetch", fetchMock);
 
     await expect(new DashScopeProvider(environment).propose(context)).rejects.toThrow("Organizer provider returned invalid JSON");
   });
 
-  it("rejects oversized context before making an HTTP request", async () => {
+  it("rejects final serialized requests that exceed the configured context limit before fetch", async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
-    const oversizedContext = { ...context, note: { ...context.note, content: "x".repeat(262_145) } };
+    const rawContent = "</untrusted_note>".repeat(50);
+    expect(Buffer.byteLength(rawContent, "utf8")).toBeLessThan(2_048);
+    const oversizedContext = { ...context, note: { ...context.note, content: rawContent } };
 
-    await expect(new DashScopeProvider(environment).propose(oversizedContext)).rejects.toThrow(
+    await expect(new DashScopeProvider(environment, { maxContextBytes: 2_048 }).propose(oversizedContext)).rejects.toThrow(
       "Organizer provider context is too large",
     );
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("cancels retryable response bodies before retrying", async () => {
+    const cancel = vi.fn().mockResolvedValue(undefined);
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(errorResponse(429, cancel))
+      .mockResolvedValueOnce(responseWithJson({ choices: [{ message: { content: JSON.stringify(validProposal) } }] }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(new DashScopeProvider(environment).propose(context)).resolves.toEqual(validProposal);
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("uses exactly three attempts for retryable status exhaustion", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(errorResponse(500));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(new DashScopeProvider(environment).propose(context)).rejects.toThrow(
+      "Organizer provider request failed with status 500",
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not retry a non-retryable status", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(errorResponse(400));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(new DashScopeProvider(environment).propose(context)).rejects.toThrow(
+      "Organizer provider request failed with status 400",
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["no choices", {}],
+    ["non-string first choice", { choices: [{ message: { content: 7 } }] }],
+  ])("rejects a %s response shape", async (_label, payload) => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(responseWithJson(payload)));
+
+    await expect(new DashScopeProvider(environment).propose(context)).rejects.toThrow(
+      "Organizer provider returned invalid response",
+    );
+  });
+
+  it("rejects a successful response without a readable body", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, status: 200, headers: new Headers(), body: null }));
+
+    await expect(new DashScopeProvider(environment).propose(context)).rejects.toThrow(
+      "Organizer provider returned invalid response",
+    );
+  });
+
+  it("rejects an oversized streamed response before JSON parsing", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: new Headers(),
+      body: streamFromText("x".repeat(65)),
+    }));
+
+    await expect(new DashScopeProvider(environment, { maxResponseBytes: 64 }).propose(context)).rejects.toThrow(
+      "Organizer provider response is too large",
+    );
+  });
+
+  it("reports a timeout when aborting during streamed response reading", async () => {
+    const controller = new AbortController();
+    vi.spyOn(AbortSignal, "timeout").mockReturnValue(controller.signal);
+    let readStarted!: () => void;
+    const readingStarted = new Promise<void>((resolve) => { readStarted = resolve; });
+    const body = new ReadableStream<Uint8Array>({
+      pull() {
+        readStarted();
+        return new Promise<void>(() => undefined);
+      },
+    });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, status: 200, headers: new Headers(), body }));
+
+    const pending = new DashScopeProvider(environment).propose(context);
+    await readingStarted;
+    controller.abort();
+
+    await expect(pending).rejects.toThrow("Organizer provider request timed out");
   });
 });
