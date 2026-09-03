@@ -25,6 +25,21 @@ describe("sensitive-content guard", () => {
     ]);
   });
 
+  it("detects labeled bearer credentials without retaining their values", () => {
+    const findings = detectSensitiveContent(
+      "bearer_token=synthetic-value-123\nbearer-token: synthetic-value-456",
+    );
+    expect(findings).toEqual([
+      { kind: "oauth_token", line: 1 },
+      { kind: "oauth_token", line: 2 },
+    ]);
+    expect(JSON.stringify(findings)).not.toContain("synthetic-value");
+  });
+
+  it("does not flag ordinary bearer authentication prose", () => {
+    expect(detectSensitiveContent("Bearer authentication is described here")).toEqual([]);
+  });
+
   it("returns one finding per category and line while preserving category order", () => {
     const findings = detectSensitiveContent(
       "password=first password=second sk-firstsynthetic123456 sk-secondsynthetic123456 ocid1.user.oc1..syntheticidentifier",

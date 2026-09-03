@@ -15,7 +15,7 @@ const PATTERNS: ReadonlyArray<readonly [SensitiveKind, RegExp]> = [
   ["api_key", /\bsk-[A-Za-z0-9_-]{16,}\b/],
   [
     "oauth_token",
-    /(?:\b(?:access|refresh|oauth|id)[_-]?token\s*[:=]\s*\S+|\bAuthorization\s*:\s*Bearer\s+\S{8,}|\bBearer\s+[A-Za-z0-9._~+/=-]{8,})/i,
+    /(?:\b(?:access|refresh|oauth|id|bearer)[_-]?token\s*[:=]\s*\S+|\bAuthorization\s*:\s*Bearer\s+[A-Za-z0-9._~+/=-]{8,}(?=\s|$))/i,
   ],
   ["password", /\b(?:password|passphrase)\s*[:=]\s*\S+/i],
   [
