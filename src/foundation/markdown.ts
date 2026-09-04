@@ -2,7 +2,6 @@ import type { AreaDefinition, VaultFoundationPolicy } from "./policy.js";
 
 const managedBlock = [
   "<!-- brain-auto:start note-index -->",
-  "_자동 정리기가 이 구간만 갱신합니다._",
   "<!-- brain-auto:end note-index -->",
 ].join("\n");
 

@@ -132,6 +132,35 @@ Per-user options: add `"readOnly": true` to expose only read tools to that perso
 `"ext": [".md", ".canvas"]` to override the writable extensions. `id` is any label; it appears in
 logs and the token. The server refuses to start if two users share a passphrase.
 
+### Optional Brain organizer configuration
+
+The organizer is available only with the owner-controlled configuration selected by
+`MCP_CONFIG_FILE`; do not combine that setting with the legacy `MCP_USERS_FILE`. Add an `organizer`
+object to that configuration, start with `mode` set to `dry-run`, and list only Vault IDs owned by
+this service instance in `enabledVaults`. The minimum automatic threshold is `0.90`.
+
+Keep provider settings in a separate root-owned file. Create the file without putting a sample or
+real secret in this runbook or shell output:
+
+```bash
+install -o root -g root -m 600 /dev/null /etc/brain-organizer.env
+sudoedit /etc/brain-organizer.env
+stat -c '%U %G %a %n' /etc/brain-organizer.env
+```
+
+The file is `/etc/brain-organizer.env`, must remain owned by `root:root` with permissions `600`, and
+holds `ORGANIZER_PROVIDER`, `DASHSCOPE_API_KEY`, `DASHSCOPE_BASE_URL`, and `DASHSCOPE_MODEL`. Enter
+the real provider key only in that file. Never paste it into the repository, an Obsidian note, a run
+report, command output, or incident ticket. Add this line to the systemd service alongside the main
+environment file:
+
+```ini
+EnvironmentFile=-/etc/brain-organizer.env
+```
+
+The leading `-` permits deployments with the organizer disabled and the provider file absent. When
+the organizer is enabled, treat a missing or unreadable provider file as a deployment error.
+
 ---
 
 ## Step 4 — systemd unit `/etc/systemd/system/obsidian-multivault-mcp.service`
@@ -150,6 +179,7 @@ Wants=network-online.target
 User=youruser
 WorkingDirectory=/home/youruser/obsidian-multivault-mcp
 EnvironmentFile=/etc/obsidian-multivault-mcp.env
+EnvironmentFile=-/etc/brain-organizer.env
 ExecStart=<NODE_BIN> /home/youruser/obsidian-multivault-mcp/dist/index.js --http --port 8787 --host 127.0.0.1
 Restart=on-failure
 RestartSec=2
@@ -170,6 +200,10 @@ Notes:
 - `ProtectSystem=strict` makes the whole filesystem read-only except `ReadWritePaths` — list
   **every** vault plus the app dir (for `oauth-clients.json`). Add a path here for each user's vault.
 - Per-user read-only is set in the users file (`"readOnly": true`), not on `ExecStart`.
+- For an owner-configured organizer, include exactly its configured Vault roots and `dataDir` in
+  `ReadWritePaths`; do not widen the writable boundary. The portable transaction protections assume
+  these are owner-controlled paths. An actor running with the same OS identity as the service is
+  inside that trust boundary, so stop the service before operator recovery or manual namespace work.
 
 ---
 
@@ -246,6 +280,16 @@ curl -i -X POST https://203-0-113-10.sslip.io/mcp \
 `200 ok` on `/healthz` and `401` + `WWW-Authenticate` on `/mcp` means TLS, the proxy, and the OAuth
 gate are all working. You're ready to connect Claude.
 
+If the owner configuration enables the organizer, verify the same OAuth/HTTPS path and the exact
+tool surface from the checked-out release before going public:
+
+```bash
+SMOKE_EXPECT_ORGANIZER_TOOLS=1 npm run smoke:http
+```
+
+This must report exactly 13 tools. With no organizer configured (or with its mode set to
+`disabled`), the normal smoke test must report exactly the six knowledge tools.
+
 ---
 
 ## Step 9 — Connect Claude (mobile + desktop)
@@ -287,6 +331,43 @@ sudo systemctl restart obsidian-multivault-mcp
 
 Caddy and the env file are one-time setup; only reload Caddy (`sudo systemctl reload caddy`) if you
 change the Caddyfile.
+
+---
+
+## Brain organizer operations and recovery
+
+For every area, read `000_AI_WORK_GUIDE.md`, then `000_Home_MOC.md`, then the area's
+`99_작업가이드_다음AI용.md`, and finally that area's `000_*_MOC.md`. Do not apply a proposal before
+the root and area-specific rules have been reviewed.
+
+- `dry-run` scans stable Inbox notes and records proposals/reports without moving sources.
+- A requested `automatic` run is forced to dry-run during the first seven days. After that, only a
+  safe proposal at or above `0.90` can move automatically. Medium- and low-confidence notes remain
+  in place.
+- Secret-bearing notes are stopped before the provider sees them. They remain local and
+  byte-for-byte unchanged; sync-conflict copies are skipped and unchanged as well.
+
+The MCP operator flow is `list_inbox_notes` → `propose_organization` → review the returned source,
+destination, reason, and confidence → `apply_organization`. Save the returned transaction ID. Use
+`undo_organization` with that ID to restore the exact source and managed MOC state. Run
+`audit_vault` after apply and after recovery; it returns structural findings without note bodies.
+
+Run reports are stored in the Vault at
+`60_Tools/61_Obsidian_MCP/90_Auto_Organizer_Reports/<run-id>.json`. Private recovery snapshots are
+under `<dataDir>/organizer-recovery/<transaction-id>/`, and audit actions are in
+`<dataDir>/audit.jsonl`. Do not manually edit recovery snapshots while the service runs. Preserve
+the owner-controlled filesystem boundary: recovery never requires broader Vault access or another
+native dependency.
+
+To disable the organizer immediately:
+
+1. Edit the owner configuration named by `MCP_CONFIG_FILE` and set `organizer.mode` to `disabled`.
+2. Restart `obsidian-multivault-mcp`.
+3. Confirm the service is active, the Vault is unchanged, and MCP lists exactly the six knowledge
+   tools. The seven organizer tools must be absent.
+
+Disabling does not delete reports, audit history, proposals, or recovery snapshots. Keep those files
+for diagnosis and exact undo; remove nothing recursively during incident response.
 
 ---
 

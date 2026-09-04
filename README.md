@@ -85,6 +85,42 @@ npm run foundation:preview -- --vault "D:\obsidian\Brain"
 npm run foundation:apply -- --vault "D:\obsidian\Brain"
 ```
 
+## Brain organizer operating contract
+
+Before organizing an area, read the Vault in this order: `000_AI_WORK_GUIDE.md`,
+`000_Home_MOC.md`, that area's `99_작업가이드_다음AI용.md`, and then its `000_*_MOC.md`.
+The root guide defines the global policy; the area guide and MOC supply the local rules and context.
+
+The organizer has three configured modes:
+
+- `dry-run` scans stable `Agent-Inbox` notes, creates proposals and a redacted run report, but does
+  not move or rewrite a source note.
+- `automatic` is still forced to dry-run for the first seven days after the first enabled run. After
+  that trial, it may move only a validated proposal with confidence at or above `0.90`; medium- and
+  low-confidence notes remain in place for review.
+- `disabled` stops organizer runs and removes the seven organizer tools from MCP while leaving the
+  six knowledge tools available.
+
+The MCP flow is `list_inbox_notes` → `propose_organization` → inspect the returned proposal →
+`apply_organization`. The server, not the caller, chooses and validates the destination. Keep the
+returned transaction ID: `undo_organization` uses it to restore the exact source and managed MOC
+state. `get_vault_policy` shows the active contract, and `audit_vault` checks foundation files,
+managed markers, links, and generated Canvas files without returning note bodies.
+
+Each run writes a content-free JSON report under
+`60_Tools/61_Obsidian_MCP/90_Auto_Organizer_Reports` in the configured Vault. Recovery snapshots live
+under `<dataDir>/organizer-recovery/<transaction-id>/`, and the append-only action log is
+`<dataDir>/audit.jsonl`. Recovery state is private service data: do not edit or copy it into the
+Vault. Secret-bearing notes are rejected before provider invocation and remain local and
+byte-for-byte unchanged. Sync-conflict copies are also skipped and unchanged.
+
+Provider settings belong only in the root-owned `/etc/brain-organizer.env` file with mode `0600`;
+never put a provider key in the repository, a note, a report, or documentation. To stop organization
+immediately, set the configured `organizer.mode` to `disabled` in the file named by
+`MCP_CONFIG_FILE`, restart the service, and confirm that MCP lists exactly the six knowledge tools.
+The filesystem safety boundary remains the owner-controlled configured Vault roots and `dataDir`;
+do not broaden service write permissions beyond those paths.
+
 ## Deploy to the VPS
 
 Requires **Node 20+** on the VPS.
@@ -195,6 +231,7 @@ keys: `readOnly` and `ext`.
 ```bash
 npm run build
 npm run smoke:http           # spins up two servers: tools-over-HTTP + full OAuth handshake
+SMOKE_EXPECT_ORGANIZER_TOOLS=1 npm run smoke:http  # same auth flow; expects exactly 13 tools
 
 # Or drive it by hand (auth disabled) with the MCP Inspector:
 MCP_NO_AUTH=1 node dist/index.js /path/to/vault --http --port 8787

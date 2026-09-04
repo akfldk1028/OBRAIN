@@ -1,6 +1,7 @@
 // End-to-end smoke test for the Streamable HTTP transport.
 //
 //   npm run build && node scripts/smoke-http.mjs
+//   SMOKE_EXPECT_ORGANIZER_TOOLS=1 npm run smoke:http
 //
 // Part A (MCP_NO_AUTH=1): drives every tool over http://127.0.0.1:PORT/mcp with
 //   the real MCP SDK client, and asserts traversal/bad-extension attempts error.
@@ -18,6 +19,15 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 const PORT_A = Number(process.env.SMOKE_PORT_A ?? 8798);
 const PORT_B = Number(process.env.SMOKE_PORT_B ?? 8799);
 const PORT_D = Number(process.env.SMOKE_PORT_D ?? 8800);
+const EXPECT_ORGANIZER_TOOLS = process.env.SMOKE_EXPECT_ORGANIZER_TOOLS === "1";
+const KNOWLEDGE_TOOLS = [
+  "create_inbox_note", "get_note_links", "list_notes",
+  "list_vaults", "read_note", "search_notes",
+].sort();
+const ORGANIZER_TOOLS = [
+  "apply_organization", "audit_vault", "get_vault_policy", "list_inbox_notes",
+  "organize_now", "propose_organization", "undo_organization",
+].sort();
 
 /** Run the OAuth authorization-code + PKCE flow and return an access token. */
 async function oauthToken(base, passphrase) {
@@ -79,6 +89,18 @@ async function callToolAs(base, token, name, args) {
   return (res.content ?? []).map((c) => c.text).join("\n");
 }
 
+/** Connect an authenticated MCP client and return its exact sorted tool names. */
+async function listToolsAs(base, token) {
+  const transport = new StreamableHTTPClientTransport(new URL(`${base}/mcp`), {
+    requestInit: { headers: { Authorization: `Bearer ${token}` } },
+  });
+  const client = new Client({ name: "smoke-tool-list", version: "1.0.0" });
+  await client.connect(transport);
+  const tools = (await client.listTools()).tools.map((tool) => tool.name).sort();
+  await client.close();
+  return tools;
+}
+
 const show = (label, res) => {
   const flag = res.isError ? "  [isError]" : "";
   const text = (res.content ?? []).map((c) => c.text).join("\n");
@@ -137,10 +159,7 @@ try {
   const tools = await client.listTools();
   console.log("tools:", tools.tools.map((t) => t.name).join(", "));
   const toolNames = tools.tools.map((tool) => tool.name).sort();
-  assert(toolNames.join(",") === [
-    "create_inbox_note", "get_note_links", "list_notes",
-    "list_vaults", "read_note", "search_notes",
-  ].sort().join(","), "exactly the 6 safe knowledge tools are registered");
+  assert(toolNames.join(",") === KNOWLEDGE_TOOLS.join(","), "exactly the 6 safe knowledge tools are registered");
 
   const created = await client.callTool({
     name: "create_inbox_note",
@@ -367,6 +386,12 @@ try {
         { id: "alpha", root: vaultAlpha },
         { id: "bravo", root: vaultBravo },
       ],
+      ...(EXPECT_ORGANIZER_TOOLS ? {
+        organizer: {
+          enabledVaults: ["alpha", "bravo"],
+          mode: "dry-run",
+        },
+      } : {}),
     }),
     { mode: 0o600 },
   );
@@ -381,6 +406,14 @@ try {
 
   const ownerToken = await oauthToken(baseD, "smoke-owner-passphrase");
   assert(!!ownerToken, "owner OAuth flow returns a token");
+  const expectedTools = EXPECT_ORGANIZER_TOOLS
+    ? [...KNOWLEDGE_TOOLS, ...ORGANIZER_TOOLS].sort()
+    : KNOWLEDGE_TOOLS;
+  const ownerTools = await listToolsAs(baseD, ownerToken);
+  assert(
+    ownerTools.join(",") === expectedTools.join(","),
+    `exactly ${expectedTools.length} ${EXPECT_ORGANIZER_TOOLS ? "knowledge and organizer" : "safe knowledge"} tools are registered`,
+  );
   const alphaSees = await callToolAs(baseD, ownerToken, "list_notes", { vault: "alpha" });
   const bravoSees = await callToolAs(baseD, ownerToken, "list_notes", { vault: "bravo" });
   assert(alphaSees.includes("alpha-only.md"), "owner sees the alpha vault");
