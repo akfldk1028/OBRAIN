@@ -71,6 +71,9 @@ export class SearchIndex {
       this.db.pragma("foreign_keys = ON");
       this.db.pragma("journal_mode = WAL");
       this.db.pragma("busy_timeout = 5000");
+      const hadFts = Boolean(this.db.prepare(`
+        SELECT 1 FROM sqlite_master WHERE type='table' AND name='notes_fts'
+      `).get());
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS notes (
           id INTEGER PRIMARY KEY,
@@ -98,7 +101,8 @@ export class SearchIndex {
           operation TEXT NOT NULL CHECK(operation IN ('upsert', 'delete')),
           content_hash TEXT,
           mtime_ms REAL,
-          size INTEGER
+          size INTEGER,
+          content TEXT
         );
         CREATE INDEX IF NOT EXISTS note_changes_vault_seq
           ON note_changes(vault_id, seq);
@@ -125,16 +129,20 @@ export class SearchIndex {
           VALUES(new.id,new.title,new.body,new.tags_json);
         END;
       `);
-      this.db.prepare(`
-        INSERT INTO note_changes(vault_id,path,operation,content_hash,mtime_ms,size)
-        SELECT n.vault_id,n.path,'upsert',n.content_hash,n.mtime_ms,n.size
-        FROM notes n
-        WHERE NOT EXISTS (
-          SELECT 1 FROM note_changes c
-          WHERE c.vault_id=n.vault_id AND c.path=n.path
-        )
-        ORDER BY n.id
-      `).run();
+      if (!hadFts) {
+        this.db.exec(`
+          INSERT INTO notes_fts(rowid,title,body,tags)
+          SELECT id,title,body,tags_json FROM notes
+        `);
+      }
+      const changeColumns = new Set(
+        (this.db.pragma("table_info(note_changes)") as Array<{ name: string }>)
+          .map((column) => column.name),
+      );
+      if (!changeColumns.has("content")) {
+        this.db.exec("ALTER TABLE note_changes ADD COLUMN content TEXT");
+        this.db.exec("DELETE FROM note_changes WHERE operation='upsert' AND content IS NULL");
+      }
     } catch (error) {
       this.db.close();
       throw error;
@@ -152,13 +160,22 @@ export class SearchIndex {
         mtime_ms: number;
         size: number;
       } | undefined;
-      if (
+      const unchanged = (
         existing?.content_hash === note.contentHash
         && existing.mtime_ms === note.mtimeMs
         && existing.size === note.size
-      ) return;
+      );
+      const readableSnapshot = this.db.prepare(`
+        SELECT 1
+        FROM note_changes
+        WHERE vault_id=? AND path=? AND operation='upsert'
+          AND content_hash=? AND content IS NOT NULL
+        LIMIT 1
+      `).get(note.vaultId, note.path, note.contentHash);
+      if (unchanged && readableSnapshot) return;
 
-      const row = this.db.prepare(`
+      if (!unchanged) {
+        const row = this.db.prepare(`
         INSERT INTO notes(
           vault_id,path,title,body,excerpt,frontmatter_json,tags_json,mtime_ms,size,content_hash
         ) VALUES(?,?,?,?,?,?,?,?,?,?)
@@ -172,29 +189,47 @@ export class SearchIndex {
           size=excluded.size,
           content_hash=excluded.content_hash
         RETURNING id
-      `).get(
+        `).get(
+          note.vaultId,
+          note.path,
+          note.title,
+          note.body,
+          note.excerpt,
+          JSON.stringify(note.frontmatter),
+          JSON.stringify(note.tags),
+          note.mtimeMs,
+          note.size,
+          note.contentHash,
+        ) as { id: number };
+
+        this.db.prepare("DELETE FROM links WHERE source_id=?").run(row.id);
+        const insertLink = this.db.prepare(
+          "INSERT OR IGNORE INTO links(source_id,target) VALUES(?,?)",
+        );
+        for (const target of note.outgoingLinks) insertLink.run(row.id, target);
+      }
+      this.db.prepare(`
+        INSERT INTO note_changes(vault_id,path,operation,content_hash,mtime_ms,size,content)
+        VALUES(?,?,'upsert',?,?,?,?)
+      `).run(
         note.vaultId,
         note.path,
-        note.title,
-        note.body,
-        note.excerpt,
-        JSON.stringify(note.frontmatter),
-        JSON.stringify(note.tags),
+        note.contentHash,
         note.mtimeMs,
         note.size,
-        note.contentHash,
-      ) as { id: number };
-
-      this.db.prepare("DELETE FROM links WHERE source_id=?").run(row.id);
-      const insertLink = this.db.prepare(
-        "INSERT OR IGNORE INTO links(source_id,target) VALUES(?,?)",
+        note.content,
       );
-      for (const target of note.outgoingLinks) insertLink.run(row.id, target);
-      this.db.prepare(`
-        INSERT INTO note_changes(vault_id,path,operation,content_hash,mtime_ms,size)
-        VALUES(?,?,'upsert',?,?,?)
-      `).run(note.vaultId, note.path, note.contentHash, note.mtimeMs, note.size);
     })();
+  }
+
+  readChangeContent(input: { seq: number; vault: string; path: string }): string {
+    const row = this.db.prepare(`
+      SELECT content
+      FROM note_changes
+      WHERE seq=? AND vault_id=? AND path=? AND operation='upsert'
+    `).get(input.seq, input.vault, input.path) as { content: string | null } | undefined;
+    if (!row || row.content == null) throw new Error("Change snapshot is unavailable");
+    return row.content;
   }
 
   remove(vaultId: string, relativePath: string): void {

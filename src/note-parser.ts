@@ -5,6 +5,7 @@ import matter from "gray-matter";
 export interface ParsedNote {
   vaultId: string;
   path: string;
+  content: string;
   title: string;
   body: string;
   excerpt: string;
@@ -52,6 +53,7 @@ export function parseNote(
   return {
     vaultId,
     path: relativePath.split(path.sep).join("/"),
+    content,
     title: headings[0] ?? fallbackTitle,
     body,
     excerpt: body.replace(/\s+/g, " ").trim().slice(0, 400),

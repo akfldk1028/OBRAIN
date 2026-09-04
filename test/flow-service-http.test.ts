@@ -97,6 +97,15 @@ describe("FLOW service principal over Streamable HTTP", () => {
       }));
       expect(changes).toContain("Connected.md");
       expect(changes).not.toContain("Secret.md");
+      const changeSeq = (JSON.parse(changes) as { changes: Array<{ seq: number }> }).changes[0].seq;
+      await writeFile(path.join(fx.rootOf("brain"), "Connected.md"), "# Connected\nchanged later");
+      await fx.knowledge.initialize();
+      const historical = toolText(await client.callTool({
+        name: "read_note",
+        arguments: { vault: "brain", path: "Connected.md", changeSeq },
+      }));
+      expect(historical).toContain("FLOW bridge proof");
+      expect(historical).not.toContain("changed later");
       await expect(client.callTool({
         name: "create_inbox_note",
         arguments: { vault: "brain", title: "Blocked", content: "Blocked" },
@@ -143,6 +152,40 @@ describe("FLOW service principal over Streamable HTTP", () => {
       await expect(client.connect(transport)).rejects.toThrow();
     } finally {
       await client.close().catch(() => undefined);
+      await runtime.close();
+      await fx.cleanup();
+    }
+  });
+
+  it("rate-limits forwarded client IPs independently behind the loopback proxy", async () => {
+    delete process.env.MCP_NO_AUTH;
+    delete process.env.MCP_PUBLIC_URL;
+    process.env.MCP_JWT_SECRET = "test-jwt-secret-at-least-thirty-two-characters";
+    const fx = await createKnowledgeFixture(["brain"]);
+    await fx.knowledge.initialize();
+    const port = await freePort();
+    const runtime = await startHttp(
+      [{ id: "owner", passphrase: "owner-passphrase", knowledge: fx.knowledge }],
+      { host: "127.0.0.1", port, serviceClients: [] },
+    );
+    const tokenUrl = `http://127.0.0.1:${port}/token`;
+    const attempt = (forwardedFor: string) => fetch(tokenUrl, {
+      method: "POST",
+      headers: {
+        authorization: `Basic ${Buffer.from("unknown:wrong").toString("base64")}`,
+        "content-type": "application/x-www-form-urlencoded",
+        "x-forwarded-for": forwardedFor,
+      },
+      body: "grant_type=client_credentials&scope=notes%3Aread",
+    });
+
+    try {
+      for (let index = 0; index < 10; index += 1) {
+        expect((await attempt("198.51.100.10")).status).toBe(401);
+      }
+      expect((await attempt("198.51.100.10")).status).toBe(429);
+      expect((await attempt("198.51.100.11")).status).toBe(401);
+    } finally {
       await runtime.close();
       await fx.cleanup();
     }

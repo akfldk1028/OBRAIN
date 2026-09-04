@@ -16,6 +16,7 @@ import { createKnowledgeMcpServer } from "./server-factory.js";
 import { LoginError, VaultOAuthProvider } from "./oauth-provider.js";
 import type { KnowledgeAccessPolicy } from "./knowledge-view.js";
 import {
+  hashServiceSecret,
   loadServiceClients,
   type ServiceClient,
   verifyServiceSecret,
@@ -99,9 +100,20 @@ export async function startHttp(users: HttpUser[], opts: HttpOptions): Promise<H
       throw new Error(`Service client ${client.clientId} has an invalid owner or Vault assignment`);
     }
   }
+  const dummyServiceClient: ServiceClient | undefined = authEnabled
+    ? {
+        clientId: "invalid",
+        secretHash: await hashServiceSecret(randomUUID()),
+        ownerId: ownerIds[0],
+        scopes: ["notes:read"],
+        allowedVaults: [knownVaults[0]],
+        enabled: false,
+      }
+    : undefined;
 
   const app = express();
   app.disable("x-powered-by");
+  app.set("trust proxy", "loopback");
 
   app.use(
     cors({
@@ -179,14 +191,16 @@ export async function startHttp(users: HttpUser[], opts: HttpOptions): Promise<H
         const client = credentials
           ? serviceClients.find((candidate) => candidate.clientId === credentials.clientId)
           : undefined;
-        let validIdentity = false;
-        if (client?.enabled && credentials) {
-          try {
-            validIdentity = await verifyServiceSecret(client, credentials.secret);
-          } catch {
-            validIdentity = false;
-          }
+        let validSecret = false;
+        try {
+          validSecret = await verifyServiceSecret(
+            client?.enabled ? client : dummyServiceClient!,
+            credentials?.secret ?? "",
+          );
+        } catch {
+          validSecret = false;
         }
+        const validIdentity = Boolean(client?.enabled && credentials && validSecret);
         if (!validIdentity || !client) {
           attempt.count += 1;
           failedServiceAuth.set(key, attempt);

@@ -68,7 +68,11 @@ export function registerKnowledgeTools(
     {
       title: "Read note",
       description: "Read one Markdown note.",
-      inputSchema: { vault: vaultId, path: notePath },
+      inputSchema: {
+        vault: vaultId,
+        path: notePath,
+        changeSeq: z.number().int().positive().optional(),
+      },
     },
     wrap(async (input) => json(await view.readNote(input))),
   );

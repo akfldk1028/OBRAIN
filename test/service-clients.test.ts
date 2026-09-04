@@ -1,4 +1,4 @@
-import { writeFile } from "node:fs/promises";
+import { chmod, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
@@ -70,5 +70,17 @@ describe("service client configuration", () => {
 
     await expect(loadServiceClients(file, ["brain"], ["owner"]))
       .rejects.toThrow();
+  });
+
+  it("accepts a systemd credential file protected as mode 0400", async () => {
+    if (process.platform === "win32") return;
+    const fx = await makeTempVaultSet(["brain"]);
+    cleanups.push(fx.cleanup);
+    const file = path.join(fx.root, "service-clients.json");
+    await writeFile(file, JSON.stringify({ clients: [] }), { mode: 0o400 });
+    await chmod(file, 0o400);
+
+    await expect(loadServiceClients(file, ["brain"], ["owner"]))
+      .resolves.toEqual([]);
   });
 });

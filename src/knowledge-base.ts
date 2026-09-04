@@ -45,12 +45,15 @@ export class KnowledgeBase {
     return { vault: input.vault, notes, nextCursor };
   }
 
-  async readNote(input: { vault: string; path: string }): Promise<{
+  async readNote(input: { vault: string; path: string; changeSeq?: number }): Promise<{
     vault: string;
     path: string;
     content: string;
   }> {
-    const content = await this.registry.get(input.vault).readNote(input.path);
+    const vault = this.registry.get(input.vault);
+    const content = input.changeSeq === undefined
+      ? await vault.readNote(input.path)
+      : this.index.readChangeContent({ seq: input.changeSeq, vault: input.vault, path: input.path });
     if (Buffer.byteLength(content, "utf8") > 2 * 1024 * 1024) {
       throw new Error("Note exceeds read limit");
     }

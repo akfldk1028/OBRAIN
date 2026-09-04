@@ -234,7 +234,7 @@ service's protected environment.
 }
 ```
 
-The server validates the file, its Vault and owner references, and mode `0600` or `0640` before it
+The server validates the file, its Vault and owner references, and protected mode `0400`, `0600`, or `0640` before it
 starts. See [`deploy/README.md`](deploy/README.md) for secret hashing, rotation, and FLOW settings.
 
 ### Multiple people, multiple vaults

@@ -41,6 +41,7 @@ export class KnowledgeView {
   readNote(input: {
     vault: string;
     path: string;
+    changeSeq?: number;
   }): ReturnType<KnowledgeBase["readNote"]> {
     this.assertAllowed(input.vault);
     return this.knowledge.readNote(input);

@@ -61,8 +61,8 @@ export async function loadServiceClients(
   const fileStat = await stat(file);
   if (process.platform !== "win32") {
     const permissions = fileStat.mode & 0o777;
-    if (permissions !== 0o600 && permissions !== 0o640) {
-      throw new Error("Service client file must have mode 0600 or 0640");
+    if (permissions !== 0o400 && permissions !== 0o600 && permissions !== 0o640) {
+      throw new Error("Service client file must have mode 0400, 0600, or 0640");
     }
   }
   const parsed = serviceClientsFileSchema.parse(JSON.parse(await readFile(file, "utf8")));
