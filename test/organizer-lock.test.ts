@@ -49,4 +49,19 @@ describe("organizer lock", () => {
     expect(lock).toBeDefined();
     await lock?.release();
   });
+
+  it("allows only one contender to take over the same stale lock", async () => {
+    const file = await lockPath();
+    await writeFile(file, JSON.stringify({ pid: 123, startedAt: "2020-01-01T00:00:00.000Z", owner: "other" }), "utf8");
+    let observed = 0; let releaseBarrier!: () => void;
+    const barrier = new Promise<void>((resolve) => { releaseBarrier = resolve; });
+    const contender = () => acquireOrganizerLock({
+      path: file, maxRunDurationMs: 1, isProcessAlive: () => false,
+      onStaleObserved: async () => { observed += 1; if (observed === 2) releaseBarrier(); await barrier; },
+    });
+    const locks = await Promise.all([contender(), contender()]);
+    expect(observed).toBe(2);
+    expect(locks.filter(Boolean)).toHaveLength(1);
+    await locks[0]?.release(); await locks[1]?.release();
+  });
 });

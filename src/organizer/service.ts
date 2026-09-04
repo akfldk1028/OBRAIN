@@ -1,11 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, open, readFile, readdir, stat } from "node:fs/promises";
+import { constants } from "node:fs";
+import { lstat, mkdir, open, readFile, readdir, realpath } from "node:fs/promises";
 import path from "node:path";
 import { AuditLogger } from "../audit.js";
 import { BRAIN_FOUNDATION_POLICY, areaMocPath } from "../foundation/policy.js";
 import { VaultRegistry } from "../vault-registry.js";
 import { auditVaultIntegrity } from "./integrity.js";
-import { acquireOrganizerLock } from "./lock.js";
+import { acquireOrganizerLock, type OrganizerLock } from "./lock.js";
 import { replaceManagedMocIndex } from "./managed-moc.js";
 import { assertApprovedDestination, assertInboxSource, buildDestinationPath } from "./paths.js";
 import type { OrganizerProvider } from "./provider.js";
@@ -22,7 +23,7 @@ export interface OrganizerServiceOptions {
   registry: VaultRegistry;
   config: OrganizerConfig;
   store: OrganizerStore;
-  provider?: OrganizerProvider | (() => OrganizerProvider);
+  provider?: OrganizerProvider | ((options: { maxContextBytes: number }) => OrganizerProvider);
   transaction: OrganizerTransactionEngine;
   auditLogger?: AuditLogger;
   now?: () => string;
@@ -34,6 +35,8 @@ function sha(content: string): string { return createHash("sha256").update(conte
 function compare(left: string, right: string): number { return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8")); }
 function expiry(now: string, hours: number): string { return new Date(Date.parse(now) + hours * 3_600_000).toISOString(); }
 function safeReason(error: unknown): string { return error instanceof Error && /^[a-z_]{3,64}$/u.test(error.message) ? error.message : "processing_failed"; }
+function outside(root: string, candidate: string): boolean { const relative = path.relative(root, candidate); return relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative); }
+type ReportPath = { path: string; reasonCode: string };
 
 export class OrganizerService implements OrganizerServiceApi {
   private readonly now: () => string;
@@ -107,8 +110,10 @@ export class OrganizerService implements OrganizerServiceApi {
   public async startRun(input: { vault: string; requestedMode?: OrganizerMode }): Promise<RunSummary> {
     this.authorize(input.vault); const active = this.active.get(input.vault);
     if (active) return { ...active.summary, status: "already_running" };
+    const lock = await acquireOrganizerLock({ path: this.options.lockPath, maxRunDurationMs: this.options.maxRunDurationMs ?? 3_600_000 });
+    if (!lock) return { runId: "", mode: this.runMode(input.requestedMode), discovered: 0, proposed: 0, applied: 0, review: 0, skipped: 0, failed: 0, status: "already_running" };
     const mode = this.runMode(input.requestedMode); const summary = this.options.store.startRun({ vault: input.vault, mode, startedAt: this.now() });
-    const promise = this.executeRun(input.vault, summary).catch((error: unknown) => {
+    const promise = this.executeRun(input.vault, summary, lock).catch((error: unknown) => {
       const failed = { ...summary, failed: summary.failed + 1, status: "failed" as const };
       return this.options.store.finishRun(summary.runId, failed, this.now());
     });
@@ -127,10 +132,9 @@ export class OrganizerService implements OrganizerServiceApi {
     try { return (await readdir(directory)).filter((name) => name.endsWith(".json")).sort(compare).map((name) => `${this.options.config.reportsDirectory}/${name}`); } catch { return []; }
   }
 
-  private async executeRun(vaultId: string, initial: RunSummary): Promise<RunSummary> {
-    const lock = await acquireOrganizerLock({ path: this.options.lockPath, maxRunDurationMs: this.options.maxRunDurationMs ?? 3_600_000 });
-    if (!lock) { const done = { ...initial, status: "complete" as const }; return this.options.store.finishRun(initial.runId, done, this.now()); }
+  private async executeRun(vaultId: string, initial: RunSummary, lock: OrganizerLock): Promise<RunSummary> {
     let summary = initial;
+    const paths: ReportPath[] = [];
     try {
       if (summary.mode !== "disabled") {
         const vault = this.authorize(vaultId);
@@ -140,18 +144,18 @@ export class OrganizerService implements OrganizerServiceApi {
           try {
             const proposal = await this.proposeCandidate(vaultId, vault.rootPath, candidate);
             summary = { ...summary, proposed: summary.proposed + 1 };
-            if (summary.mode === "automatic") {
-              if (proposal.confidence >= this.options.config.autoApplyConfidence) { await this.apply({ vault: vaultId, proposalId: proposal.id }); summary = { ...summary, applied: summary.applied + 1 }; }
-              else if (proposal.confidence >= 0.7) summary = { ...summary, review: summary.review + 1 };
-              else summary = { ...summary, skipped: summary.skipped + 1 };
-            }
+            if (proposal.confidence >= this.options.config.autoApplyConfidence) {
+              if (summary.mode === "automatic") { await this.apply({ vault: vaultId, proposalId: proposal.id }); summary = { ...summary, applied: summary.applied + 1 }; paths.push({ path: candidate.path, reasonCode: "applied" }); }
+              else paths.push({ path: candidate.path, reasonCode: "proposed" });
+            } else if (proposal.confidence >= 0.7) { summary = { ...summary, review: summary.review + 1 }; paths.push({ path: candidate.path, reasonCode: "review" }); }
+            else { summary = { ...summary, skipped: summary.skipped + 1 }; paths.push({ path: candidate.path, reasonCode: "skipped_low_confidence" }); }
           } catch (error) {
-            if (error instanceof Error && error.message === "sensitive_source") summary = { ...summary, skipped: summary.skipped + 1 };
-            else summary = { ...summary, failed: summary.failed + 1 };
+            if (error instanceof Error && error.message === "sensitive_source") { summary = { ...summary, skipped: summary.skipped + 1 }; paths.push({ path: candidate.path, reasonCode: "sensitive_source" }); }
+            else { summary = { ...summary, failed: summary.failed + 1 }; paths.push({ path: candidate.path, reasonCode: safeReason(error) }); }
           }
         }
       }
-      const complete = { ...summary, status: "complete" as const }; await this.writeReport(vaultId, complete); await this.record("organizer_run", "allowed", vaultId, undefined, "complete"); return this.options.store.finishRun(initial.runId, complete, this.now());
+      const complete = { ...summary, status: "complete" as const }; await this.writeReport(vaultId, complete, paths); await this.record("organizer_run", "allowed", vaultId, undefined, "complete"); return this.options.store.finishRun(initial.runId, complete, this.now());
     } finally { await lock.release(); }
   }
 
@@ -162,7 +166,7 @@ export class OrganizerService implements OrganizerServiceApi {
     const provider = this.provider();
     const existing = new Set((await this.authorize(vaultId).listNotes()).map((item) => item.replaceAll("\\", "/")));
     const directories = await this.existingApprovedDirectories(root);
-    const candidateNotes = [...existing].filter((item) => item !== candidate.path).sort(compare);
+    const candidateNotes = [...existing].filter((item) => item !== candidate.path).sort(compare).slice(0, 512);
     const context = this.context(source, candidate.path, candidateNotes, [...directories].sort(compare));
     const draft = await provider.propose(context);
     const targetDirectory = assertApprovedDestination(draft.targetDirectory, directories);
@@ -176,33 +180,43 @@ export class OrganizerService implements OrganizerServiceApi {
     const max = this.options.config.maxContextBytes; let content = source; const candidates: string[] = [];
     const base = () => ({ policyVersion: BRAIN_FOUNDATION_POLICY.version, approvedDirectories: directories, candidateNotes: candidates, note: { path: sourcePath, content } });
     while (Buffer.byteLength(JSON.stringify(base()), "utf8") > max && content.length) content = content.slice(0, -1);
-    for (const note of notes) { candidates.push(note); if (Buffer.byteLength(JSON.stringify(base()), "utf8") > max) candidates.pop(); }
+    for (const note of notes.slice(0, 512)) { candidates.push(note); if (Buffer.byteLength(JSON.stringify(base()), "utf8") > max) candidates.pop(); }
     if (Buffer.byteLength(JSON.stringify(base()), "utf8") > max) throw new Error("context_limit");
     return base();
   }
 
   private async existingApprovedDirectories(root: string): Promise<Set<string>> {
+    const boundRoot = await realpath(root); const rootStat = await lstat(root); if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) throw new Error("vault_root_unsafe");
     const found = new Set<string>();
     const walk = async (absolute: string, relative: string, depth: number): Promise<void> => {
       if (depth > BRAIN_FOUNDATION_POLICY.maxDepth) return;
       const entries = await readdir(absolute, { withFileTypes: true });
-      for (const entry of entries) if (entry.isDirectory() && !entry.isSymbolicLink() && !entry.name.startsWith(".")) {
+      for (const entry of entries) if (!entry.name.startsWith(".")) {
         const next = relative ? `${relative}/${entry.name}` : entry.name;
-        if (BRAIN_FOUNDATION_POLICY.areas.some((area) => next === area.directory) || relative) found.add(next);
-        await walk(path.join(absolute, entry.name), next, depth + 1);
+        const candidate = path.join(absolute, entry.name); const before = await lstat(candidate);
+        if (before.isSymbolicLink()) throw new Error("approved_directory_unsafe");
+        if (!before.isDirectory()) continue;
+        const canonical = await realpath(candidate); const after = await lstat(candidate);
+        if (after.isSymbolicLink() || !after.isDirectory() || outside(boundRoot, canonical)) throw new Error("approved_directory_unsafe");
+        found.add(next); await walk(canonical, next, depth + 1);
       }
     };
     for (const area of BRAIN_FOUNDATION_POLICY.areas) {
-      const absolute = path.join(root, area.directory); try { if ((await stat(absolute)).isDirectory()) { found.add(area.directory); await walk(absolute, area.directory, 1); } } catch { /* absent approved areas are not targets */ }
+      const absolute = path.join(boundRoot, area.directory); let value;
+      try { value = await lstat(absolute); } catch (error: unknown) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
+      if (value.isSymbolicLink() || !value.isDirectory()) throw new Error("approved_directory_unsafe");
+      const canonical = await realpath(absolute); if (outside(boundRoot, canonical)) throw new Error("approved_directory_unsafe");
+      found.add(area.directory); await walk(canonical, area.directory, 1);
     }
-    return found;
+    return new Set([...found].sort(compare).slice(0, 256));
   }
 
   private mocLinks(content: string): Map<string, string> { const result = new Map<string, string>(); for (const match of content.matchAll(/^- \[\[([^|\]]+)\|([^\]]+)\]\]$/gmu)) result.set(match[1]!, match[2]!); return result; }
   private providerDisabled(): boolean { return this.options.config.mode === "disabled" || !this.options.provider; }
-  private provider(): OrganizerProvider { if (this.providerDisabled()) throw new Error("organizer_unavailable"); if (!this.providerInstance) this.providerInstance = typeof this.options.provider === "function" ? this.options.provider() : this.options.provider!; return this.providerInstance; }
+  private provider(): OrganizerProvider { if (this.providerDisabled()) throw new Error("organizer_unavailable"); if (!this.providerInstance) this.providerInstance = typeof this.options.provider === "function" ? this.options.provider({ maxContextBytes: this.options.config.maxContextBytes }) : this.options.provider!; return this.providerInstance; }
   private runMode(requested: OrganizerMode | undefined): OrganizerMode { if (this.providerDisabled()) return "disabled"; const trial = this.options.store.getOrStartTrial(this.now()); if (trial.active) return "dry-run"; if (this.options.config.mode === "dry-run" || requested === "dry-run") return "dry-run"; return "automatic"; }
   private authorize(vault: string) { if (!this.options.config.enabledVaults.includes(vault)) throw new Error("vault_not_enabled"); return this.options.registry.get(vault); }
-  private async writeReport(vault: string, summary: RunSummary): Promise<void> { const fs = this.authorize(vault); const directory = path.join(fs.rootPath, ...this.options.config.reportsDirectory.split("/")); await mkdir(directory, { recursive: true, mode: 0o700 }); const file = path.join(directory, `${summary.runId}.json`); const handle = await open(file, "wx", 0o600); try { await handle.writeFile(JSON.stringify({ runId: summary.runId, mode: summary.mode, paths: [], counts: { discovered: summary.discovered, proposed: summary.proposed, applied: summary.applied, review: summary.review, skipped: summary.skipped, failed: summary.failed }, reasonCodes: summary.failed ? ["processing_failed"] : [] }), "utf8"); } finally { await handle.close(); } }
+  private async writeReport(vault: string, summary: RunSummary, paths: ReportPath[]): Promise<void> { const fs = this.authorize(vault); const directory = await this.reportDirectory(fs.rootPath); const file = path.join(directory, `${summary.runId}.json`); const directoryStat = await lstat(directory); if (directoryStat.isSymbolicLink() || !directoryStat.isDirectory()) throw new Error("report_directory_unsafe"); const flags = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0); const handle = await open(file, flags, 0o600); try { const ordered = [...paths].sort((left, right) => compare(left.path, right.path) || compare(left.reasonCode, right.reasonCode)); await handle.writeFile(JSON.stringify({ runId: summary.runId, mode: summary.mode, paths: ordered, counts: { discovered: summary.discovered, proposed: summary.proposed, applied: summary.applied, review: summary.review, skipped: summary.skipped, failed: summary.failed }, reasonCodes: [...new Set(ordered.map((item) => item.reasonCode))].sort(compare) }), "utf8"); } finally { await handle.close(); } }
+  private async reportDirectory(root: string): Promise<string> { const boundRoot = await realpath(root); let current = boundRoot; for (const segment of this.options.config.reportsDirectory.split("/")) { const next = path.join(current, segment); try { await mkdir(next, { mode: 0o700 }); } catch (error: unknown) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; } const before = await lstat(next); if (before.isSymbolicLink() || !before.isDirectory()) throw new Error("report_directory_unsafe"); const canonical = await realpath(next); const after = await lstat(next); if (after.isSymbolicLink() || !after.isDirectory() || outside(boundRoot, canonical)) throw new Error("report_directory_unsafe"); current = canonical; } return current; }
   private async record(action: "organizer_propose" | "organizer_apply" | "organizer_undo" | "organizer_run" | "organizer_audit", outcome: "allowed" | "denied", vault: string, path?: string, reason?: string): Promise<void> { await this.options.auditLogger?.record({ action, outcome, vault, path, reason }); }
 }

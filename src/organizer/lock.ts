@@ -17,6 +17,8 @@ export interface AcquireOrganizerLockOptions {
   maxRunDurationMs: number;
   now?: () => Date;
   isProcessAlive?: (pid: number) => boolean;
+  /** Test/diagnostic hook invoked after a stale lock is observed and before takeover arbitration. */
+  onStaleObserved?: () => void | Promise<void>;
 }
 
 function processAlive(pid: number): boolean {
@@ -51,7 +53,8 @@ export async function acquireOrganizerLock(options: AcquireOrganizerLockOptions)
   const record: LockRecord = { pid: process.pid, startedAt: now().toISOString(), owner: randomUUID() };
   const content = JSON.stringify(record);
 
-  for (let attempt = 0; attempt < 2; attempt += 1) {
+  const takeoverPath = `${options.path}.takeover`;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
       await mkdir(path.dirname(options.path), { recursive: true, mode: 0o700 });
       const handle = await open(options.path, "wx", 0o600);
@@ -74,15 +77,32 @@ export async function acquireOrganizerLock(options: AcquireOrganizerLockOptions)
       };
     } catch (error: unknown) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      let existing: LockRecord | undefined;
-      try { existing = parseLock(await readFile(options.path, "utf8")); } catch (readError: unknown) {
+      let existing: LockRecord | undefined; let existingText: string;
+      try { existingText = await readFile(options.path, "utf8"); existing = parseLock(existingText); } catch (readError: unknown) {
         if ((readError as NodeJS.ErrnoException).code === "ENOENT") continue;
         return undefined;
       }
       const age = existing ? now().getTime() - Date.parse(existing.startedAt) : Number.NEGATIVE_INFINITY;
       if (!existing || alive(existing.pid) || age <= options.maxRunDurationMs) return undefined;
-      try { await unlink(options.path); } catch (unlinkError: unknown) {
-        if ((unlinkError as NodeJS.ErrnoException).code !== "ENOENT") return undefined;
+      await options.onStaleObserved?.();
+      let takeover: Awaited<ReturnType<typeof open>>;
+      try { takeover = await open(takeoverPath, "wx", 0o600); } catch (takeoverError: unknown) {
+        if ((takeoverError as NodeJS.ErrnoException).code === "EEXIST") return undefined;
+        throw takeoverError;
+      }
+      try {
+        const current = await readFile(options.path, "utf8").catch((readError: unknown) => (
+          (readError as NodeJS.ErrnoException).code === "ENOENT" ? undefined : Promise.reject(readError)
+        ));
+        const currentRecord = current === undefined ? undefined : parseLock(current);
+        const currentAge = currentRecord ? now().getTime() - Date.parse(currentRecord.startedAt) : Number.NEGATIVE_INFINITY;
+        if (!currentRecord || current !== existingText || alive(currentRecord.pid) || currentAge <= options.maxRunDurationMs) return undefined;
+        await unlink(options.path);
+      } finally {
+        await takeover.close();
+        await unlink(takeoverPath).catch((unlinkError: unknown) => {
+          if ((unlinkError as NodeJS.ErrnoException).code !== "ENOENT") throw unlinkError;
+        });
       }
     }
   }

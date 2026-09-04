@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, unlink, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -15,6 +15,14 @@ const stores: OrganizerStore[] = [];
 const now = "2026-09-04T12:00:00.000Z";
 const markers = "<!-- brain-auto:start note-index -->\n<!-- brain-auto:end note-index -->\n";
 
+async function waitFor(check: () => boolean | Promise<boolean>): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (await check()) return;
+    await new Promise((done) => setTimeout(done, 10));
+  }
+  throw new Error("timed out waiting for organizer run");
+}
+
 class FakeProvider implements OrganizerProvider {
   calls: OrganizerContext[] = [];
   draft: ProposalDraft = {
@@ -29,7 +37,7 @@ class FakeProvider implements OrganizerProvider {
   }
 }
 
-async function fixture(content = "# Inbox\n\nordinary note"): Promise<{ root: string; source: string; service: (provider?: OrganizerProvider | (() => OrganizerProvider), config?: Partial<OrganizerConfig>, timestamp?: string) => OrganizerService }> {
+async function fixture(content = "# Inbox\n\nordinary note"): Promise<{ root: string; source: string; service: (provider?: OrganizerProvider | ((options: { maxContextBytes: number }) => OrganizerProvider), config?: Partial<OrganizerConfig>, timestamp?: string) => OrganizerService }> {
   const root = await mkdtemp(path.join(os.tmpdir(), "brain-organizer-service-"));
   roots.push(root);
   const source = path.join(root, "Agent-Inbox", "note.md");
@@ -98,6 +106,13 @@ describe("OrganizerService", () => {
     expect(summary.proposed).toBe(1);
   });
 
+  it.each([[0.7, "review"], [0.699, "skipped"]] as const)("counts confidence %s during a trial-clamped dry-run", async (confidence, field) => {
+    const fx = await fixture(); const provider = new FakeProvider(); provider.draft.confidence = confidence;
+    const summary = await fx.service(provider).runToCompletion({ vault: "brain", requestedMode: "automatic" });
+    expect(summary).toMatchObject({ mode: "dry-run", [field]: 1 });
+    await expect(readFile(fx.source, "utf8")).resolves.toContain("Inbox");
+  });
+
   it("applies confidence of 0.90 and above after the trial", async () => {
     const fx = await fixture(); const provider = new FakeProvider(); provider.draft.confidence = 0.9;
     await fx.service(provider, {}, "2026-08-20T00:00:00.000Z").runToCompletion({ vault: "brain", requestedMode: "dry-run" });
@@ -128,6 +143,24 @@ describe("OrganizerService", () => {
     expect(Buffer.byteLength(JSON.stringify(provider.calls[0]), "utf8")).toBeLessThanOrEqual(512);
   });
 
+  it("passes configured context bytes into a lazy provider factory", async () => {
+    const fx = await fixture(); const provider = new FakeProvider(); let received: number | undefined;
+    await fx.service((options) => { received = options.maxContextBytes; return provider; }, { maxContextBytes: 512 })
+      .runToCompletion({ vault: "brain", requestedMode: "dry-run" });
+    expect(received).toBe(512);
+    expect(Buffer.byteLength(JSON.stringify(provider.calls[0]), "utf8")).toBeLessThanOrEqual(512);
+  });
+
+  it("bounds provider context paths and directories to the provider schema limits", async () => {
+    const fx = await fixture(); const old = new Date(Date.parse(now) - 600_000);
+    for (let index = 0; index < 520; index += 1) await writeFile(path.join(fx.root, "20_Study", "22_RL", `reference-${index}.md`), "reference", "utf8");
+    for (let index = 0; index < 270; index += 1) await mkdir(path.join(fx.root, "20_Study", `topic-${index}`), { recursive: true });
+    const provider = new FakeProvider();
+    await fx.service(provider, { maxContextBytes: 262_144 }).runToCompletion({ vault: "brain", requestedMode: "dry-run" });
+    expect(provider.calls[0]?.candidateNotes.length).toBeLessThanOrEqual(512);
+    expect(provider.calls[0]?.approvedDirectories.length).toBeLessThanOrEqual(256);
+  });
+
   it("continues after a failed note", async () => {
     const fx = await fixture(); await writeFile(path.join(fx.root, "Agent-Inbox", "two.md"), "two", "utf8");
     await utimes(path.join(fx.root, "Agent-Inbox", "two.md"), new Date(Date.parse(now) - 600_000), new Date(Date.parse(now) - 600_000));
@@ -153,7 +186,48 @@ describe("OrganizerService", () => {
     await new Promise((done) => setTimeout(done, 25));
     expect(first.status).toBe("running");
     expect(second.status).toBe("already_running");
-    expect(provider.calls).toHaveLength(1);
     resolve();
+    await waitFor(() => provider.calls.length === 1);
+    await waitFor(async () => (await readFile(path.join(fx.root, "60_Tools", "61_Obsidian_MCP", "90_Auto_Organizer_Reports", `${first.runId}.json`), "utf8").catch(() => undefined)) !== undefined);
+  });
+
+  it("reports already_running for a second service blocked by the filesystem lock", async () => {
+    const fx = await fixture(); const provider = new FakeProvider(); let resolve!: () => void; provider.wait = new Promise<void>((done) => { resolve = done; });
+    const firstService = fx.service(provider); const secondService = fx.service(new FakeProvider());
+    const first = await firstService.startRun({ vault: "brain", requestedMode: "dry-run" });
+    await new Promise((done) => setTimeout(done, 25));
+    const second = await secondService.startRun({ vault: "brain", requestedMode: "dry-run" });
+    expect(first.status).toBe("running");
+    expect(second.status).toBe("already_running");
+    resolve();
+    await waitFor(() => provider.calls.length === 1);
+    await waitFor(async () => (await readFile(path.join(fx.root, "60_Tools", "61_Obsidian_MCP", "90_Auto_Organizer_Reports", `${first.runId}.json`), "utf8").catch(() => undefined)) !== undefined);
+  });
+
+  it("writes per-note report paths and stable codes without provider error text", async () => {
+    const fx = await fixture(); const provider = new FakeProvider(); provider.draft.confidence = 0.7;
+    const summary = await fx.service(provider).runToCompletion({ vault: "brain", requestedMode: "automatic" });
+    const report = JSON.parse(await readFile(path.join(fx.root, "60_Tools", "61_Obsidian_MCP", "90_Auto_Organizer_Reports", `${summary.runId}.json`), "utf8"));
+    expect(report.paths).toEqual([{ path: "Agent-Inbox/note.md", reasonCode: "review" }]);
+    expect(report.reasonCodes).toEqual(["review"]);
+    expect(JSON.stringify(report)).not.toContain("Sequential decisions");
+  });
+
+  it("refuses an approved-directory symlink that escapes the vault", async () => {
+    const fx = await fixture(); const outside = await mkdtemp(path.join(os.tmpdir(), "brain-organizer-outside-")); roots.push(outside);
+    await mkdir(path.join(outside, "escaped"));
+    await rm(path.join(fx.root, "20_Study"), { recursive: true, force: true });
+    try { await symlink(outside, path.join(fx.root, "20_Study"), "junction"); } catch { return; }
+    const provider = new FakeProvider(); provider.draft.targetDirectory = "20_Study/escaped";
+    await expect(fx.service(provider).propose({ vault: "brain", path: "Agent-Inbox/note.md" })).rejects.toThrow();
+  });
+
+  it("does not publish reports through a symlinked report parent", async () => {
+    const fx = await fixture(); const outside = await mkdtemp(path.join(os.tmpdir(), "brain-organizer-report-outside-")); roots.push(outside);
+    await rm(path.join(fx.root, "60_Tools"), { recursive: true, force: true });
+    try { await symlink(outside, path.join(fx.root, "60_Tools"), "junction"); } catch { return; }
+    const summary = await fx.service(undefined, { mode: "disabled" }).runToCompletion({ vault: "brain" });
+    expect(summary.status).toBe("failed");
+    expect(await readFile(path.join(outside, "61_Obsidian_MCP", "90_Auto_Organizer_Reports", `${summary.runId}.json`), "utf8").catch(() => undefined)).toBeUndefined();
   });
 });
