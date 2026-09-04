@@ -89,7 +89,7 @@ id brain >/dev/null 2>&1 || useradd --system --home-dir /srv/brain --create-home
 install -d -o root -g root -m 0755 /opt/brain-mcp
 cp -a "$RELEASE_DIR/." /opt/brain-mcp/
 cd /opt/brain-mcp
-npm ci --omit=dev
+npm ci --omit=dev --no-audit --no-fund
 chown -R root:brain /opt/brain-mcp
 chmod -R u=rwX,g=rX,o= /opt/brain-mcp
 
