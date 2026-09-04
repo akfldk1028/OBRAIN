@@ -16,6 +16,7 @@ import {
   InvalidGrantError,
   InvalidTokenError,
 } from "@modelcontextprotocol/sdk/server/auth/errors.js";
+import type { ServiceClient } from "./service-clients.js";
 
 const ACCESS_TTL_SECONDS = 60 * 60; // 1 hour
 const REFRESH_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
@@ -57,6 +58,8 @@ export interface OAuthProviderConfig {
   jwtSecret: string;
   /** File where dynamically-registered OAuth clients are persisted. */
   clientsFile: string;
+  /** Hashed machine identities permitted to use the read-only service flow. */
+  serviceClients?: ServiceClient[];
 }
 
 /**
@@ -81,6 +84,7 @@ export class VaultOAuthProvider implements OAuthServerProvider {
   private readonly userHashes: { id: string; hash: Buffer }[];
   private readonly userIds: Set<string>;
   private readonly clients = new Map<string, OAuthClientInformationFull>();
+  private readonly serviceClients = new Map<string, ServiceClient>();
   private readonly pendingLogins = new Map<string, PendingLogin>();
   private readonly authCodes = new Map<string, AuthCode>();
 
@@ -104,6 +108,15 @@ export class VaultOAuthProvider implements OAuthServerProvider {
       seenPass.add(u.passphrase);
     }
     this.userHashes = cfg.users.map((u) => ({ id: u.id, hash: sha256(u.passphrase) }));
+    for (const client of cfg.serviceClients ?? []) {
+      if (this.serviceClients.has(client.clientId)) {
+        throw new Error(`Duplicate service client id: ${client.clientId}`);
+      }
+      if (!this.userIds.has(client.ownerId)) {
+        throw new Error(`Unknown service client owner: ${client.ownerId}`);
+      }
+      this.serviceClients.set(client.clientId, client);
+    }
 
     this.loadClients();
 
@@ -242,6 +255,41 @@ ${err}
     return this.issueTokens(client.client_id, userId, finalScopes);
   }
 
+  async issueServiceAccessToken(input: {
+    client: ServiceClient;
+    requestedScopes: string[];
+  }): Promise<OAuthTokens> {
+    const configured = this.serviceClients.get(input.client.clientId);
+    if (!configured || configured !== input.client || !configured.enabled) {
+      throw new InvalidGrantError("Service client is not enabled");
+    }
+    const scopes = input.requestedScopes.length ? [...new Set(input.requestedScopes)] : configured.scopes;
+    if (scopes.length !== 1 || scopes[0] !== "notes:read") {
+      throw new InvalidGrantError("Only notes:read is permitted");
+    }
+    const access = await new SignJWT({
+      typ: "service",
+      client_id: configured.clientId,
+      scopes,
+      owner_id: configured.ownerId,
+      allowed_vaults: configured.allowedVaults,
+    })
+      .setProtectedHeader({ alg: "HS256" })
+      .setSubject(`service:${configured.clientId}`)
+      .setIssuer(this.cfg.issuer)
+      .setAudience(this.cfg.resource)
+      .setIssuedAt()
+      .setExpirationTime(`${ACCESS_TTL_SECONDS}s`)
+      .sign(this.secretKey);
+
+    return {
+      access_token: access,
+      token_type: "Bearer",
+      expires_in: ACCESS_TTL_SECONDS,
+      scope: scopes.join(" "),
+    };
+  }
+
   // ---- resource-server verification (called by requireBearerAuth) -------
 
   async verifyAccessToken(token: string): Promise<AuthInfo> {
@@ -250,6 +298,34 @@ ${err}
         issuer: this.cfg.issuer,
         audience: this.cfg.resource,
       });
+      if (payload.typ === "service") {
+        const clientId = String(payload.client_id ?? "");
+        const client = this.serviceClients.get(clientId);
+        const scopes = Array.isArray(payload.scopes) ? (payload.scopes as string[]) : [];
+        if (!client?.enabled) throw new Error("disabled service client");
+        if (payload.sub !== `service:${clientId}`) throw new Error("invalid service subject");
+        if (scopes.length !== 1 || scopes[0] !== "notes:read") {
+          throw new Error("invalid service scopes");
+        }
+        return {
+          token,
+          clientId,
+          scopes,
+          expiresAt: typeof payload.exp === "number" ? payload.exp : undefined,
+          resource: new URL(this.cfg.resource),
+          extra: {
+            userId: client.ownerId,
+            principalId: `service:${client.clientId}`,
+            allowedVaults: [...client.allowedVaults],
+            policy: {
+              allowedVaults: [...client.allowedVaults],
+              inboxWrite: false,
+              changeFeed: true,
+              organizer: false,
+            },
+          },
+        };
+      }
       if (payload.typ === "refresh") throw new Error("refresh token used as access token");
       const userId = String(payload.sub ?? "");
       if (!this.userIds.has(userId)) throw new Error("unknown user");

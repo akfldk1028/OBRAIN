@@ -87,3 +87,46 @@ it("exposes organizer tools over HTTP only when configured", async () => {
     else process.env.MCP_NO_AUTH = previousNoAuth;
   }
 });
+
+it("advertises client credentials while retaining human OAuth grants", async () => {
+  const previousNoAuth = process.env.MCP_NO_AUTH;
+  const previousJwtSecret = process.env.MCP_JWT_SECRET;
+  delete process.env.MCP_NO_AUTH;
+  process.env.MCP_JWT_SECRET = "test-jwt-secret-at-least-thirty-two-characters";
+  const fx = await createKnowledgeFixture(["brain"]);
+  const port = await freePort();
+  const runtime = await startHttp(
+    [{ id: "owner", passphrase: "a-long-test-passphrase", knowledge: fx.knowledge }],
+    { host: "127.0.0.1", port },
+  );
+  try {
+    const response = await fetch(
+      `http://127.0.0.1:${port}/.well-known/oauth-authorization-server`,
+    );
+    const metadata = await response.json() as {
+      grant_types_supported: string[];
+      token_endpoint_auth_methods_supported: string[];
+      scopes_supported: string[];
+    };
+
+    expect(response.status).toBe(200);
+    expect(metadata.grant_types_supported).toEqual([
+      "authorization_code",
+      "refresh_token",
+      "client_credentials",
+    ]);
+    expect(metadata.token_endpoint_auth_methods_supported).toEqual([
+      "client_secret_post",
+      "none",
+      "client_secret_basic",
+    ]);
+    expect(metadata.scopes_supported).toEqual(["notes:read"]);
+  } finally {
+    await runtime.close();
+    await fx.cleanup();
+    if (previousNoAuth === undefined) delete process.env.MCP_NO_AUTH;
+    else process.env.MCP_NO_AUTH = previousNoAuth;
+    if (previousJwtSecret === undefined) delete process.env.MCP_JWT_SECRET;
+    else process.env.MCP_JWT_SECRET = previousJwtSecret;
+  }
+});

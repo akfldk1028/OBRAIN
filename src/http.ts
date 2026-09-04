@@ -6,6 +6,7 @@ import cors from "cors";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import {
+  createOAuthMetadata,
   mcpAuthRouter,
   getOAuthProtectedResourceMetadataUrl,
 } from "@modelcontextprotocol/sdk/server/auth/router.js";
@@ -13,6 +14,12 @@ import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middlew
 import type { KnowledgeBase } from "./knowledge-base.js";
 import { createKnowledgeMcpServer } from "./server-factory.js";
 import { LoginError, VaultOAuthProvider } from "./oauth-provider.js";
+import type { KnowledgeAccessPolicy } from "./knowledge-view.js";
+import {
+  loadServiceClients,
+  type ServiceClient,
+  verifyServiceSecret,
+} from "./service-clients.js";
 
 /** One HTTP owner whose knowledge base can contain multiple vaults. */
 export interface HttpUser {
@@ -24,6 +31,7 @@ export interface HttpUser {
 export interface HttpOptions {
   port: number;
   host: string;
+  serviceClients?: ServiceClient[];
 }
 
 export interface HttpRuntime {
@@ -36,6 +44,23 @@ const jsonRpcError = (code: number, message: string) => ({
   error: { code, message },
   id: null,
 });
+
+function parseBasicCredentials(
+  header: string | undefined,
+): { clientId: string; secret: string } | undefined {
+  if (!header?.toLowerCase().startsWith("basic ")) return undefined;
+  try {
+    const decoded = Buffer.from(header.slice(6).trim(), "base64").toString("utf8");
+    const separator = decoded.indexOf(":");
+    if (separator < 1) return undefined;
+    return {
+      clientId: decoded.slice(0, separator),
+      secret: decoded.slice(separator + 1),
+    };
+  } catch {
+    return undefined;
+  }
+}
 
 /**
  * Serve one or more vaults over Streamable HTTP (for Claude's remote connectors,
@@ -60,6 +85,20 @@ export async function startHttp(users: HttpUser[], opts: HttpOptions): Promise<H
 
   const knowledgeByUser = new Map(users.map((user) => [user.id, user.knowledge]));
   const defaultKnowledge = users[0].knowledge;
+  const ownerIds = users.map((user) => user.id);
+  const knownVaults = [...new Set(users.flatMap((user) => user.knowledge.listVaults().vaults))];
+  const serviceClients = opts.serviceClients ?? (
+    process.env.MCP_SERVICE_CLIENTS_FILE
+      ? await loadServiceClients(process.env.MCP_SERVICE_CLIENTS_FILE, knownVaults, ownerIds)
+      : []
+  );
+  for (const client of serviceClients) {
+    const knowledge = knowledgeByUser.get(client.ownerId);
+    const ownerVaults = new Set(knowledge?.listVaults().vaults ?? []);
+    if (!knowledge || client.allowedVaults.some((vault) => !ownerVaults.has(vault))) {
+      throw new Error(`Service client ${client.clientId} has an invalid owner or Vault assignment`);
+    }
+  }
 
   const app = express();
   app.disable("x-powered-by");
@@ -78,6 +117,7 @@ export async function startHttp(users: HttpUser[], opts: HttpOptions): Promise<H
 
   let bearer: RequestHandler | undefined;
   const failedLogins = new Map<string, { count: number; resetAt: number }>();
+  const failedServiceAuth = new Map<string, { count: number; resetAt: number }>();
   const loginWindowMs = 15 * 60 * 1000;
 
   if (authEnabled) {
@@ -95,14 +135,85 @@ export async function startHttp(users: HttpUser[], opts: HttpOptions): Promise<H
       clientsFile:
         process.env.MCP_CLIENTS_FILE ??
         path.join(path.dirname(new URL(import.meta.url).pathname), "oauth-clients.json"),
+      serviceClients,
     });
 
+    const authRouterOptions = {
+      provider,
+      issuerUrl: new URL(publicUrl),
+      resourceServerUrl: new URL(resourceUrl),
+      scopesSupported: ["notes:read"],
+    };
+    const metadata = createOAuthMetadata(authRouterOptions);
+    app.get("/.well-known/oauth-authorization-server", (_req, res) => {
+      res.json({
+        ...metadata,
+        grant_types_supported: ["authorization_code", "refresh_token", "client_credentials"],
+        token_endpoint_auth_methods_supported: [
+          "client_secret_post",
+          "none",
+          "client_secret_basic",
+        ],
+        scopes_supported: ["notes:read"],
+      });
+    });
+    app.post(
+      "/token",
+      express.urlencoded({ extended: false, limit: "16kb" }),
+      async (req, res, next) => {
+        if (req.body.grant_type !== "client_credentials") {
+          next();
+          return;
+        }
+        const key = req.ip ?? req.socket.remoteAddress ?? "unknown";
+        const now = Date.now();
+        const existing = failedServiceAuth.get(key);
+        const attempt = existing && existing.resetAt > now
+          ? existing
+          : { count: 0, resetAt: now + loginWindowMs };
+        if (attempt.count >= 10) {
+          res.status(429).json({ error: "temporarily_unavailable" });
+          return;
+        }
+        const credentials = parseBasicCredentials(req.get("authorization"));
+        const client = credentials
+          ? serviceClients.find((candidate) => candidate.clientId === credentials.clientId)
+          : undefined;
+        let validIdentity = false;
+        if (client?.enabled && credentials) {
+          try {
+            validIdentity = await verifyServiceSecret(client, credentials.secret);
+          } catch {
+            validIdentity = false;
+          }
+        }
+        if (!validIdentity || !client) {
+          attempt.count += 1;
+          failedServiceAuth.set(key, attempt);
+          res
+            .status(401)
+            .set("WWW-Authenticate", 'Basic realm="token"')
+            .json({ error: "invalid_client" });
+          return;
+        }
+        const requestedScopes = String(req.body.scope ?? "")
+          .split(/\s+/)
+          .filter(Boolean);
+        if (requestedScopes.some((scope) => scope !== "notes:read")) {
+          res.status(400).json({ error: "invalid_scope" });
+          return;
+        }
+        try {
+          const tokens = await provider.issueServiceAccessToken({ client, requestedScopes });
+          failedServiceAuth.delete(key);
+          res.set("Cache-Control", "no-store").set("Pragma", "no-cache").json(tokens);
+        } catch {
+          res.status(400).json({ error: "invalid_scope" });
+        }
+      },
+    );
     app.use(
-      mcpAuthRouter({
-        provider,
-        issuerUrl: new URL(publicUrl),
-        resourceServerUrl: new URL(resourceUrl),
-      }),
+      mcpAuthRouter(authRouterOptions),
     );
 
     app.get("/login", (req, res) => {
@@ -142,21 +253,27 @@ export async function startHttp(users: HttpUser[], opts: HttpOptions): Promise<H
 
   // ---- the MCP endpoint (session-managed Streamable HTTP) ----------------
   const transports: Record<string, StreamableHTTPServerTransport> = {};
-  const sessionUsers: Record<string, string> = {}; // sessionId -> userId
+  const sessionPrincipals: Record<string, string> = {}; // sessionId -> principalId
   const guard: RequestHandler[] = bearer ? [bearer] : [];
 
   // Identify the user for a request (from the verified token, or "default" without auth).
   const userIdOf = (req: express.Request): string =>
     authEnabled ? String((req.auth?.extra?.userId as string | undefined) ?? "") : "default";
+  const principalIdOf = (req: express.Request): string => authEnabled
+    ? String((req.auth?.extra?.principalId as string | undefined) ?? userIdOf(req))
+    : "default";
+  const policyOf = (req: express.Request): KnowledgeAccessPolicy | undefined =>
+    authEnabled ? req.auth?.extra?.policy as KnowledgeAccessPolicy | undefined : undefined;
 
   app.post("/mcp", ...guard, express.json({ limit: "1mb" }), async (req, res) => {
     const userId = userIdOf(req);
+    const principalId = principalIdOf(req);
     const sid = req.headers["mcp-session-id"] as string | undefined;
     let transport = sid ? transports[sid] : undefined;
 
     if (transport) {
       // Guard against a session id being reused with a different user's token.
-      if (sessionUsers[sid!] !== userId) {
+      if (sessionPrincipals[sid!] !== principalId) {
         res.status(403).json(jsonRpcError(-32000, "Session does not belong to this user"));
         return;
       }
@@ -178,16 +295,16 @@ export async function startHttp(users: HttpUser[], opts: HttpOptions): Promise<H
         sessionIdGenerator: () => randomUUID(),
         onsessioninitialized: (newSid: string) => {
           transports[newSid] = created;
-          sessionUsers[newSid] = userId;
+          sessionPrincipals[newSid] = principalId;
         },
       });
       created.onclose = () => {
         if (created.sessionId) {
           delete transports[created.sessionId];
-          delete sessionUsers[created.sessionId];
+          delete sessionPrincipals[created.sessionId];
         }
       };
-      const server = createKnowledgeMcpServer(knowledge);
+      const server = createKnowledgeMcpServer(knowledge, policyOf(req));
       await server.connect(created);
       transport = created;
     }
@@ -196,14 +313,14 @@ export async function startHttp(users: HttpUser[], opts: HttpOptions): Promise<H
   });
 
   const streamOrDelete: RequestHandler = async (req, res) => {
-    const userId = userIdOf(req);
+    const principalId = principalIdOf(req);
     const sid = req.headers["mcp-session-id"] as string | undefined;
     const transport = sid ? transports[sid] : undefined;
     if (!transport) {
       res.status(400).json(jsonRpcError(-32000, "Missing or unknown mcp-session-id"));
       return;
     }
-    if (sessionUsers[sid!] !== userId) {
+    if (sessionPrincipals[sid!] !== principalId) {
       res.status(403).json(jsonRpcError(-32000, "Session does not belong to this user"));
       return;
     }
