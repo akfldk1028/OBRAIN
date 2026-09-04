@@ -44,17 +44,18 @@ These are example values — change them to match your VPS and keep them consist
 | Variable | Value |
 |---|---|
 | Run user | `youruser` |
-| Vaults (per user) | alice → `/home/youruser/alice-vault`, bob → `/home/youruser/bob-vault` |
-| Users file | `/etc/obsidian-multivault-mcp-users.json` (per-user passphrase + vault) |
+| Vaults (one owner) | personal → `/home/youruser/personal-vault`, work → `/home/youruser/work-vault` |
+| Knowledge config | `/etc/obsidian-multivault-mcp.json` (root-owned, mode 600) |
+| Data dir | `/home/youruser/obsidian-multivault-mcp/data` |
 | Repo / app dir | `/home/youruser/obsidian-multivault-mcp` |
 | Public hostname | `203-0-113-10.sslip.io` (→ `203.0.113.10`) |
 | Local port | `8787` |
 | Node binary | resolved from asdf in step 1 |
 
-> **Multiple people share one endpoint.** Each person gets their **own passphrase** mapped to their
-> **own vault**; the passphrase entered at login decides which vault Claude sees. Passphrases must be
-> **distinct** per person. Confirm both vault paths exist before starting. (For a single user, list
-> just one entry.)
+> **One owner controls this endpoint and every configured Vault.** The current configuration schema
+> requires `owner.allowedVaults` to contain every ID in `vaults`. The owner's one strong passphrase
+> unlocks that complete allowed set. Run a separate service instance and configuration for a
+> different trust boundary; do not add a second owner to this file.
 
 ---
 
@@ -94,7 +95,7 @@ The remaining blocks run as root.
 
 ---
 
-## Step 3 — Secrets file + users file (both mode 600)
+## Step 3 — Service environment + owner configuration
 
 **Environment** — `/etc/obsidian-multivault-mcp.env`:
 
@@ -103,7 +104,6 @@ cat > /etc/obsidian-multivault-mcp.env <<EOF
 MCP_PUBLIC_URL=https://203-0-113-10.sslip.io
 MCP_JWT_SECRET=$(openssl rand -hex 32)
 MCP_CLIENTS_FILE=/home/youruser/obsidian-multivault-mcp/oauth-clients.json
-MCP_USERS_FILE=/etc/obsidian-multivault-mcp-users.json
 EOF
 chmod 600 /etc/obsidian-multivault-mcp.env
 ```
@@ -111,33 +111,62 @@ chmod 600 /etc/obsidian-multivault-mcp.env
 - `MCP_PUBLIC_URL` — public origin; used as the OAuth issuer and token audience. No trailing slash.
 - `MCP_JWT_SECRET` — signs access/refresh tokens. Rotating it + restarting revokes all tokens.
 - `MCP_CLIENTS_FILE` — where Dynamic Client Registrations persist across restarts.
-- `MCP_USERS_FILE` — the per-user passphrase → vault map (below).
 
-**Users** — `/etc/obsidian-multivault-mcp-users.json`. One entry per person; each `passphrase` must be a
-**strong and distinct** value (it is that person's entire login):
+Do not set `MCP_USERS_FILE`; current HTTP startup rejects that legacy variable. The systemd unit in
+step 4 sets `MCP_CONFIG_FILE` to a private credential copy of the owner configuration below.
+
+**Knowledge configuration** — `/etc/obsidian-multivault-mcp.json`. First confirm both owner-controlled
+Vault roots exist, then save one new strong owner passphrase in the owner's approved password manager
+and enter it without echoing it. The script writes
+the current `dataDir`, `owner`, `vaults`, and `organizer` schema directly; it does not print the
+passphrase or place it in command history:
 
 ```bash
-cat > /etc/obsidian-multivault-mcp-users.json <<'EOF'
-{
-  "users": [
-    { "id": "alice", "passphrase": "REPLACE-with-a-long-passphrase-for-alice",  "vault": "/home/youruser/alice-vault" },
-    { "id": "bob", "passphrase": "REPLACE-with-a-DIFFERENT-long-passphrase", "vault": "/home/youruser/bob-vault" }
-  ]
-}
-EOF
-chmod 600 /etc/obsidian-multivault-mcp-users.json
+test -d /home/youruser/personal-vault
+test -d /home/youruser/work-vault
+install -d -o youruser -g youruser -m 700 /home/youruser/obsidian-multivault-mcp/data
+install -o root -g root -m 600 /dev/null /etc/obsidian-multivault-mcp.json
+read -rsp 'Owner passphrase (minimum 16 characters): ' brain_owner_passphrase
+echo
+BRAIN_OWNER_PASSPHRASE="$brain_owner_passphrase" <NODE_BIN> --input-type=commonjs <<'NODE'
+const { writeFileSync } = require("node:fs");
+const passphrase = process.env.BRAIN_OWNER_PASSPHRASE ?? "";
+if (passphrase.length < 16) throw new Error("owner passphrase must contain at least 16 characters");
+const config = {
+  dataDir: "/home/youruser/obsidian-multivault-mcp/data",
+  owner: {
+    id: "owner",
+    passphrase,
+    allowedVaults: ["personal", "work"],
+  },
+  vaults: [
+    { id: "personal", root: "/home/youruser/personal-vault" },
+    { id: "work", root: "/home/youruser/work-vault" },
+  ],
+  organizer: {
+    enabledVaults: ["personal", "work"],
+    mode: "disabled",
+    autoApplyConfidence: 0.90,
+  },
+};
+writeFileSync("/etc/obsidian-multivault-mcp.json", `${JSON.stringify(config, null, 2)}\n`, {
+  encoding: "utf8",
+  mode: 0o600,
+});
+NODE
+unset brain_owner_passphrase BRAIN_OWNER_PASSPHRASE
+chown root:root /etc/obsidian-multivault-mcp.json
+chmod 600 /etc/obsidian-multivault-mcp.json
+stat -c '%U %G %a %n' /etc/obsidian-multivault-mcp.json
 ```
 
-Per-user options: add `"readOnly": true` to expose only read tools to that person, or
-`"ext": [".md", ".canvas"]` to override the writable extensions. `id` is any label; it appears in
-logs and the token. The server refuses to start if two users share a passphrase.
+Replace `<NODE_BIN>` with the concrete path from step 1 before running the block. If you configure
+only one Vault, remove the other entry from all three arrays: `owner.allowedVaults`, `vaults`, and
+`organizer.enabledVaults`. `owner.allowedVaults` must name every configured Vault. The first
+deployment deliberately uses `organizer.mode: "disabled"`, so it needs no provider and exposes only
+the six knowledge tools.
 
-### Optional Brain organizer configuration
-
-The organizer is available only with the owner-controlled configuration selected by
-`MCP_CONFIG_FILE`; do not combine that setting with the legacy `MCP_USERS_FILE`. Add an `organizer`
-object to that configuration, start with `mode` set to `dry-run`, and list only Vault IDs owned by
-this service instance in `enabledVaults`. The minimum automatic threshold is `0.90`.
+### Organizer provider file
 
 Keep provider settings in a separate root-owned file. Create the file without putting a sample or
 real secret in this runbook or shell output:
@@ -158,8 +187,12 @@ environment file:
 EnvironmentFile=-/etc/brain-organizer.env
 ```
 
-The leading `-` permits deployments with the organizer disabled and the provider file absent. When
-the organizer is enabled, treat a missing or unreadable provider file as a deployment error.
+Leave the file empty for the initial provider-disabled deployment. To enable organization later,
+edit this file and add the four real assignments, change `organizer.mode` in
+`/etc/obsidian-multivault-mcp.json` to `"dry-run"`, then restart the service. `DASHSCOPE_BASE_URL`
+must be an official DashScope HTTPS endpoint. Never enable `automatic` for the initial seven-day
+trial. The leading `-` on `EnvironmentFile` permits the disabled deployment to start if the empty
+provider file is removed; an enabled organizer must have every required provider setting.
 
 ---
 
@@ -180,12 +213,14 @@ User=youruser
 WorkingDirectory=/home/youruser/obsidian-multivault-mcp
 EnvironmentFile=/etc/obsidian-multivault-mcp.env
 EnvironmentFile=-/etc/brain-organizer.env
+LoadCredential=knowledge-config.json:/etc/obsidian-multivault-mcp.json
+Environment=MCP_CONFIG_FILE=%d/knowledge-config.json
 ExecStart=<NODE_BIN> /home/youruser/obsidian-multivault-mcp/dist/index.js --http --port 8787 --host 127.0.0.1
 Restart=on-failure
 RestartSec=2
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=/home/youruser/alice-vault /home/youruser/bob-vault /home/youruser/obsidian-multivault-mcp
+ReadWritePaths=/home/youruser/personal-vault /home/youruser/work-vault /home/youruser/obsidian-multivault-mcp
 
 [Install]
 WantedBy=multi-user.target
@@ -196,11 +231,13 @@ sed -i "s#<NODE_BIN>#$(sudo -u youruser bash -lc 'asdf which node')#" /etc/syste
 ```
 
 Notes:
-- No vault path on `ExecStart` — in multi-user mode the vaults come from `MCP_USERS_FILE`.
+- No vault path belongs on `ExecStart`; `MCP_CONFIG_FILE` selects the Vault registry. `%d` expands to
+  systemd's private credential directory, where `LoadCredential` makes the root-owned mode-600
+  source configuration readable by this unprivileged service without changing its ownership.
 - `ProtectSystem=strict` makes the whole filesystem read-only except `ReadWritePaths` — list
-  **every** vault plus the app dir (for `oauth-clients.json`). Add a path here for each user's vault.
-- Per-user read-only is set in the users file (`"readOnly": true`), not on `ExecStart`.
-- For an owner-configured organizer, include exactly its configured Vault roots and `dataDir` in
+  **every** configured Vault plus the app/data dir (for `oauth-clients.json`, the search index,
+  organizer state, reports, and recovery). Add or remove Vault paths together with the configuration.
+- Include exactly the configured Vault roots and `dataDir` in
   `ReadWritePaths`; do not widen the writable boundary. The portable transaction protections assume
   these are owner-controlled paths. An actor running with the same OS identity as the service is
   inside that trust boundary, so stop the service before operator recovery or manual namespace work.
@@ -294,28 +331,23 @@ This must report exactly 13 tools. With no organizer configured (or with its mod
 
 ## Step 9 — Connect Claude (mobile + desktop)
 
-Custom connectors are **account-level** — each person adds the URL once in **their own** Claude
-account and it works across their claude.ai, Desktop, and mobile.
-
-Every person uses the **same URL** but their **own passphrase** — that is what routes each of them to
-their own vault:
+Custom connectors are **account-level**. The configured owner adds the URL once in that owner's
+Claude account, and it works across claude.ai, Desktop, and mobile. That identity receives the full
+Vault set named by `owner.allowedVaults`.
 
 1. In Claude (**Settings → Connectors** → **Add custom connector**):
    - URL: `https://203-0-113-10.sslip.io/mcp`
    - Leave Advanced settings (OAuth Client ID/Secret) **blank** — the server supports Dynamic Client
      Registration.
-2. Click **Add** → a browser opens → **enter your own passphrase** from
-   `/etc/obsidian-multivault-mcp-users.json`. You log in once; Anthropic's cloud holds the token and reconnects.
-   - You (alice) log in with your passphrase → you get `/home/youruser/alice-vault`.
-   - Bob logs in **in her Claude account** with **her** passphrase → she gets
-     `/home/youruser/bob-vault`.
+2. Click **Add** → a browser opens → enter the owner passphrase saved during step 3. You log in once;
+   Anthropic's cloud holds the token and reconnects. Confirm `list_vaults` returns exactly
+   `personal` and `work` before writing anything.
 3. **Replace the Desktop SSH server (optional):** on the Mac, edit
    `~/Library/Application Support/Claude/claude_desktop_config.json` and delete the `obsidian-multivault`
    entry under `mcpServers`, then restart Claude Desktop. (Keep a backup first.)
 
-> If someone lands on the **wrong** vault, they logged in with the wrong passphrase. Remove and
-> re-add the connector in that account and log in with the correct one. (Historically this happened
-> because everyone shared a single passphrase — distinct passphrases per person fix it.)
+> A second person or a different Vault trust boundary needs a separate service instance, owner
+> configuration, and connector URL. Do not add another owner or share this passphrase.
 
 ---
 
@@ -361,8 +393,10 @@ native dependency.
 
 To disable the organizer immediately:
 
-1. Edit the owner configuration named by `MCP_CONFIG_FILE` and set `organizer.mode` to `disabled`.
-2. Restart `obsidian-multivault-mcp`.
+1. Run `sudoedit /etc/obsidian-multivault-mcp.json` and set `organizer.mode` to `disabled` in the
+   root-owned source configuration selected by the unit's `LoadCredential` line.
+2. Run `sudo systemctl restart obsidian-multivault-mcp`; systemd refreshes the private
+   `MCP_CONFIG_FILE` credential copy from that source file.
 3. Confirm the service is active, the Vault is unchanged, and MCP lists exactly the six knowledge
    tools. The seven organizer tools must be absent.
 
@@ -380,16 +414,19 @@ for diagnosis and exact undo; remove nothing recursively during incident respons
 | `journalctl -u caddy` shows an ACME/cert error | Port 80 or 443 not reachable from the internet, or DNS not resolving. Confirm `dig +short 203-0-113-10.sslip.io` → `203.0.113.10`. |
 | `obsidian-multivault-mcp` fails: `node: command not found` / version error | asdf shim not resolving under systemd → put the concrete `asdf which node` path in `ExecStart`, `daemon-reload`, restart. |
 | `obsidian-multivault-mcp` fails: `requires MCP_JWT_SECRET` | `/etc/obsidian-multivault-mcp.env` missing/unreadable → check it exists, mode 600, and `EnvironmentFile=` path matches. |
-| `obsidian-multivault-mcp` fails: `Two users share the same passphrase` / `Vault root does not exist` | Fix `/etc/obsidian-multivault-mcp-users.json` — unique passphrases, valid vault paths — then restart. |
-| Claude shows the **wrong person's** vault | That account logged in with the wrong passphrase → re-add the connector and enter the correct one. Each person needs a distinct passphrase. |
-| A user's writes fail | `ProtectSystem=strict` blocking a write path → ensure **every** vault plus the app dir are in `ReadWritePaths`. |
+| Startup reports `MCP_CONFIG_FILE` missing or the knowledge config is unreadable | Confirm `LoadCredential=knowledge-config.json:/etc/obsidian-multivault-mcp.json`, `Environment=MCP_CONFIG_FILE=%d/knowledge-config.json`, and source ownership/mode `root root 600`; then run `daemon-reload` and restart. |
+| Startup reports an unknown Vault or incomplete owner access | Fix `/etc/obsidian-multivault-mcp.json`: every `owner.allowedVaults` ID must exist in `vaults`, and the owner must be allowed every configured Vault. Restart to refresh the credential copy. |
+| A Vault write fails | `ProtectSystem=strict` may be blocking a configured root or `dataDir`; make the matching minimal `ReadWritePaths` correction without widening access elsewhere. |
+| Organizer tools fail while knowledge tools work | Keep `organizer.mode` disabled until `/etc/brain-organizer.env` contains all four required provider assignments and has `root root 600`; then enable `dry-run` and restart. |
 | `/healthz` 200 locally but 502 through Caddy | Caddy up but node down, or wrong upstream port → confirm `ExecStart` port matches the Caddyfile `reverse_proxy` port (8787). |
 | Want to revoke all sessions | Change `MCP_JWT_SECRET` in `/etc/obsidian-multivault-mcp.env`, then `sudo systemctl restart obsidian-multivault-mcp`. |
 
 ## Security notes (public endpoint is read + write)
 
-- The passphrase and JWT secret live only in the mode-600 `/etc/obsidian-multivault-mcp.env`. Use a strong
-  passphrase; it is the whole gate.
+- The owner passphrase lives only in the root-owned mode-600
+  `/etc/obsidian-multivault-mcp.json`; systemd presents a private credential copy to the service.
+  The JWT signing secret lives only in the mode-600 `/etc/obsidian-multivault-mcp.env`, and the
+  provider key lives only in root-owned mode-600 `/etc/brain-organizer.env`.
 - Access tokens are short-lived (1h) JWTs; rotate `MCP_JWT_SECRET` to revoke everything at once.
 - The Node service binds `127.0.0.1` only — Caddy is the sole public listener, always over HTTPS.
 - Consider `--read-only` on the public service if you don't need mobile writes; the trusted Desktop
