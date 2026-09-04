@@ -3,6 +3,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { expect, it } from "vitest";
 import { startHttp } from "../src/http.js";
+import type { OrganizerServiceApi } from "../src/organizer/types.js";
 import { createKnowledgeFixture } from "./helpers/knowledge-fixture.js";
 
 async function freePort(): Promise<number> {
@@ -40,6 +41,44 @@ it("routes unauthenticated local HTTP to the multi-vault knowledge server", asyn
     const result = await client.callTool({ name: "list_vaults", arguments: {} });
     expect(JSON.stringify(result.content)).toContain("personal");
     expect(JSON.stringify(result.content)).toContain("work");
+  } finally {
+    await client.close();
+    await runtime.close();
+    await fx.cleanup();
+    if (previousNoAuth === undefined) delete process.env.MCP_NO_AUTH;
+    else process.env.MCP_NO_AUTH = previousNoAuth;
+  }
+});
+
+it("exposes organizer tools over HTTP only when configured", async () => {
+  const previousNoAuth = process.env.MCP_NO_AUTH;
+  process.env.MCP_NO_AUTH = "1";
+  const organizer: OrganizerServiceApi = {
+    async getPolicy() { throw new Error("not invoked"); },
+    async listInbox() { throw new Error("not invoked"); },
+    async propose() { throw new Error("not invoked"); },
+    async apply() { throw new Error("not invoked"); },
+    async audit() { throw new Error("not invoked"); },
+    async undo() { throw new Error("not invoked"); },
+    async startRun() { throw new Error("not invoked"); },
+  };
+  const fx = await createKnowledgeFixture(["personal"], organizer);
+  await fx.knowledge.initialize();
+  const port = await freePort();
+  const runtime = await startHttp(
+    [{ id: "owner", passphrase: "a-long-test-passphrase", knowledge: fx.knowledge }],
+    { host: "127.0.0.1", port },
+  );
+  const transport = new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`));
+  const client = new Client({ name: "http-organizer-test", version: "1.0.0" });
+  try {
+    await client.connect(transport);
+    expect((await client.listTools()).tools.map((tool) => tool.name).sort()).toEqual([
+      "apply_organization", "audit_vault", "create_inbox_note", "get_note_links",
+      "get_vault_policy", "list_inbox_notes", "list_notes", "list_vaults",
+      "organize_now", "propose_organization", "read_note", "search_notes",
+      "undo_organization",
+    ]);
   } finally {
     await client.close();
     await runtime.close();

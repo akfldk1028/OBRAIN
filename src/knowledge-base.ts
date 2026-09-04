@@ -2,6 +2,8 @@ import type { AuditLogger } from "./audit.js";
 import type { IndexCoordinator } from "./index-coordinator.js";
 import type { SearchIndex } from "./search-index.js";
 import type { VaultRegistry } from "./vault-registry.js";
+import { VaultError } from "./vault.js";
+import type { OrganizerServiceApi } from "./organizer/types.js";
 
 export interface CreateInboxRequest {
   vault: string;
@@ -15,7 +17,8 @@ export class KnowledgeBase {
     private readonly registry: VaultRegistry,
     private readonly index: SearchIndex,
     private readonly coordinator: IndexCoordinator,
-    private readonly audit: AuditLogger,
+    private readonly auditLogger: AuditLogger,
+    private readonly organizer?: OrganizerServiceApi,
   ) {}
 
   async initialize(): Promise<void> {
@@ -78,7 +81,7 @@ export class KnowledgeBase {
     try {
       const created = await this.registry.get(input.vault).createInboxNote(input);
       await this.coordinator.indexCreatedNote(input.vault, created.path);
-      await this.audit.record({
+      await this.auditLogger.record({
         action: "create_inbox_note",
         outcome: "allowed",
         vault: input.vault,
@@ -86,7 +89,7 @@ export class KnowledgeBase {
       });
       return { vault: input.vault, path: created.path };
     } catch (error) {
-      await this.audit.record({
+      await this.auditLogger.record({
         action: "create_inbox_note",
         outcome: "denied",
         vault: input.vault,
@@ -94,6 +97,43 @@ export class KnowledgeBase {
       });
       throw error;
     }
+  }
+
+  hasOrganizer(): boolean {
+    return this.organizer !== undefined;
+  }
+
+  async getPolicy(vault: string) {
+    return this.organizerOrThrow().getPolicy(vault);
+  }
+
+  async listInbox(input: Parameters<OrganizerServiceApi["listInbox"]>[0]) {
+    return this.organizerOrThrow().listInbox(input);
+  }
+
+  async propose(input: Parameters<OrganizerServiceApi["propose"]>[0]) {
+    return this.organizerOrThrow().propose(input);
+  }
+
+  async apply(input: Parameters<OrganizerServiceApi["apply"]>[0]) {
+    return this.organizerOrThrow().apply(input);
+  }
+
+  async audit(input: Parameters<OrganizerServiceApi["audit"]>[0]) {
+    return this.organizerOrThrow().audit(input);
+  }
+
+  async undo(input: Parameters<OrganizerServiceApi["undo"]>[0]) {
+    return this.organizerOrThrow().undo(input);
+  }
+
+  async startRun(input: Parameters<OrganizerServiceApi["startRun"]>[0]) {
+    return this.organizerOrThrow().startRun(input);
+  }
+
+  private organizerOrThrow(): OrganizerServiceApi {
+    if (!this.organizer) throw new VaultError("Organizer is not configured");
+    return this.organizer;
   }
 
   async close(): Promise<void> {

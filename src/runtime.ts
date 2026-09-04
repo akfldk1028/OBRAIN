@@ -8,6 +8,7 @@ import { loadOrganizerEnvironment } from "./organizer/config.js";
 import { OrganizerService } from "./organizer/service.js";
 import { OrganizerStore } from "./organizer/store.js";
 import { OrganizerTransactionEngine } from "./organizer/transaction.js";
+import type { OrganizerServiceApi } from "./organizer/types.js";
 import { SearchIndex } from "./search-index.js";
 import type { VaultRegistry } from "./vault-registry.js";
 
@@ -17,7 +18,11 @@ export interface BrainRuntime {
   close(): Promise<void>;
 }
 
-export async function assembleKnowledge(dataDir: string, registry: VaultRegistry): Promise<KnowledgeBase> {
+export async function assembleKnowledge(
+  dataDir: string,
+  registry: VaultRegistry,
+  organizer?: OrganizerServiceApi,
+): Promise<KnowledgeBase> {
   await mkdir(dataDir, { recursive: true, mode: 0o700 });
   const index = SearchIndex.openWithRecovery(path.join(dataDir, "index.sqlite"));
   const coordinator = new IndexCoordinator(registry, index);
@@ -26,6 +31,7 @@ export async function assembleKnowledge(dataDir: string, registry: VaultRegistry
     index,
     coordinator,
     new AuditLogger(path.join(dataDir, "audit.jsonl")),
+    organizer,
   );
   try {
     await knowledge.initialize();
@@ -45,14 +51,18 @@ export async function assembleRuntime(input: {
   environment: NodeJS.ProcessEnv;
 }): Promise<BrainRuntime> {
   const loaded = await loadKnowledgeConfig(input.configFile);
-  const knowledge = await assembleKnowledge(loaded.dataDir, loaded.registry);
-  if (!loaded.organizer) return { knowledge, close: () => knowledge.close() };
+  if (!loaded.organizer) {
+    const knowledge = await assembleKnowledge(loaded.dataDir, loaded.registry);
+    return { knowledge, close: () => knowledge.close() };
+  }
 
   let store: OrganizerStore | undefined;
+  let knowledge: KnowledgeBase | undefined;
   try {
     const environment = loaded.organizer.mode === "disabled"
       ? { provider: "disabled" as const }
       : loadOrganizerEnvironment(input.environment);
+    await mkdir(loaded.dataDir, { recursive: true, mode: 0o700 });
     store = new OrganizerStore(path.join(loaded.dataDir, "organizer.sqlite"));
     const organizer = new OrganizerService({
       registry: loaded.registry,
@@ -71,15 +81,17 @@ export async function assembleRuntime(input: {
       auditLogger: new AuditLogger(path.join(loaded.dataDir, "audit.jsonl")),
       lockPath: path.join(loaded.dataDir, "organizer.lock"),
     });
+    const attachedKnowledge = await assembleKnowledge(loaded.dataDir, loaded.registry, organizer);
+    knowledge = attachedKnowledge;
     let closed = false;
     return {
-      knowledge,
+      knowledge: attachedKnowledge,
       organizer,
       async close() {
         if (closed) return;
         closed = true;
         try {
-          await knowledge.close();
+          await attachedKnowledge.close();
         } finally {
           store?.close();
         }
@@ -87,7 +99,7 @@ export async function assembleRuntime(input: {
     };
   } catch (error) {
     store?.close();
-    await knowledge.close();
+    await knowledge?.close();
     throw error;
   }
 }

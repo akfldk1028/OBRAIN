@@ -50,6 +50,29 @@ describe("assembleRuntime", () => {
       await fx.cleanup();
     }
   });
+
+  it("attaches a configured organizer to the shared knowledge base", async () => {
+    const fx = await makeTempVaultSet(["brain"]);
+    const configFile = path.join(fx.root, "config.json");
+    await writeFile(configFile, JSON.stringify({
+      dataDir: path.join(fx.root, "data"),
+      owner: { id: "owner", passphrase: "a-long-test-passphrase", allowedVaults: ["brain"] },
+      vaults: fx.vaults,
+      organizer: { enabledVaults: ["brain"], mode: "disabled" },
+    }), { mode: 0o600 });
+
+    try {
+      const runtime = await assembleRuntime({ configFile, environment: { ORGANIZER_PROVIDER: "dashscope" } });
+      try {
+        expect(runtime.organizer).toBeDefined();
+        expect(runtime.knowledge.hasOrganizer()).toBe(true);
+      } finally {
+        await runtime.close();
+      }
+    } finally {
+      await fx.cleanup();
+    }
+  });
 });
 
 describe("runOrganizerCli", () => {

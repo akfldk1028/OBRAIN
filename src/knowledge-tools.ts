@@ -2,6 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { KnowledgeBase } from "./knowledge-base.js";
 import { VaultError } from "./vault.js";
+import { registerOrganizerTools } from "./organizer/tools.js";
 
 type ToolResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
 
@@ -101,4 +102,5 @@ export function registerKnowledgeTools(server: McpServer, knowledge: KnowledgeBa
     },
     wrap(async (input) => json(await knowledge.createInboxNote(input))),
   );
+  registerOrganizerTools(server, knowledge);
 }

@@ -19,6 +19,7 @@ export function createMcpServer(vault: VaultFS): McpServer {
 
 export function createKnowledgeMcpServer(knowledge: KnowledgeBase): McpServer {
   const server = new McpServer({ name: "obsidian-brain", version: "1.0.0" });
+  // This registration includes the organizer tools only when the shared runtime supplies one.
   registerKnowledgeTools(server, knowledge);
   return server;
 }

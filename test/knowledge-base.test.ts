@@ -36,4 +36,13 @@ describe("KnowledgeBase", () => {
       await fx.cleanup();
     }
   });
+
+  it("keeps organizer delegation unavailable when no organizer is configured", async () => {
+    const fx = await createKnowledgeFixture(["personal"]);
+    try {
+      await expect(fx.knowledge.getPolicy("personal")).rejects.toThrow("Organizer is not configured");
+    } finally {
+      await fx.cleanup();
+    }
+  });
 });
