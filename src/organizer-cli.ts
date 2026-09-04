@@ -90,9 +90,25 @@ export async function runOrganizerCli(argv: string[], environment: NodeJS.Proces
   }
 }
 
+export async function runOrganizerCliEntrypoint(argv: string[], environment: NodeJS.ProcessEnv, output: (line: string) => void = console.log): Promise<number> {
+  const warn = console.warn;
+  const error = console.error;
+  console.warn = () => undefined;
+  console.error = () => undefined;
+  try {
+    await runOrganizerCli(argv, environment, output);
+    return 0;
+  } catch {
+    output(JSON.stringify({ status: "error", code: "organizer_cli_failed" }));
+    return 1;
+  } finally {
+    console.warn = warn;
+    console.error = error;
+  }
+}
+
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  runOrganizerCli(process.argv.slice(2), process.env).catch((error: unknown) => {
-    console.error(error instanceof Error ? error.message : "organizer CLI failed");
-    process.exitCode = 1;
+  void runOrganizerCliEntrypoint(process.argv.slice(2), process.env).then((code) => {
+    process.exitCode = code;
   });
 }

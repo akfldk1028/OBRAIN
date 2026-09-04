@@ -22,7 +22,7 @@ export interface OrganizerServiceOptions {
   registry: VaultRegistry;
   config: OrganizerConfig;
   store: OrganizerStore;
-  provider?: OrganizerProvider | ((options: { maxContextBytes: number }) => OrganizerProvider);
+  provider?: OrganizerProvider | ((options: { maxContextBytes: number }) => OrganizerProvider | Promise<OrganizerProvider>);
   transaction: OrganizerTransactionEngine;
   auditLogger?: AuditLogger;
   now?: () => string;
@@ -164,7 +164,7 @@ export class OrganizerService implements OrganizerServiceApi {
     const source = await readFile(candidate.absolutePath, "utf8");
     if (Buffer.byteLength(source, "utf8") > this.options.config.maxNoteBytes || sha(source) !== candidate.hash) throw new Error("source_not_ready");
     if (detectSensitiveContent(source).length) throw new Error("sensitive_source");
-    const provider = this.provider();
+    const provider = await this.provider();
     const existing = new Set((await this.authorize(vaultId).listNotes()).map((item) => item.replaceAll("\\", "/")));
     const directories = await this.existingApprovedDirectories(root);
     const candidateNotes = [...existing].filter((item) => item !== candidate.path).sort(compare).slice(0, 512);
@@ -214,7 +214,7 @@ export class OrganizerService implements OrganizerServiceApi {
 
   private mocLinks(content: string): Map<string, string> { const result = new Map<string, string>(); for (const match of content.matchAll(/^- \[\[([^|\]]+)\|([^\]]+)\]\]$/gmu)) result.set(match[1]!, match[2]!); return result; }
   private providerDisabled(): boolean { return this.options.config.mode === "disabled" || !this.options.provider; }
-  private provider(): OrganizerProvider { if (this.providerDisabled()) throw new Error("organizer_unavailable"); if (!this.providerInstance) this.providerInstance = typeof this.options.provider === "function" ? this.options.provider({ maxContextBytes: this.options.config.maxContextBytes }) : this.options.provider!; return this.providerInstance; }
+  private async provider(): Promise<OrganizerProvider> { if (this.providerDisabled()) throw new Error("organizer_unavailable"); if (!this.providerInstance) this.providerInstance = typeof this.options.provider === "function" ? await this.options.provider({ maxContextBytes: this.options.config.maxContextBytes }) : this.options.provider!; return this.providerInstance; }
   private runMode(requested: OrganizerMode | undefined): OrganizerMode { if (this.providerDisabled()) return "disabled"; const trial = this.options.store.getOrStartTrial(this.now()); if (trial.active) return "dry-run"; if (this.options.config.mode === "dry-run" || requested === "dry-run") return "dry-run"; return "automatic"; }
   private authorize(vault: string) { if (!this.options.config.enabledVaults.includes(vault)) throw new Error("vault_not_enabled"); return this.options.registry.get(vault); }
   private async writeReport(vault: string, summary: RunSummary, paths: ReportPath[]): Promise<void> { const fs = this.authorize(vault); const boundRoot = await realpath(fs.rootPath); await this.reportDirectory(boundRoot); await this.options.onBeforeReportOpen?.(); await this.reportDirectory(boundRoot); const ordered = [...paths].sort((left, right) => compare(left.path, right.path) || compare(left.reasonCode, right.reasonCode)); const content = JSON.stringify({ runId: summary.runId, mode: summary.mode, paths: ordered, counts: { discovered: summary.discovered, proposed: summary.proposed, applied: summary.applied, review: summary.review, skipped: summary.skipped, failed: summary.failed }, reasonCodes: [...new Set(ordered.map((item) => item.reasonCode))].sort(compare) }); await this.options.transaction.publishCreateOnlyArtifact({ vaultRoot: boundRoot, relativePath: `${this.options.config.reportsDirectory}/${summary.runId}.json`, owner: summary.runId, content, onEvent: this.options.onReportPublicationEvent }); }

@@ -97,7 +97,18 @@ export class KnowledgeBase {
   }
 
   async close(): Promise<void> {
-    await this.coordinator.stopWatching();
-    this.index.close();
+    const errors: unknown[] = [];
+    try {
+      await this.coordinator.stopWatching();
+    } catch (error) {
+      errors.push(error);
+    }
+    try {
+      this.index.close();
+    } catch (error) {
+      errors.push(error);
+    }
+    if (errors.length === 1) throw errors[0];
+    if (errors.length > 1) throw new AggregateError(errors, "knowledge base cleanup failed");
   }
 }

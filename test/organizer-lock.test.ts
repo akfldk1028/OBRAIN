@@ -4,6 +4,28 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { acquireOrganizerLock } from "../src/organizer/lock.js";
 
+const probeIdentity = vi.hoisted(() => ({ value: undefined as { dev: bigint; ino: bigint } | undefined }));
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return {
+    ...actual,
+    lstat: async (...args: Parameters<typeof actual.lstat>) => {
+      const stat = await actual.lstat(...args);
+      const identity = probeIdentity.value;
+      if (!identity) return stat;
+      return new Proxy(stat, {
+        get(target, property) {
+          if (property === "dev") return identity.dev;
+          if (property === "ino") return identity.ino;
+          const value = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+    },
+  };
+});
+
 const roots: string[] = [];
 
 async function lockPath(): Promise<string> {
@@ -13,6 +35,7 @@ async function lockPath(): Promise<string> {
 }
 
 afterEach(async () => {
+  probeIdentity.value = undefined;
   vi.restoreAllMocks();
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
@@ -27,6 +50,37 @@ async function fileHandlePrototype(file: string): Promise<FileHandle> {
 }
 
 describe("organizer lock", () => {
+  it.each([
+    { dev: 0n, ino: 1n },
+    { dev: 1n, ino: 0n },
+  ])("rejects partial identity $dev/$ino before fresh and stale lock mutation", async (identity) => {
+    const fresh = await lockPath();
+    const stalePath = await lockPath();
+    const stale = JSON.stringify({ pid: 123, startedAt: "2020-01-01T00:00:00.000Z", owner: "stale-lock" });
+    await writeFile(stalePath, stale, "utf8");
+    const prototype = await fileHandlePrototype(fresh);
+    const originalStat = prototype.stat;
+    vi.spyOn(prototype, "stat").mockImplementation(async function (this: FileHandle, options) {
+      const actual = await Reflect.apply(originalStat, this, [options]);
+      return new Proxy(actual, {
+        get(target, property) {
+          if (property === "dev") return identity.dev;
+          if (property === "ino") return identity.ino;
+          const value = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+    });
+    probeIdentity.value = identity;
+
+    await expect(acquireOrganizerLock({ path: fresh, maxRunDurationMs: 1, isProcessAlive: () => false })).resolves.toBeUndefined();
+    await expect(acquireOrganizerLock({ path: stalePath, maxRunDurationMs: 1, isProcessAlive: () => false })).resolves.toBeUndefined();
+    expect(await readFile(stalePath, "utf8")).toBe(stale);
+    for (const file of [fresh, stalePath]) {
+      expect((await readdir(path.dirname(file))).filter((name) => name === path.basename(file) || name === `${path.basename(file)}.coordinator.sqlite`)).toEqual(file === stalePath ? [path.basename(file)] : []);
+    }
+  });
+
   it.each(["fresh", "stale"] as const)("fails closed before %s acquisition when runtime identity is unavailable", async (kind) => {
     const file = await lockPath();
     const stale = JSON.stringify({ pid: 123, startedAt: "2020-01-01T00:00:00.000Z", owner: "stale-lock" });

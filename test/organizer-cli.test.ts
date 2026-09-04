@@ -1,7 +1,7 @@
 import { writeFile } from "node:fs/promises";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
-import { parseOrganizerArgs, runOrganizerCli } from "../src/organizer-cli.js";
+import { describe, expect, it, vi } from "vitest";
+import { parseOrganizerArgs, runOrganizerCli, runOrganizerCliEntrypoint } from "../src/organizer-cli.js";
 import { assembleRuntime } from "../src/runtime.js";
 import { makeTempVaultSet } from "./helpers/temp-vaults.js";
 
@@ -53,6 +53,22 @@ describe("assembleRuntime", () => {
 });
 
 describe("runOrganizerCli", () => {
+  it("emits one fixed safe JSON error from the entrypoint without console leakage", async () => {
+    const output: string[] = [];
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      await expect(runOrganizerCliEntrypoint(["run", "--vault", "brain", "--mode", "synthetic-secret"], {}, (line) => output.push(line))).resolves.toBe(1);
+      expect(output).toEqual([JSON.stringify({ status: "error", code: "organizer_cli_failed" })]);
+      expect(JSON.stringify(output)).not.toContain("synthetic-secret");
+      expect(error).not.toHaveBeenCalled();
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      error.mockRestore();
+      warn.mockRestore();
+    }
+  });
+
   it("runs an audit without a provider or HTTP listener and prints a redacted JSON report", async () => {
     const fx = await makeTempVaultSet(["brain"]);
     const configFile = path.join(fx.root, "config.json");

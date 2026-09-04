@@ -61,7 +61,7 @@ function stale(record: LockRecord, at: Date, maxRunDurationMs: number, alive: (p
 type BigStat = Awaited<ReturnType<FileHandle["stat"]>>;
 
 function sameIdentity(left: BigStat, right: BigStat): boolean {
-  return !(left.dev === 0n && left.ino === 0n) && !(right.dev === 0n && right.ino === 0n)
+  return left.dev !== 0n && left.ino !== 0n && right.dev !== 0n && right.ino !== 0n
     && left.dev === right.dev && left.ino === right.ino;
 }
 

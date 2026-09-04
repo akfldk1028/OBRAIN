@@ -5,7 +5,6 @@ import { loadKnowledgeConfig } from "./config.js";
 import { IndexCoordinator } from "./index-coordinator.js";
 import { KnowledgeBase } from "./knowledge-base.js";
 import { loadOrganizerEnvironment } from "./organizer/config.js";
-import { DashScopeProvider } from "./organizer/dashscope-provider.js";
 import { OrganizerService } from "./organizer/service.js";
 import { OrganizerStore } from "./organizer/store.js";
 import { OrganizerTransactionEngine } from "./organizer/transaction.js";
@@ -28,8 +27,17 @@ export async function assembleKnowledge(dataDir: string, registry: VaultRegistry
     coordinator,
     new AuditLogger(path.join(dataDir, "audit.jsonl")),
   );
-  await knowledge.initialize();
-  return knowledge;
+  try {
+    await knowledge.initialize();
+    return knowledge;
+  } catch (error) {
+    try {
+      await knowledge.close();
+    } catch (cleanupError) {
+      throw new AggregateError([error, cleanupError], "knowledge initialization cleanup failed");
+    }
+    throw error;
+  }
 }
 
 export async function assembleRuntime(input: {
@@ -51,7 +59,10 @@ export async function assembleRuntime(input: {
       config: loaded.organizer,
       store,
       provider: environment.provider === "dashscope"
-        ? ({ maxContextBytes }) => new DashScopeProvider(environment, { maxContextBytes })
+        ? async ({ maxContextBytes }) => {
+          const { DashScopeProvider } = await import("./organizer/dashscope-provider.js");
+          return new DashScopeProvider(environment, { maxContextBytes });
+        }
         : undefined,
       transaction: new OrganizerTransactionEngine({
         store,

@@ -61,3 +61,45 @@ Output: 2 files, 21 tests passed; typecheck and build exited 0; both built entry
 
 - Recovery cleanup is intentionally not called: this task has no independently verified backup signal.
 - On a filesystem that cannot supply usable identity, the random identity probe may remain when it cannot be proven safe to unlink. It contains only fixed probe text; primary and coordinator locks are never retained, and no recursive cleanup is used.
+
+---
+
+## Fix Round 1/5
+
+### Findings addressed
+
+- Identity validity now requires both device and inode to be independently nonzero. Fresh and stale lock paths reject zero-device/nonzero-inode and nonzero-device/zero-inode probes before primary/coordinator mutation.
+- Added the CLI entrypoint boundary: success and failure flow through JSON-only output; failures emit exactly `{ "status": "error", "code": "organizer_cli_failed" }`. CLI-scoped warning/error output is suppressed during execution and normal HTTP logging is unchanged.
+- Replaced the static DashScope provider import with a dynamic import inside the async lazy provider factory. Disabled assembly neither evaluates nor constructs the module.
+- `assembleKnowledge()` now closes a partially assembled KnowledgeBase if watcher initialization fails. `KnowledgeBase.close()` closes the index even when watcher shutdown fails, preserving one failure or aggregating multiple failures.
+
+### TDD evidence
+
+#### RED
+
+`npm test -- test/organizer-cli.test.ts test/organizer-lock.test.ts test/knowledge-resource-cleanup.test.ts test/runtime-provider-loading.test.ts`
+
+Observed expected failures:
+
+- Partial `dev`/`ino` identities returned a fresh lock.
+- CLI entrypoint function was missing.
+- Disabled assembly evaluated the mocked provider module once.
+- Watcher failure skipped index closure; initialization failure left the opened SQLite index handle unclosed.
+
+#### GREEN
+
+`npm test -- test/organizer-cli.test.ts test/organizer-lock.test.ts test/knowledge-resource-cleanup.test.ts test/runtime-provider-loading.test.ts && npm run typecheck`
+
+Output: 4 files and 27 tests passed; typecheck exited 0.
+
+### Fix-round verification
+
+- `npm run build` — exited 0; `dist/index.js` and `dist/organizer-cli.js` both exist.
+- `npm test` — 35 files passed; 427 passed, 3 skipped (430 total).
+- `npm run typecheck` — exited 0 with no diagnostics.
+- `git diff --check` — exited 0 with no whitespace errors.
+
+### Remaining concerns
+
+- Recovery cleanup remains deliberately disabled without an independently verified backup signal.
+- The existing deferred config-snapshot/HTTP owner pairing minor was not altered.
