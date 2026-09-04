@@ -6,6 +6,24 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 const base = (process.argv[2] ?? "").replace(/\/$/, "");
 const passphraseFile = process.env.DEPLOY_OWNER_PASSPHRASE_FILE
   ?? "/root/brain-mcp-owner-passphrase.txt";
+const organizerExpected = process.env.DEPLOY_EXPECT_ORGANIZER === "1";
+const baseTools = [
+  "create_inbox_note",
+  "get_note_links",
+  "list_notes",
+  "list_vaults",
+  "read_note",
+  "search_notes",
+];
+const organizerTools = [
+  "apply_organization",
+  "audit_vault",
+  "get_vault_policy",
+  "list_inbox_notes",
+  "organize_now",
+  "propose_organization",
+  "undo_organization",
+];
 
 if (!base.startsWith("https://")) {
   throw new Error("usage: node scripts/verify-deployment.mjs https://host");
@@ -88,15 +106,27 @@ await client.connect(transport);
 try {
   const tools = await client.listTools();
   const names = tools.tools.map((tool) => tool.name).sort();
-  const expected = [
-    "create_inbox_note",
-    "get_note_links",
-    "list_notes",
-    "list_vaults",
-    "read_note",
-    "search_notes",
-  ].sort();
-  assert(names.join(",") === expected.join(","), "six safe MCP tools are available");
+  const expected = (organizerExpected ? [...baseTools, ...organizerTools] : baseTools).sort();
+  assert(
+    names.join(",") === expected.join(","),
+    organizerExpected
+      ? "thirteen MCP tools including organizer are available"
+      : "six safe MCP tools are available",
+  );
+
+  if (organizerExpected) {
+    const policy = await client.callTool({
+      name: "get_vault_policy",
+      arguments: { vault: "brain" },
+    });
+    assert(!policy.isError, "get_vault_policy over public MCP");
+
+    const audit = await client.callTool({
+      name: "audit_vault",
+      arguments: { vault: "brain" },
+    });
+    assert(!audit.isError, "audit_vault over public MCP");
+  }
 
   const marker = `deploymentcheck${Date.now()}`;
   const created = await client.callTool({

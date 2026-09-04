@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import {
   chmodSync,
   existsSync,
@@ -12,9 +13,14 @@ import {
   writeFileSync,
 } from "node:fs";
 import { readFile } from "node:fs/promises";
+import { createServer as createTcpServer } from "node:net";
 import { basename, join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
+import { startHttp } from "../src/http.js";
 import { prepareOrganizerStatePaths } from "../src/organizer/state-paths.js";
+import type { OrganizerServiceApi } from "../src/organizer/types.js";
+import { createKnowledgeFixture } from "./helpers/knowledge-fixture.js";
 
 const cleanupPaths: string[] = [];
 
@@ -154,6 +160,117 @@ function jsonAssignment(source: string, name: string): unknown {
   return JSON.parse(match[1]!);
 }
 
+async function freePort(): Promise<number> {
+  const server = createTcpServer();
+  await new Promise<void>((resolvePromise) => server.listen(0, "127.0.0.1", resolvePromise));
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("Could not allocate verifier test port");
+  await new Promise<void>((resolvePromise, reject) => {
+    server.close((error) => error ? reject(error) : resolvePromise());
+  });
+  return address.port;
+}
+
+function organizerRecorder(calls: string[]): OrganizerServiceApi {
+  const unexpected = (name: string): never => {
+    calls.push(name);
+    throw new Error(`deployment verifier called forbidden organizer operation: ${name}`);
+  };
+  return {
+    async getPolicy(vault) {
+      calls.push(`get_vault_policy:${vault}`);
+      return {
+        version: "test-policy-v1",
+        readingOrder: ["000_AI_WORK_GUIDE.md", "000_Home_MOC.md"],
+        approvedAreas: ["60_Tools"],
+        maxDepth: 5,
+        mode: "dry-run",
+      };
+    },
+    async audit({ vault }) {
+      calls.push(`audit_vault:${vault}`);
+      return { vault, checkedAt: "2026-09-04T00:00:00.000Z", findings: [] };
+    },
+    async listInbox() { return unexpected("list_inbox_notes"); },
+    async propose() { return unexpected("propose_organization"); },
+    async apply() { return unexpected("apply_organization"); },
+    async undo() { return unexpected("undo_organization"); },
+    async startRun() { return unexpected("organize_now"); },
+  };
+}
+
+async function runDeploymentVerifier(options: {
+  organizer?: OrganizerServiceApi;
+  expectOrganizer?: boolean;
+} = {}): Promise<string[]> {
+  const environmentKeys = [
+    "DEPLOY_OWNER_PASSPHRASE_FILE",
+    "DEPLOY_EXPECT_ORGANIZER",
+    "MCP_NO_AUTH",
+    "MCP_PUBLIC_URL",
+    "MCP_JWT_SECRET",
+    "MCP_CLIENTS_FILE",
+  ] as const;
+  const previousEnvironment = new Map(environmentKeys.map((key) => [key, process.env[key]]));
+  const previousArgv = process.argv;
+  const previousFetch = globalThis.fetch;
+  const previousLog = console.log;
+  const logs: string[] = [];
+  const fx = await createKnowledgeFixture(["brain"], options.organizer);
+  let runtime: Awaited<ReturnType<typeof startHttp>> | undefined;
+
+  try {
+    await fx.knowledge.initialize();
+    const port = await freePort();
+    const publicBase = `https://127.0.0.1:${port}`;
+    const localBase = `http://127.0.0.1:${port}`;
+    const passphrase = "deployment-verifier-test-passphrase";
+    const passphraseFile = join(fx.rootOf("brain"), "verifier-passphrase.txt");
+    writeFileSync(passphraseFile, passphrase, "utf8");
+
+    delete process.env.MCP_NO_AUTH;
+    process.env.MCP_PUBLIC_URL = publicBase;
+    process.env.MCP_JWT_SECRET = "a".repeat(64);
+    process.env.MCP_CLIENTS_FILE = resolve(fx.rootOf("brain"), "..", "oauth-clients.json");
+    process.env.DEPLOY_OWNER_PASSPHRASE_FILE = passphraseFile;
+    if (options.expectOrganizer) process.env.DEPLOY_EXPECT_ORGANIZER = "1";
+    else delete process.env.DEPLOY_EXPECT_ORGANIZER;
+
+    runtime = await startHttp(
+      [{ id: "owner", passphrase, knowledge: fx.knowledge }],
+      { host: "127.0.0.1", port },
+    );
+
+    globalThis.fetch = ((input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+      const requested = typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.href
+          : input.url;
+      if (!requested.startsWith(publicBase)) return previousFetch(input, init);
+      const rewritten = `${localBase}${requested.slice(publicBase.length)}`;
+      const rewrittenInput = input instanceof Request ? new Request(rewritten, input) : rewritten;
+      return previousFetch(rewrittenInput, init);
+    }) as typeof fetch;
+    console.log = (...args: unknown[]) => logs.push(args.map(String).join(" "));
+    process.argv = [process.execPath, resolve("scripts/verify-deployment.mjs"), publicBase];
+
+    const verifierUrl = `${pathToFileURL(resolve("scripts/verify-deployment.mjs")).href}?test=${randomUUID()}`;
+    await import(verifierUrl);
+    return logs;
+  } finally {
+    process.argv = previousArgv;
+    globalThis.fetch = previousFetch;
+    console.log = previousLog;
+    for (const [key, value] of previousEnvironment) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    if (runtime) await runtime.close();
+    await fx.cleanup();
+  }
+}
+
 describe("organizer deployment units", () => {
   it("runs the organizer once as brain inside the intended sandbox", async () => {
     const service = parseUnitFile(await readFile("deploy/brain-organizer.service", "utf8"));
@@ -243,6 +360,37 @@ describe("organizer deployment units", () => {
       "/etc/brain-mcp.env",
       "-/etc/brain-organizer.env",
     ]);
+  });
+
+  it("verifies the exact six-tool public surface by default", async () => {
+    const logs = await runDeploymentVerifier();
+    expect(logs).toContain("ok - six safe MCP tools are available");
+    expect(logs).toContain("ok - indexed search round trip");
+  });
+
+  it("rejects the thirteen-tool organizer surface unless explicitly expected", async () => {
+    await expect(runDeploymentVerifier({ organizer: organizerRecorder([]) })).rejects.toThrow(
+      "verification failed: six safe MCP tools are available",
+    );
+  });
+
+  it("verifies exactly thirteen tools while invoking only non-mutating organizer operations", async () => {
+    const organizerCalls: string[] = [];
+    const logs = await runDeploymentVerifier({
+      organizer: organizerRecorder(organizerCalls),
+      expectOrganizer: true,
+    });
+
+    expect(logs).toContain("ok - thirteen MCP tools including organizer are available");
+    expect(logs).toContain("ok - get_vault_policy over public MCP");
+    expect(logs).toContain("ok - audit_vault over public MCP");
+    expect(organizerCalls).toEqual(["get_vault_policy:brain", "audit_vault:brain"]);
+  });
+
+  it("rejects the six-tool surface when organizer tools are explicitly expected", async () => {
+    await expect(runDeploymentVerifier({ expectOrganizer: true })).rejects.toThrow(
+      "verification failed: thirteen MCP tools including organizer are available",
+    );
   });
 
   it("installs organizer state and units while preserving an existing provider environment", async () => {

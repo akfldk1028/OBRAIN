@@ -8,6 +8,14 @@ It does **not** touch the existing stdio-over-SSH path used by Claude Desktop; t
 independently. You may replace the Desktop SSH config with this remote connector afterwards (see the
 last section).
 
+> [!WARNING] CURRENT ORACLE ROLLOUT GATE
+> The reviewed commit is approved only for a **provider-disabled deployment exposing exactly the six
+> knowledge tools**. Provider installation, `dry-run`, the thirteen-tool organizer surface, and
+> `automatic` mode are **BLOCKED**. Do not add a provider key or change organizer mode until both HIGH
+> findings are fixed: the emoji surrogate-pair infinite loop in `fitNoteContent()`, and sensitive
+> `candidateNotes`/`approvedDirectories` paths reaching provider context. Both fixes then require an
+> independent re-review. Nothing in this runbook overrides that gate.
+
 ## What you are building
 
 ```
@@ -173,26 +181,26 @@ real secret in this runbook or shell output:
 
 ```bash
 install -o root -g root -m 600 /dev/null /etc/brain-organizer.env
-sudoedit /etc/brain-organizer.env
 stat -c '%U %G %a %n' /etc/brain-organizer.env
 ```
 
-The file is `/etc/brain-organizer.env`, must remain owned by `root:root` with permissions `600`, and
-holds `ORGANIZER_PROVIDER`, `DASHSCOPE_API_KEY`, `DASHSCOPE_BASE_URL`, and `DASHSCOPE_MODEL`. Enter
-the real provider key only in that file. Never paste it into the repository, an Obsidian note, a run
-report, command output, or incident ticket. Add this line to the systemd service alongside the main
+For this generic unit, `/etc/brain-organizer.env` remains owned by `root:root` with permissions
+`600`. After the rollout gate is cleared, it is the only permitted location for
+`ORGANIZER_PROVIDER`, `DASHSCOPE_API_KEY`, `DASHSCOPE_BASE_URL`, and `DASHSCOPE_MODEL`; until then it
+stays empty. Never paste a real provider key into the repository, an Obsidian note, a run report,
+command output, or incident ticket. Add this line to the systemd service alongside the main
 environment file:
 
 ```ini
 EnvironmentFile=-/etc/brain-organizer.env
 ```
 
-Leave the file empty for the initial provider-disabled deployment. To enable organization later,
-edit this file and add the four real assignments, change `organizer.mode` in
-`/etc/obsidian-multivault-mcp.json` to `"dry-run"`, then restart the service. `DASHSCOPE_BASE_URL`
-must be an official DashScope HTTPS endpoint. Never enable `automatic` for the initial seven-day
-trial. The leading `-` on `EnvironmentFile` permits the disabled deployment to start if the empty
-provider file is removed; an enabled organizer must have every required provider setting.
+Leave the file empty for the initial provider-disabled deployment. The leading `-` on
+`EnvironmentFile` permits that deployment to start if the empty provider file is removed. This
+reviewed revision does not authorize filling the file, changing `organizer.mode` to `dry-run`, or
+starting the seven-day trial. Those actions remain blocked by the rollout gate above; provider setup
+instructions must be supplied only by a later independently reviewed revision after both HIGH
+findings are fixed.
 
 ---
 
@@ -317,15 +325,22 @@ curl -i -X POST https://203-0-113-10.sslip.io/mcp \
 `200 ok` on `/healthz` and `401` + `WWW-Authenticate` on `/mcp` means TLS, the proxy, and the OAuth
 gate are all working. You're ready to connect Claude.
 
-If the owner configuration enables the organizer, verify the same OAuth/HTTPS path and the exact
-tool surface from the checked-out release before going public:
+For the Oracle `/opt/brain-mcp` deployment, run the authenticated verifier without
+`DEPLOY_EXPECT_ORGANIZER`. It must see exactly six tools while preserving the authenticated
+create/read/search round trip. The passphrase stays in its protected file and is not printed:
 
 ```bash
-SMOKE_EXPECT_ORGANIZER_TOOLS=1 npm run smoke:http
+sudo env DEPLOY_OWNER_PASSPHRASE_FILE=/root/brain-mcp-owner-passphrase.txt \
+  /usr/bin/node /opt/brain-mcp/scripts/verify-deployment.mjs \
+  https://203-0-113-10.sslip.io
 ```
 
-This must report exactly 13 tools. With no organizer configured (or with its mode set to
-`disabled`), the normal smoke test must report exactly the six knowledge tools.
+`DEPLOY_EXPECT_ORGANIZER=1` changes only the verifier's expected surface to exactly thirteen tools;
+it does not enable or approve the organizer. Do not set it while the current rollout gate is
+blocked. After both HIGH fixes and an independent re-review, it may be used only to verify an
+already approved provider-enabled deployment. In that mode the verifier calls only
+`get_vault_policy` and `audit_vault` from the organizer tool set; it never calls propose, apply,
+undo, or run operations. Its existing Inbox test note remains the sole verifier mutation.
 
 ---
 
@@ -368,6 +383,77 @@ change the Caddyfile.
 
 ## Brain organizer operations and recovery
 
+### Oracle provider-disabled checks
+
+Keep both gates disabled: `/etc/brain-organizer.env` must contain
+`ORGANIZER_PROVIDER=disabled`, and `/etc/brain-mcp-config.json` must retain
+`organizer.mode="disabled"`. These commands disclose no credential:
+
+```bash
+sudo grep -qx 'ORGANIZER_PROVIDER=disabled' /etc/brain-organizer.env
+sudo jq -e '.organizer.mode == "disabled"' /etc/brain-mcp-config.json >/dev/null
+sudo systemctl status brain-organizer.timer --no-pager
+sudo systemctl list-timers brain-organizer.timer --no-pager
+sudo -u brain env MCP_CONFIG_FILE=/etc/brain-mcp-config.json \
+  /usr/bin/node /opt/brain-mcp/dist/organizer-cli.js audit --vault brain
+```
+
+The installed timer fires daily from the `18:00 UTC` base time, with its reviewed five-minute
+random delay and persistent missed-run handling. A one-time provider-disabled service-path check is:
+
+```bash
+sudo systemctl start brain-organizer.service
+sudo systemctl status brain-organizer.service --no-pager
+```
+
+It must not call a provider or move a note, and it does not start the seven-day trial.
+`sudo systemctl edit --runtime brain-organizer.timer` is reserved for an approved trial schedule
+after the two HIGH fixes and independent re-review; do not run it or create a runtime override while
+the rollout gate is blocked. There is deliberately no command here to start, shorten, or bypass the
+trial. Even after the code is cleared, seven elapsed calendar days and explicit review are required
+before any separate `automatic` approval.
+
+### Emergency provider disable
+
+If a future independently approved trial has a problem, edit the protected file interactively and
+set `ORGANIZER_PROVIDER=disabled`. Do not copy or print any provider key. Restart only the process
+that consumes the environment; the timer can remain enabled because provider-disabled runs cannot
+organize notes.
+
+```bash
+sudoedit /etc/brain-organizer.env
+sudo grep -qx 'ORGANIZER_PROVIDER=disabled' /etc/brain-organizer.env
+sudo chown root:brain /etc/brain-organizer.env
+sudo chmod 0640 /etc/brain-organizer.env
+sudo systemctl restart brain-mcp
+sudo systemctl reset-failed brain-organizer.service
+sudo systemctl is-active brain-mcp brain-organizer.timer
+```
+
+### Guarded CLI undo
+
+Undo only a known transaction. Stop the timer, MCP writer, and Syncthing first so the backup and
+operator recovery cannot race another writer, then take a fresh backup. Replace the visibly fake
+identifier below with the exact retained transaction ID; never guess one. Audit before restarting
+services.
+
+```bash
+sudo systemctl stop brain-organizer.timer brain-mcp brain-syncthing
+sudo /usr/local/sbin/brain-mcp-backup
+sudo -u brain env MCP_CONFIG_FILE=/etc/brain-mcp-config.json \
+  /usr/bin/node /opt/brain-mcp/dist/organizer-cli.js undo --vault brain \
+  --transaction ORG-EXAMPLE-IDENTIFIER
+sudo -u brain env MCP_CONFIG_FILE=/etc/brain-mcp-config.json \
+  /usr/bin/node /opt/brain-mcp/dist/organizer-cli.js audit --vault brain
+sudo systemctl start brain-syncthing brain-mcp brain-organizer.timer
+```
+
+The CLI can perform this recovery with the provider disabled; it reads the non-secret config path
+explicitly instead of relying on a systemd-only `EnvironmentFile`.
+
+The behavior below documents the intended organizer design and recovery vocabulary only. It is not
+approval to expose or invoke organizer MCP tools while the current rollout gate is blocked.
+
 For every area, read `000_AI_WORK_GUIDE.md`, then `000_Home_MOC.md`, then the area's
 `99_작업가이드_다음AI용.md`, and finally that area's `000_*_MOC.md`. Do not apply a proposal before
 the root and area-specific rules have been reviewed.
@@ -391,7 +477,8 @@ under `<dataDir>/organizer-recovery/<transaction-id>/`, and audit actions are in
 the owner-controlled filesystem boundary: recovery never requires broader Vault access or another
 native dependency.
 
-To disable the organizer immediately:
+For the generic non-Oracle unit shown earlier in this document, hiding organizer tools also requires
+setting the source configuration's `organizer.mode` to `disabled`:
 
 1. Run `sudoedit /etc/obsidian-multivault-mcp.json` and set `organizer.mode` to `disabled` in the
    root-owned source configuration selected by the unit's `LoadCredential` line.
@@ -417,7 +504,7 @@ for diagnosis and exact undo; remove nothing recursively during incident respons
 | Startup reports `MCP_CONFIG_FILE` missing or the knowledge config is unreadable | Confirm `LoadCredential=knowledge-config.json:/etc/obsidian-multivault-mcp.json`, `Environment=MCP_CONFIG_FILE=%d/knowledge-config.json`, and source ownership/mode `root root 600`; then run `daemon-reload` and restart. |
 | Startup reports an unknown Vault or incomplete owner access | Fix `/etc/obsidian-multivault-mcp.json`: every `owner.allowedVaults` ID must exist in `vaults`, and the owner must be allowed every configured Vault. Restart to refresh the credential copy. |
 | A Vault write fails | `ProtectSystem=strict` may be blocking a configured root or `dataDir`; make the matching minimal `ReadWritePaths` correction without widening access elsewhere. |
-| Organizer tools fail while knowledge tools work | Keep `organizer.mode` disabled until `/etc/brain-organizer.env` contains all four required provider assignments and has `root root 600`; then enable `dry-run` and restart. |
+| Organizer tools appear or fail during the currently approved rollout | This release must expose six tools only. Restore both provider and organizer mode to `disabled`, restart, and run the default authenticated verifier. Provider setup and `dry-run` remain blocked until both HIGH fixes and independent re-review. |
 | `/healthz` 200 locally but 502 through Caddy | Caddy up but node down, or wrong upstream port → confirm `ExecStart` port matches the Caddyfile `reverse_proxy` port (8787). |
 | Want to revoke all sessions | Change `MCP_JWT_SECRET` in `/etc/obsidian-multivault-mcp.env`, then `sudo systemctl restart obsidian-multivault-mcp`. |
 
