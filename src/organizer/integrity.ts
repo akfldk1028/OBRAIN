@@ -81,6 +81,7 @@ type FailureKind = "changed" | "unreadable" | "unsafe";
 
 const START = "<!-- brain-auto:start note-index -->";
 const END = "<!-- brain-auto:end note-index -->";
+const ORGANIZER_REPORT_PREFIX = "60_Tools/61_Obsidian_MCP/90_Auto_Organizer_Reports/";
 const LIMIT_FINDING: IntegrityFinding = {
   code: "audit_limit_exceeded",
   category: "limit",
@@ -908,6 +909,7 @@ export async function auditVaultIntegrity(input: {
       if (
         !required.markdown.has(file.path)
         && !file.path.startsWith(`${input.policy.inbox}/`)
+        && !file.path.startsWith(ORGANIZER_REPORT_PREFIX)
         && !file.path.split("/").some((segment) => segment.startsWith("."))
         && !incoming.has(file.path)
       ) findings.add("orphan_note", "no_inbound_link", file.path);

@@ -189,6 +189,7 @@ export interface RecoveryCleanupInput {
 export interface OrganizerTransactionEngineOptions {
   recoveryRoot: string;
   store: OrganizerStore;
+  recoveryDays?: number;
   now?: () => string;
   onEvent?: (event: TransactionEvent) => void | Promise<void>;
 }
@@ -1707,10 +1708,18 @@ export class OrganizerTransactionEngine {
   private readonly options: OrganizerTransactionEngineOptions;
 
   constructor(options: OrganizerTransactionEngineOptions) {
-    if (!options || typeof options !== "object" || !(options.store instanceof OrganizerStore)) {
+    const recoveryDays = options?.recoveryDays ?? 30;
+    if (
+      !options
+      || typeof options !== "object"
+      || !(options.store instanceof OrganizerStore)
+      || !Number.isSafeInteger(recoveryDays)
+      || recoveryDays < 1
+      || recoveryDays > 365
+    ) {
       throw new TransactionValidationError("transaction engine options are invalid");
     }
-    this.options = options;
+    this.options = { ...options, recoveryDays };
   }
 
   public async publishCreateOnlyArtifact(plan: CreateOnlyVaultArtifactPlan): Promise<void> {
@@ -1984,7 +1993,7 @@ export class OrganizerTransactionEngine {
   public async cleanupRecovery(input: RecoveryCleanupInput): Promise<string[]> {
     if (!input?.backupVerified) throw new TransactionValidationError("verified backup is required before recovery cleanup");
     const now = timestampSchema.parse(input.now);
-    const cutoff = Date.parse(now) - 30 * 86_400_000;
+    const cutoff = Date.parse(now) - this.options.recoveryDays! * 86_400_000;
     const recoveryRoot = await ensureRecoveryRoot(this.options.recoveryRoot, this.options, { create: false });
     if (!recoveryRoot) return [];
     const entries = await readdir(recoveryRoot, { withFileTypes: true });

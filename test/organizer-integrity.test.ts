@@ -90,6 +90,16 @@ describe("Vault integrity auditor", () => {
     expect(await readFile(path.join(root, BRAIN_FOUNDATION_POLICY.homeMoc), "utf8")).toBe(before);
   });
 
+  it("does not classify fixed AI-managed organizer Markdown reports as orphan notes", async () => {
+    const root = await createValidVault();
+    const reportPath = "60_Tools/61_Obsidian_MCP/90_Auto_Organizer_Reports/RUN-synthetic.md";
+    await writeVaultFile(root, reportPath, "# Brain Organizer Run Report\n");
+
+    const report = await auditVaultIntegrity({ vault: "brain", root, policy: BRAIN_FOUNDATION_POLICY });
+
+    expect(report.findings).not.toContainEqual(expect.objectContaining({ code: "orphan_note", path: reportPath }));
+  });
+
   it("reports the documented foundation, link, marker, Canvas, depth, and orphan finding codes in UTF-8 path order", async () => {
     const root = await createValidVault();
     await rm(path.join(root, BRAIN_FOUNDATION_POLICY.rootGuide));

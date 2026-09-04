@@ -5,6 +5,7 @@ import { DashScopeProvider } from "../src/organizer/dashscope-provider.js";
 const context = {
   policyVersion: "1.0.0",
   approvedDirectories: ["20_Study/22_RL", "98_DK/98_Unsorted"],
+  policyContext: [{ kind: "root_guide" as const, path: "000_AI_WORK_GUIDE.md", summary: "Global policy." }],
   candidateNotes: ["20_Study/22_RL/MDP.md"],
   note: { path: "Agent-Inbox/new.md", content: "A note about reinforcement learning." },
 };

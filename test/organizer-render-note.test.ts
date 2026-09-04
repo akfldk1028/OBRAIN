@@ -1,3 +1,4 @@
+import matter from "gray-matter";
 import { describe, expect, it } from "vitest";
 import { renderOrganizedNote } from "../src/organizer/render-note.js";
 import type { StoredProposal } from "../src/organizer/types.js";
@@ -12,6 +13,7 @@ const proposal = (overrides: Partial<StoredProposal> = {}): StoredProposal => ({
   createdAt: "2026-09-02T00:00:00.000Z",
   expiresAt: "2026-09-04T00:00:00.000Z",
   status: "pending",
+  semanticStatus: "active",
   targetDirectory: "20_Study",
   title: "정리된 제목",
   type: "study",
@@ -45,10 +47,56 @@ describe("organized note rendering", () => {
 
     expect(rendered).toContain("source: lecture");
     expect(rendered).toContain("aliases:\n  - old name");
-    expect(rendered).toContain("organization:\n  managed: true\n  transaction_id: ORG-test\n  confidence: 0.96\n  organized_at: '2026-09-03T00:00:00.000Z'");
+    expect(rendered).toContain("organization:\n  managed: true\n  transaction_id: ORG-test\n  confidence: 0.96");
+    expect(rendered).toContain("organized_at: '2026-09-03T00:00:00.000Z'");
     expect(rendered).toContain("> [!abstract] 한눈에 보기");
     expect(rendered).toContain("## 원문\n\n# Raw title\n\n원래 문장입니다.\n");
     expect(rendered.endsWith("# Raw title\n\n원래 문장입니다.\n")).toBe(true);
+    const metadata = matter(rendered).data;
+    expect(metadata).toMatchObject({
+      source: "lecture",
+      id: expect.stringMatching(/^NOTE-[A-F0-9]{16}$/u),
+      type: "study",
+      area: "20_Study",
+      status: "active",
+      created: "2026-09-02",
+      updated: "2026-09-03",
+      parent_moc: "[[000_Study_MOC]]",
+      aliases: ["old name"],
+      organization: {
+        managed: true,
+        transaction_id: "ORG-test",
+        policy_version: "1.0.0",
+        source_path: "Agent-Inbox/raw.md",
+        source_hash: "a".repeat(64),
+      },
+    });
+    expect(metadata.tags).toEqual(["학습", "AI정리"]);
+  });
+
+  it("keeps note identity and creation date stable while semantic status remains separate from proposal lifecycle", () => {
+    const source = "---\ntags: [human]\n---\nbody\n";
+    const first = matter(renderOrganizedNote({
+      source,
+      proposal: proposal({ semanticStatus: "complete", status: "pending" }),
+      transactionId: "ORG-first",
+      now: "2026-09-03T00:00:00.000Z",
+      existingNotePaths: existingNotes,
+    })).data;
+    const second = matter(renderOrganizedNote({
+      source,
+      proposal: proposal({ semanticStatus: "complete", status: "pending" }),
+      transactionId: "ORG-second",
+      now: "2026-09-10T00:00:00.000Z",
+      existingNotePaths: existingNotes,
+    })).data;
+
+    expect(second.id).toBe(first.id);
+    expect(first.created).toBe("2026-09-02");
+    expect(second.created).toBe("2026-09-02");
+    expect(first.status).toBe("complete");
+    expect(second.updated).toBe("2026-09-10");
+    expect(first.tags).toEqual(["human", "학습", "AI정리"]);
   });
 
   it("renders sections in contract order and omits empty optional sections", () => {

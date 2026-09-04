@@ -65,36 +65,64 @@ function sameIdentity(left: BigStat, right: BigStat): boolean {
     && left.dev === right.dev && left.ino === right.ino;
 }
 
-async function supportsStableRuntimeIdentity(directory: string, lockName: string): Promise<boolean> {
-  const probePath = path.join(directory, `.${lockName}.${randomUUID()}.identity-probe`);
-  let handle: FileHandle | undefined;
-  let expected: BigStat | undefined;
-  try {
-    handle = await open(probePath, "wx", 0o600);
-    await handle.writeFile("identity-probe", "utf8");
-    await handle.sync();
-    const first = await handle.stat({ bigint: true });
-    const second = await handle.stat({ bigint: true });
-    if (!sameIdentity(first, second)) return false;
-    expected = second;
-  } catch {
-    return false;
-  } finally {
-    await handle?.close().catch(() => undefined);
-  }
-
+async function cleanupIdentityProbe(probePath: string): Promise<boolean> {
   try {
     const before = await lstat(probePath, { bigint: true });
     const canonical = await realpath(probePath);
     const after = await lstat(probePath, { bigint: true });
-    const canonicalStat = await lstat(canonical, { bigint: true });
-    if (canonical !== probePath || !before.isFile() || !after.isFile() || !canonicalStat.isFile()
-      || !sameIdentity(expected!, before) || !sameIdentity(expected!, after) || !sameIdentity(expected!, canonicalStat)) return false;
+    const resolved = await lstat(canonical, { bigint: true });
+    const sameObservedIdentity = (left: BigStat, right: BigStat) => left.dev === right.dev && left.ino === right.ino;
+    if (
+      canonical !== probePath
+      || before.isSymbolicLink()
+      || !before.isFile()
+      || !after.isFile()
+      || !resolved.isFile()
+      || !sameObservedIdentity(before, after)
+      || !sameObservedIdentity(before, resolved)
+    ) return false;
     await unlink(probePath);
     return true;
-  } catch {
-    return false;
+  } catch (error: unknown) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT";
   }
+}
+
+async function supportsStableRuntimeIdentity(directory: string, lockName: string): Promise<boolean> {
+  const probePath = path.join(directory, `.${lockName}.${randomUUID()}.identity-probe`);
+  let handle: FileHandle | undefined;
+  let expected: BigStat | undefined;
+  let created = false;
+  let supported = false;
+  try {
+    handle = await open(probePath, "wx", 0o600);
+    created = true;
+    await handle.writeFile("identity-probe", "utf8");
+    await handle.sync();
+    const first = await handle.stat({ bigint: true });
+    const second = await handle.stat({ bigint: true });
+    expected = second;
+    supported = sameIdentity(first, second);
+  } catch {
+    supported = false;
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+
+  if (supported && expected) {
+    try {
+      const before = await lstat(probePath, { bigint: true });
+      const canonical = await realpath(probePath);
+      const after = await lstat(probePath, { bigint: true });
+      const canonicalStat = await lstat(canonical, { bigint: true });
+      supported = canonical === probePath && before.isFile() && after.isFile() && canonicalStat.isFile()
+        && sameIdentity(expected, before) && sameIdentity(expected, after) && sameIdentity(expected, canonicalStat);
+    } catch {
+      supported = false;
+    }
+  }
+  if (created && !(await cleanupIdentityProbe(probePath))) supported = false;
+  return supported;
 }
 
 async function legacyGuardBlocks(

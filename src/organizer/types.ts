@@ -38,6 +38,9 @@ export interface StoredProposal extends Omit<ProposalDraft, "status"> {
   policyVersion: string;
   createdAt: string;
   expiresAt: string;
+  /** Provider-authored note semantics; absent only on pre-migration persisted proposals. */
+  semanticStatus?: ProposalDraft["status"];
+  /** Local proposal lifecycle, never rendered as note semantics. */
   status: "pending" | "applied" | "stale" | "rejected";
 }
 

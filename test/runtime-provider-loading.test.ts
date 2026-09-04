@@ -1,4 +1,4 @@
-import { writeFile } from "node:fs/promises";
+import { lstat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
@@ -27,6 +27,9 @@ describe("runtime provider loading", () => {
       const runtime = await assembleRuntime({ configFile, environment: { ORGANIZER_PROVIDER: "dashscope" } });
       await runtime.close();
       expect(providerModule.loads).toBe(0);
+      expect((await lstat(path.join(fx.root, "data", "organizer", "organizer.sqlite"))).isFile()).toBe(true);
+      expect((await lstat(path.join(fx.root, "data", "organizer", "transactions"))).isDirectory()).toBe(true);
+      await expect(lstat(path.join(fx.root, "data", "organizer.sqlite"))).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       await fx.cleanup();
     }

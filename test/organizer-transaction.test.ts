@@ -75,6 +75,7 @@ async function fixture(): Promise<Fixture> {
     createdAt: "2026-09-03T00:00:00.000Z",
     expiresAt: "2026-09-04T00:00:00.000Z",
     status: "pending",
+    semanticStatus: "active",
     targetDirectory: "20_Study/22_RL",
     title: "Organized",
     type: "study",
@@ -131,6 +132,7 @@ function engine(
     store: options.store ?? input.store,
     now: options.now ?? (() => "2026-09-03T01:00:00.000Z"),
     onEvent: options.onEvent,
+    recoveryDays: options.recoveryDays,
   });
 }
 
@@ -960,6 +962,20 @@ describe("organizer transaction engine", () => {
     expect(await engine(input).cleanupRecovery({ now: "2026-10-04T01:00:00.000Z", backupVerified: true }))
       .toEqual([input.plan.id]);
     await expect(lstat(directory)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("uses the configured recovery retention and still requires an independently verified backup", async () => {
+    const input = await fixture();
+    await engine(input).apply(input.plan);
+    await engine(input).recover();
+    const directory = path.join(input.recovery, input.plan.id);
+    const configured = engine(input, { recoveryDays: 7 });
+
+    await expect(configured.cleanupRecovery({ now: "2026-09-11T01:00:00.000Z", backupVerified: false }))
+      .rejects.toThrow(/backup/i);
+    expect((await lstat(directory)).isDirectory()).toBe(true);
+    expect(await configured.cleanupRecovery({ now: "2026-09-11T01:00:00.000Z", backupVerified: true }))
+      .toEqual([input.plan.id]);
   });
 
   it.each(["／", "＼"])("rejects a path component whose NFKC form introduces a separator: %s", async (separator) => {

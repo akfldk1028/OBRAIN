@@ -90,7 +90,9 @@ describe("organizer lock", () => {
 
     await expect(acquireOrganizerLock({ path: file, maxRunDurationMs: 1, isProcessAlive: () => false })).resolves.toBeUndefined();
     if (kind === "stale") expect(await readFile(file, "utf8")).toBe(stale);
-    expect((await readdir(path.dirname(file))).filter((name) => name === `${path.basename(file)}.coordinator.sqlite`)).toEqual([]);
+    expect((await readdir(path.dirname(file))).filter((name) => (
+      name === `${path.basename(file)}.coordinator.sqlite` || name.endsWith(".identity-probe")
+    ))).toEqual([]);
   });
 
   it("fails closed before fresh acquisition when runtime identity is zero", async () => {

@@ -6,6 +6,7 @@ import { IndexCoordinator } from "./index-coordinator.js";
 import { KnowledgeBase } from "./knowledge-base.js";
 import { loadOrganizerEnvironment } from "./organizer/config.js";
 import { OrganizerService } from "./organizer/service.js";
+import { prepareOrganizerStatePaths } from "./organizer/state-paths.js";
 import { OrganizerStore } from "./organizer/store.js";
 import { OrganizerTransactionEngine } from "./organizer/transaction.js";
 import type { OrganizerServiceApi } from "./organizer/types.js";
@@ -16,6 +17,22 @@ export interface BrainRuntime {
   knowledge: KnowledgeBase;
   organizer?: OrganizerService;
   close(): Promise<void>;
+}
+
+export async function cleanupFailedRuntimeConstruction(
+  primaryError: unknown,
+  resources: {
+    store?: Pick<OrganizerStore, "close">;
+    knowledge?: Pick<KnowledgeBase, "close">;
+  },
+): Promise<never> {
+  const errors: unknown[] = [primaryError];
+  try { resources.store?.close(); }
+  catch (error) { errors.push(error); }
+  try { await resources.knowledge?.close(); }
+  catch (error) { errors.push(error); }
+  if (errors.length > 1) throw new AggregateError(errors, "runtime construction cleanup failed");
+  throw primaryError;
 }
 
 export async function assembleKnowledge(
@@ -62,8 +79,8 @@ export async function assembleRuntime(input: {
     const environment = loaded.organizer.mode === "disabled"
       ? { provider: "disabled" as const }
       : loadOrganizerEnvironment(input.environment);
-    await mkdir(loaded.dataDir, { recursive: true, mode: 0o700 });
-    store = new OrganizerStore(path.join(loaded.dataDir, "organizer.sqlite"));
+    const state = await prepareOrganizerStatePaths(loaded.dataDir);
+    store = new OrganizerStore(state.database);
     const organizer = new OrganizerService({
       registry: loaded.registry,
       config: loaded.organizer,
@@ -76,10 +93,11 @@ export async function assembleRuntime(input: {
         : undefined,
       transaction: new OrganizerTransactionEngine({
         store,
-        recoveryRoot: path.join(loaded.dataDir, "organizer-recovery"),
+        recoveryRoot: state.recovery,
+        recoveryDays: loaded.organizer.recoveryDays,
       }),
       auditLogger: new AuditLogger(path.join(loaded.dataDir, "audit.jsonl")),
-      lockPath: path.join(loaded.dataDir, "organizer.lock"),
+      lockPath: state.lock,
     });
     const attachedKnowledge = await assembleKnowledge(
       loaded.dataDir,
@@ -102,8 +120,6 @@ export async function assembleRuntime(input: {
       },
     };
   } catch (error) {
-    store?.close();
-    await knowledge?.close();
-    throw error;
+    return cleanupFailedRuntimeConstruction(error, { store, knowledge });
   }
 }

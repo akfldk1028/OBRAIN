@@ -60,4 +60,28 @@ describe("sensitive-content guard", () => {
     ].join("\n");
     expect(detectSensitiveContent(text)).toEqual([]);
   });
+
+  it.each([
+    ["AKIAIOSFODNN7EXAMPLE", "aws_access_key"],
+    [`ghp_${"a".repeat(36)}`, "github_token"],
+    [`github_pat_${"a".repeat(44)}`, "github_token"],
+    ["eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJzeW50aGV0aWMifQ.c3ludGhldGljLXNpZ25hdHVyZQ", "jwt"],
+    ["900101-1234568", "personal_identifier"],
+    ["4111 1111 1111 1111", "personal_identifier"],
+  ] as const)("detects the synthetic high-signal value shape as %s without retaining it", (content, kind) => {
+    const findings = detectSensitiveContent(content);
+    expect(findings).toEqual([{ kind, line: 1 }]);
+    expect(JSON.stringify(findings)).not.toContain(content);
+  });
+
+  it.each([
+    "AKIAIOSFODNN7EXAMPL",
+    `ghp_${"a".repeat(35)}`,
+    "eyJhbGciOiJIUzI1NiJ9.not-json.c2lnbmF0dXJl",
+    "900101-1234567",
+    "4111 1111 1111 1112",
+    "Release 2026.09.04 build 1234567890123456",
+  ])("does not flag the false-positive boundary %s", (content) => {
+    expect(detectSensitiveContent(content)).toEqual([]);
+  });
 });

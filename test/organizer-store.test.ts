@@ -25,6 +25,7 @@ function proposal(id = "PRP-20260903-001"): StoredProposal {
     createdAt: "2026-09-03T00:00:00.000Z",
     expiresAt: "2026-09-04T00:00:00.000Z",
     status: "pending",
+    semanticStatus: "active",
     targetDirectory: "20_Study/22_RL",
     title: "Markov decision processes",
     type: "study",
@@ -114,6 +115,31 @@ describe("OrganizerStore", () => {
     expect(() => store.markUndone(applied.id, "2026-09-03T03:00:00.000Z")).toThrow("transaction already undone");
     expect(() => store.recordTransaction({ ...applied, id: "ORG-20260903-002" })).toThrow("transaction already exists");
     store.close();
+  });
+
+  it("claims and persists one explicit disposition per exact source decision", async () => {
+    const store = new OrganizerStore(await databaseFile());
+    try {
+      const stored = proposal();
+      const key = {
+        vault: stored.vault,
+        sourcePath: stored.sourcePath,
+        sourceHash: stored.sourceHash,
+        policyVersion: stored.policyVersion,
+      };
+
+      expect(store.claimSourceDecision({ ...key, proposalId: stored.id, decidedAt: stored.createdAt }).claimed).toBe(true);
+      expect(store.claimSourceDecision({ ...key, proposalId: "PRP-other-source-decision", decidedAt: stored.createdAt }).claimed).toBe(false);
+      store.saveProposalForDecision(stored, "review");
+      expect(store.getSourceDecision(key)).toMatchObject({ proposalId: stored.id, disposition: "review" });
+
+      store.applyProposalWithTransaction(transaction(stored.id));
+      expect(store.getSourceDecision(key)?.disposition).toBe("applied");
+      store.markUndone("ORG-20260903-001", "2026-09-03T02:00:00.000Z");
+      expect(store.getSourceDecision(key)?.disposition).toBe("undone");
+    } finally {
+      store.close();
+    }
   });
 
   it("rolls back both proposal and transaction when atomic application cannot insert", async () => {
@@ -231,6 +257,17 @@ describe("OrganizerStore", () => {
     });
     expect(reopened.getOrStartTrial("2026-09-09T00:00:00.000Z").active).toBe(false);
     reopened.close();
+  });
+
+  it("can inspect trial state without starting the seven-day clock", async () => {
+    const store = new OrganizerStore(await databaseFile());
+    try {
+      expect(store.getTrial("2026-09-03T00:00:00.000Z")).toBeUndefined();
+      store.getOrStartTrial("2026-09-03T00:00:00.000Z");
+      expect(store.getTrial("2026-09-04T00:00:00.000Z")).toMatchObject({ active: true });
+    } finally {
+      store.close();
+    }
   });
 
   it("rejects an incompatible partial organizer schema at open", async () => {

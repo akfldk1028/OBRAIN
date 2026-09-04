@@ -16,6 +16,8 @@ export interface InboxCandidate {
   hash: string;
   size: number;
   mtimeMs: number;
+  /** Exact UTF-8 text read through the verified, byte-capped file handle. */
+  content: string;
 }
 
 function isOutside(root: string, candidate: string): boolean {
@@ -224,6 +226,7 @@ export async function scanStableInbox(input: {
   minStableSeconds: number;
   nowMs?: number;
   maxBytes?: number;
+  state?: "ready" | "review";
 }): Promise<InboxCandidate[]> {
   const { nowMs, maxBytes } = validateInput(input);
   const suppliedRootStat = await lstat(input.root, { bigint: true });
@@ -245,6 +248,25 @@ export async function scanStableInbox(input: {
   const inbox = await resolveBoundDirectory(inboxPath, inboxStat, "scanner Inbox", root);
   if (isOutside(root.canonicalPath, inbox.canonicalPath)) {
     throw new Error("scanner Inbox escaped the vault root");
+  }
+
+  let scanBase = inbox;
+  let scanRelative: string = BRAIN_FOUNDATION_POLICY.inbox;
+  let scanLineage: readonly BoundDirectory[] = [root, inbox];
+  if (input.state === "review") {
+    const reviewPath = path.join(inbox.canonicalPath, REVIEW_DIRECTORY);
+    let reviewStat: BigIntStats;
+    try {
+      reviewStat = await lstat(reviewPath, { bigint: true });
+    } catch (error: unknown) {
+      if (isGone(error)) return [];
+      throw error;
+    }
+    const review = await resolveBoundDirectory(reviewPath, reviewStat, "scanner review directory", inbox);
+    if (isOutside(inbox.canonicalPath, review.canonicalPath)) throw new Error("scanner review directory escaped the Inbox");
+    scanBase = review;
+    scanRelative = `${BRAIN_FOUNDATION_POLICY.inbox}/${REVIEW_DIRECTORY}`;
+    scanLineage = [root, inbox, review];
   }
 
   const discovered: DiscoveredFile[] = [];
@@ -296,7 +318,7 @@ export async function scanStableInbox(input: {
         }
         if (
           isOutside(root.canonicalPath, child.canonicalPath)
-          || isOutside(inbox.canonicalPath, child.canonicalPath)
+          || isOutside(scanBase.canonicalPath, child.canonicalPath)
         ) {
           continue;
         }
@@ -325,7 +347,7 @@ export async function scanStableInbox(input: {
       if (
         !isStrictlyInside(directory.canonicalPath, canonicalFile)
         || isOutside(root.canonicalPath, canonicalFile)
-        || isOutside(inbox.canonicalPath, canonicalFile)
+        || isOutside(scanBase.canonicalPath, canonicalFile)
       ) {
         continue;
       }
@@ -340,8 +362,8 @@ export async function scanStableInbox(input: {
     }
   };
 
-  const rootInboxLineage = [root, inbox] as const;
-  await walk(inbox, BRAIN_FOUNDATION_POLICY.inbox, rootInboxLineage);
+  const rootInboxLineage = scanLineage;
+  await walk(scanBase, scanRelative, rootInboxLineage);
   const inventory = new Map<string, string>();
   for (const file of discovered) {
     const key = collisionKey(file.sourcePath);
@@ -393,7 +415,7 @@ export async function scanStableInbox(input: {
         || !sameSnapshot(file.stat, finalBoundPath.after)
         || !sameSnapshot(file.stat, finalBoundPath.resolved)
         || isOutside(root.canonicalPath, finalBoundPath.canonicalPath)
-        || isOutside(inbox.canonicalPath, finalBoundPath.canonicalPath)
+        || isOutside(scanBase.canonicalPath, finalBoundPath.canonicalPath)
       ) {
         continue;
       }
@@ -413,6 +435,7 @@ export async function scanStableInbox(input: {
           hash: createHash("sha256").update(content).digest("hex"),
           size: Number(file.stat.size),
           mtimeMs,
+          content: decodeExactUtf8(content),
         },
       });
     } finally {
@@ -434,4 +457,12 @@ export async function scanStableInbox(input: {
   return finalCandidates.sort((left, right) => (
     left.path < right.path ? -1 : left.path > right.path ? 1 : 0
   ));
+}
+
+function decodeExactUtf8(content: Buffer): string {
+  const decoded = content.toString("utf8");
+  if (!Buffer.from(decoded, "utf8").equals(content)) {
+    throw new Error("scanner source is not valid UTF-8");
+  }
+  return decoded;
 }

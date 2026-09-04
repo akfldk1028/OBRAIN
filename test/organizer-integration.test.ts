@@ -122,7 +122,14 @@ describe("Brain organizer complete local story", () => {
       await knowledge.initialize();
 
       const policy = await knowledge.getPolicy("brain");
-      expect(policy.readingOrder).toEqual(["Agent-Inbox", ...BRAIN_FOUNDATION_POLICY.areas.map((area) => area.directory)]);
+      expect(policy.readingOrder).toEqual([
+        BRAIN_FOUNDATION_POLICY.rootGuide,
+        BRAIN_FOUNDATION_POLICY.homeMoc,
+        "<destination-area>/99_작업가이드_다음AI용.md",
+        "<destination-area>/000_<Area>_MOC.md",
+        "<target-note>",
+        "<relevant-linked-notes>",
+      ]);
 
       const dryRun = await organizer.runToCompletion({ vault: "brain", requestedMode: "automatic" });
       expect(dryRun).toMatchObject({
@@ -135,7 +142,7 @@ describe("Brain organizer complete local story", () => {
       clock = AFTER_TRIAL;
       const automatic = await organizer.runToCompletion({ vault: "brain", requestedMode: "automatic" });
       expect(automatic).toMatchObject({
-        mode: "automatic", discovered: 4, proposed: 3, applied: 1, review: 1, skipped: 2, failed: 0, status: "complete",
+        mode: "automatic", discovered: 4, proposed: 1, applied: 1, review: 1, skipped: 2, failed: 0, status: "complete",
       });
 
       const targetDirectory = path.join(vaultRoot, "20_Study", "22_RL");
@@ -148,7 +155,7 @@ describe("Brain organizer complete local story", () => {
       for (const key of ["medium", "low", "secret", "conflict"] as const) {
         await expect(readFile(path.join(vaultRoot, ...inboxPaths[key].split("/")), "utf8")).resolves.toBe(sources[key]);
       }
-      expect(provider.received).toHaveLength(6);
+      expect(provider.received).toHaveLength(4);
       expect(provider.received).not.toContain(sources.secret);
       expect(provider.received).not.toContain(sources.conflict);
 

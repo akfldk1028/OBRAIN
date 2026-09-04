@@ -178,7 +178,7 @@ Assert `install.sh`:
 - creates `/etc/brain-organizer.env` from the disabled example only if absent;
 - sets owner `root:brain` and mode `0640`;
 - enables the timer without starting an organizer run;
-- adds `organizer.enabledVaults=["brain"]`, `mode="dry-run"`, threshold `0.9`, stable seconds `300`,
+- adds `organizer.enabledVaults=["brain"]`, `mode="disabled"`, threshold `0.9`, stable seconds `300`,
   maximum notes `20`, recovery days `30`, and the exact reports directory to MCP config.
 
 Assert `backup.sh` creates `organizer-state.tgz` from `/srv/brain/data/organizer` when present and never
@@ -208,7 +208,9 @@ install -o root -g root -m 0644 deploy/brain-organizer.timer /etc/systemd/system
 
 Add the complete non-secret organizer object through `jq`, preserving the existing owner passphrase
 handling. Trial time is not stored in root configuration: the organizer SQLite store records
-`trial_started_at` on the first provider-enabled run. Enable `brain-organizer.timer` but do not call
+`trial_started_at` on the first provider-enabled run. The installed config must remain
+`mode="disabled"`; Task 6 performs the first protected transition to `dry-run`. Enable
+`brain-organizer.timer` but do not call
 `systemctl start brain-organizer.service` from the installer.
 
 - [ ] **Step 4: Back up recovery state separately**
@@ -439,15 +441,20 @@ systemctl is-active brain-mcp brain-syncthing caddy brain-mcp-backup.timer brain
 systemctl is-enabled brain-mcp brain-syncthing caddy brain-mcp-backup.timer brain-organizer.timer
 systemctl list-timers brain-organizer.timer --no-pager
 curl -fsS http://127.0.0.1:8787/healthz
+# Run the authenticated verifier without DEPLOY_EXPECT_ORGANIZER.
+# It must assert the exact six-tool disabled surface.
+node /opt/brain-mcp/current/scripts/verify-deployment.mjs
 ```
 
 Expected: all units active/enabled as appropriate, next organizer time is about 18:00 UTC, health is
-`ok`, and no organizer run starts during installation.
+`ok`, the authenticated MCP surface contains exactly six tools, and no organizer run starts during
+installation. Stop before provider activation if any organizer tool is registered.
 
 ### Task 6: Secure Provider Activation and Real Dry-Run Smoke
 
 **Files:**
-- Modify remotely: `/etc/brain-organizer.env` only through a root-owned protected write
+- Modify remotely: `/etc/brain-organizer.env` and `/etc/brain-mcp-config.json` only through one
+  root-owned protected activation transaction
 - Create in Vault: one harmless public MCP test note and one dry-run report
 - No Git source changes
 
@@ -464,16 +471,22 @@ region. Never paste the new value into chat or a Vault note.
 
 - [ ] **Step 2: Enter the new value through a hidden interactive remote prompt**
 
-Open an interactive SSH terminal and run a root script that uses `read -rsp` so the value is not
-echoed or placed in shell history. The script writes a temporary file with `umask 077`, includes
-`ORGANIZER_PROVIDER=dashscope`, the correct official base URL, the selected model, and a
-`DASHSCOPE_API_KEY` value entered by the hidden prompt, then atomically installs it as
-`root:brain` mode `0640`. Remove the temporary file in the same shell. Do not use a command-line
-argument or clipboard-visible transcript for the key.
+Open an interactive SSH terminal and run one root activation script that uses `read -rsp` so the
+value is not echoed or placed in shell history. With `umask 077`, stage both (a) a provider
+environment containing `ORGANIZER_PROVIDER=dashscope`, the correct official base URL, selected
+model, and hidden `DASHSCOPE_API_KEY`, and (b) a validated config copy whose only activation change
+is `organizer.mode="dry-run"`. Verify the live config is still `disabled`, validate both staged
+files, retain private same-filesystem rollback copies, and atomically rename the staged files into
+`/etc/brain-organizer.env` and `/etc/brain-mcp-config.json` inside one trap-guarded critical section.
+Restore both prior files if either replacement, permission change, restart, health check, or tool
+count verification fails. Install the final files as `root:brain` mode `0640` and `brain:brain` mode
+`0600`, respectively, preserving the service account's existing config ownership. Remove staged and
+rollback files in the same shell only after success. Do not
+use a command-line argument or clipboard-visible transcript for the key.
 
 - [ ] **Step 3: Restart only the processes that read the environment**
 
-Run:
+Only after both protected files are installed, run:
 
 ```bash
 systemctl restart brain-mcp
@@ -513,7 +526,8 @@ redacted journal output. Confirm:
 - [ ] **Step 6: Run public and backup verification**
 
 Set `DEPLOY_EXPECT_ORGANIZER=1` and run the authenticated deployment verifier from the server without
-displaying the passphrase. Then create a new backup, verify `vaults.tgz`, `organizer-state.tgz`, and
+displaying the passphrase; it must assert the exact thirteen-tool provider-enabled surface. Then
+create a new backup, verify `vaults.tgz`, `organizer-state.tgz`, and
 `config.json` are readable, and confirm the protected provider environment is absent from the backup.
 
 - [ ] **Step 7: Reboot and verify recovery**

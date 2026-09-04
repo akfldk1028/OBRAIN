@@ -141,8 +141,23 @@ describe("stable Inbox scanner", () => {
       hash: "0b5d111515d1635b87bcda6a27190572a6d8c6bb7452215c3f1c61c9fed940c7",
       size: 11,
       mtimeMs: expectedStat.mtimeMs,
+      content: "stable body",
     }]);
     expect(readProbe.paths).toEqual([]);
+  });
+
+  it("lists only bounded Markdown beneath the review directory when requested", async () => {
+    const root = await makeVault();
+    const review = path.join(root, "Agent-Inbox", "검토필요");
+    await writeAgedFile(path.join(root, "Agent-Inbox", "ready.md"), "ready", 600);
+    await writeAgedFile(path.join(review, "review.md"), "review", 600);
+    await writeAgedFile(path.join(review, "oversized.md"), "1234567", 600);
+
+    const candidates = await scanStableInbox({ root, minStableSeconds: 300, nowMs, maxBytes: 6, state: "review" });
+
+    expect(candidates.map((candidate) => ({ path: candidate.path, content: candidate.content }))).toEqual([
+      { path: "Agent-Inbox/검토필요/review.md", content: "review" },
+    ]);
   });
 
   it("preserves exact on-disk Unicode spelling in candidate paths", async () => {
@@ -205,6 +220,7 @@ describe("stable Inbox scanner", () => {
 
     expect(candidates.map((candidate) => candidate.path)).toEqual(["Agent-Inbox/exact.md"]);
     expect(candidates[0]?.hash).toBe("61be55a8e2f6b4e172338bddf184d6dbee29c98853e0a0485ecee7f27b9af0b4");
+    expect(candidates[0]?.content).toBe("aaaa");
     expect(readProbe.paths).not.toContain(oversized);
   });
 

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import matter from "gray-matter";
 import { z } from "zod";
 import { BRAIN_FOUNDATION_POLICY, areaMocPath } from "../foundation/policy.js";
@@ -95,6 +96,48 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return prototype === null || prototype === Object.prototype;
 }
 
+function canonicalDate(value: string, field: string): string {
+  if (!Number.isFinite(Date.parse(value))) throw new Error(`proposal ${field} timestamp is invalid`);
+  return value.slice(0, 10);
+}
+
+function priorDate(value: unknown, fallback: string): string {
+  if (value === undefined) return fallback;
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/u.test(value) || !Number.isFinite(Date.parse(`${value}T00:00:00.000Z`))) {
+    throw new Error("existing created metadata is invalid");
+  }
+  return value;
+}
+
+function metadataList(value: unknown, field: string, maxItems: number): string[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > maxItems || value.some((item) => (
+    typeof item !== "string" || !item.trim() || Buffer.byteLength(item, "utf8") > 200
+  ))) throw new Error(`existing ${field} metadata is invalid`);
+  return value as string[];
+}
+
+function uniqueMetadata(values: string[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const value of values) {
+    const key = value.normalize("NFKC").toLocaleLowerCase("en-US");
+    if (!seen.has(key)) {
+      seen.add(key);
+      result.push(value);
+    }
+  }
+  return result;
+}
+
+function stableNoteId(proposal: StoredProposal, prior: unknown): string {
+  if (prior !== undefined) {
+    if (typeof prior !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u.test(prior)) throw new Error("existing note id is invalid");
+    return prior;
+  }
+  return `NOTE-${createHash("sha256").update(`${proposal.vault}\0${proposal.sourcePath}`, "utf8").digest("hex").slice(0, 16).toUpperCase()}`;
+}
+
 export function renderOrganizedNote(input: {
   source: string;
   proposal: StoredProposal;
@@ -124,17 +167,38 @@ export function renderOrganizedNote(input: {
   if (!existing.has(parentPath)) throw new Error(`parent MOC does not exist: ${parentPath}`);
 
   const parsed = matter(input.source);
+  if (!isPlainRecord(parsed.data)) throw new Error("existing frontmatter is malformed");
   const priorOrganization = parsed.data.organization;
   if (priorOrganization !== undefined && !isPlainRecord(priorOrganization)) {
     throw new Error("existing organization frontmatter is malformed");
   }
+  if (!input.proposal.semanticStatus) throw new Error("proposal semantic status is missing");
+  const created = priorDate(parsed.data.created, canonicalDate(input.proposal.createdAt, "created"));
+  const tags = uniqueMetadata([
+    ...metadataList(parsed.data.tags, "tags", 128),
+    ...input.proposal.tags.map((tag) => assertProviderText(tag, 50, "tag")),
+    "AI정리",
+  ]);
+  const aliases = metadataList(parsed.data.aliases, "aliases", 128);
   const data = {
     ...parsed.data,
+    id: stableNoteId(input.proposal, parsed.data.id),
+    type: input.proposal.type,
+    area: destinationArea,
+    status: input.proposal.semanticStatus,
+    created,
+    updated: canonicalDate(input.now, "updated"),
+    parent_moc: `[[${parentPath.split("/").at(-1)!.slice(0, -3)}]]`,
+    tags,
+    aliases,
     organization: {
       ...(priorOrganization ?? {}),
       managed: true,
       transaction_id: input.transactionId,
       confidence: input.proposal.confidence,
+      policy_version: input.proposal.policyVersion,
+      source_path: input.proposal.sourcePath,
+      source_hash: input.proposal.sourceHash,
       organized_at: input.now,
     },
   };
