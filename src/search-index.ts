@@ -20,6 +20,32 @@ interface SearchRow {
   score: number;
 }
 
+export type NoteChange = {
+  seq: number;
+  vault: string;
+  path: string;
+  operation: "upsert" | "delete";
+  contentHash?: string;
+  mtimeMs?: number;
+  size?: number;
+};
+
+export type NoteChangePage = {
+  changes: NoteChange[];
+  nextCursor: number;
+  hasMore: boolean;
+};
+
+interface ChangeRow {
+  seq: number;
+  vault_id: string;
+  path: string;
+  operation: "upsert" | "delete";
+  content_hash: string | null;
+  mtime_ms: number | null;
+  size: number | null;
+}
+
 export class SearchIndex {
   private readonly db: Database.Database;
 
@@ -65,6 +91,17 @@ export class SearchIndex {
           target TEXT NOT NULL,
           UNIQUE(source_id, target)
         );
+        CREATE TABLE IF NOT EXISTS note_changes (
+          seq INTEGER PRIMARY KEY AUTOINCREMENT,
+          vault_id TEXT NOT NULL,
+          path TEXT NOT NULL,
+          operation TEXT NOT NULL CHECK(operation IN ('upsert', 'delete')),
+          content_hash TEXT,
+          mtime_ms REAL,
+          size INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS note_changes_vault_seq
+          ON note_changes(vault_id, seq);
         CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
           title,
           body,
@@ -88,6 +125,16 @@ export class SearchIndex {
           VALUES(new.id,new.title,new.body,new.tags_json);
         END;
       `);
+      this.db.prepare(`
+        INSERT INTO note_changes(vault_id,path,operation,content_hash,mtime_ms,size)
+        SELECT n.vault_id,n.path,'upsert',n.content_hash,n.mtime_ms,n.size
+        FROM notes n
+        WHERE NOT EXISTS (
+          SELECT 1 FROM note_changes c
+          WHERE c.vault_id=n.vault_id AND c.path=n.path
+        )
+        ORDER BY n.id
+      `).run();
     } catch (error) {
       this.db.close();
       throw error;
@@ -96,6 +143,21 @@ export class SearchIndex {
 
   upsert(note: ParsedNote): void {
     this.db.transaction(() => {
+      const existing = this.db.prepare(`
+        SELECT content_hash,mtime_ms,size
+        FROM notes
+        WHERE vault_id=? AND path=?
+      `).get(note.vaultId, note.path) as {
+        content_hash: string;
+        mtime_ms: number;
+        size: number;
+      } | undefined;
+      if (
+        existing?.content_hash === note.contentHash
+        && existing.mtime_ms === note.mtimeMs
+        && existing.size === note.size
+      ) return;
+
       const row = this.db.prepare(`
         INSERT INTO notes(
           vault_id,path,title,body,excerpt,frontmatter_json,tags_json,mtime_ms,size,content_hash
@@ -128,23 +190,80 @@ export class SearchIndex {
         "INSERT OR IGNORE INTO links(source_id,target) VALUES(?,?)",
       );
       for (const target of note.outgoingLinks) insertLink.run(row.id, target);
+      this.db.prepare(`
+        INSERT INTO note_changes(vault_id,path,operation,content_hash,mtime_ms,size)
+        VALUES(?,?,'upsert',?,?,?)
+      `).run(note.vaultId, note.path, note.contentHash, note.mtimeMs, note.size);
     })();
   }
 
   remove(vaultId: string, relativePath: string): void {
-    this.db.prepare("DELETE FROM notes WHERE vault_id=? AND path=?")
-      .run(vaultId, relativePath);
+    this.db.transaction(() => {
+      const existing = this.db.prepare(
+        "SELECT 1 FROM notes WHERE vault_id=? AND path=?",
+      ).get(vaultId, relativePath);
+      if (!existing) return;
+      this.db.prepare(`
+        INSERT INTO note_changes(vault_id,path,operation)
+        VALUES(?,?,'delete')
+      `).run(vaultId, relativePath);
+      this.db.prepare("DELETE FROM notes WHERE vault_id=? AND path=?")
+        .run(vaultId, relativePath);
+    })();
   }
 
   removeMissing(vaultId: string, presentPaths: Set<string>): void {
     const rows = this.db.prepare("SELECT path FROM notes WHERE vault_id=?")
       .all(vaultId) as Array<{ path: string }>;
+    const record = this.db.prepare(`
+      INSERT INTO note_changes(vault_id,path,operation)
+      VALUES(?,?,'delete')
+    `);
     const remove = this.db.prepare("DELETE FROM notes WHERE vault_id=? AND path=?");
     this.db.transaction(() => {
       for (const row of rows) {
-        if (!presentPaths.has(row.path)) remove.run(vaultId, row.path);
+        if (!presentPaths.has(row.path)) {
+          record.run(vaultId, row.path);
+          remove.run(vaultId, row.path);
+        }
       }
     })();
+  }
+
+  listChanges(input: {
+    allowedVaults: string[];
+    after: number;
+    limit: number;
+  }): NoteChangePage {
+    const after = Math.max(0, Math.trunc(input.after));
+    const limit = Math.max(1, Math.min(200, Math.trunc(input.limit)));
+    if (input.allowedVaults.length === 0) {
+      return { changes: [], nextCursor: after, hasMore: false };
+    }
+    const vaultSlots = input.allowedVaults.map(() => "?").join(",");
+    const rows = this.db.prepare(`
+      SELECT seq,vault_id,path,operation,content_hash,mtime_ms,size
+      FROM note_changes
+      WHERE seq > ? AND vault_id IN (${vaultSlots})
+      ORDER BY seq
+      LIMIT ?
+    `).all(after, ...input.allowedVaults, limit + 1) as ChangeRow[];
+    const hasMore = rows.length > limit;
+    const visibleRows = hasMore ? rows.slice(0, limit) : rows;
+    const changes = visibleRows.map((row): NoteChange => ({
+      seq: row.seq,
+      vault: row.vault_id,
+      path: row.path,
+      operation: row.operation,
+      ...(row.content_hash == null ? {} : { contentHash: row.content_hash }),
+      ...(row.mtime_ms == null ? {} : { mtimeMs: row.mtime_ms }),
+      ...(row.size == null ? {} : { size: row.size }),
+    }));
+    return {
+      changes,
+      nextCursor: changes.at(-1)?.seq ?? after,
+      hasMore,
+    };
   }
 
   search(query: string, allowedVaults: string[], limit: number): IndexedSearchHit[] {
