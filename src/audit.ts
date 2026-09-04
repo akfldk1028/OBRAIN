@@ -1,8 +1,12 @@
 import { appendFile, mkdir } from "node:fs/promises";
 import path from "node:path";
 
+export type AuditAction =
+  | "create_inbox_note" | "organizer_propose" | "organizer_apply"
+  | "organizer_undo" | "organizer_run" | "organizer_audit";
+
 export interface AuditEvent {
-  action: "create_inbox_note";
+  action: AuditAction;
   outcome: "allowed" | "denied";
   vault: string;
   path?: string;

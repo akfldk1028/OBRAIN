@@ -22,3 +22,20 @@ it("records bounded metadata without note content or secrets", async () => {
     await fx.cleanup();
   }
 });
+
+it("records organizer actions with bounded reasons", async () => {
+  const fx = await makeTempVaultSet(["personal"]);
+  try {
+    const file = path.join(fx.root, "audit.jsonl");
+    await new AuditLogger(file).record({
+      action: "organizer_run",
+      outcome: "allowed",
+      vault: "personal",
+      reason: "x".repeat(250),
+    });
+    const line = await readFile(file, "utf8");
+    expect(JSON.parse(line).reason).toHaveLength(200);
+  } finally {
+    await fx.cleanup();
+  }
+});
