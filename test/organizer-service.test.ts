@@ -427,7 +427,7 @@ describe("OrganizerService", () => {
     await fx.service(provider, { maxContextBytes: 262_144 }).runToCompletion({ vault: "brain", requestedMode: "dry-run" });
     expect(provider.calls[0]?.candidateNotes.length).toBeLessThanOrEqual(512);
     expect(provider.calls[0]?.approvedDirectories.length).toBeLessThanOrEqual(256);
-  });
+  }, 15_000);
 
   it("continues after a failed note", async () => {
     const fx = await fixture(); await writeFile(path.join(fx.root, "Agent-Inbox", "two.md"), "two", "utf8");

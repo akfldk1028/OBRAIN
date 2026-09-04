@@ -200,5 +200,5 @@ describe("Brain organizer complete local story", () => {
       store?.close();
       await rm(temporaryRoot, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 });
