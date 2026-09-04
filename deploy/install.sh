@@ -2,6 +2,53 @@
 set -euo pipefail
 umask 077
 
+brain_organizer_json='{"enabledVaults":["brain"],"mode":"disabled","minStableSeconds":300,"autoApplyConfidence":0.9,"maxNotesPerRun":20,"maxNoteBytes":131072,"maxContextBytes":262144,"proposalTtlHours":24,"recoveryDays":30,"reportsDirectory":"60_Tools/61_Obsidian_MCP/90_Auto_Organizer_Reports"}'
+
+brain_render_config() {
+  local brain_config_file=$1
+  local brain_passphrase=$2
+  local brain_ids=$3
+  if [[ -f "$brain_config_file" ]]; then
+    jq \
+      --argjson organizer "$brain_organizer_json" \
+      '.organizer = $organizer' \
+      "$brain_config_file"
+  else
+    jq -n \
+      --arg passphrase "$brain_passphrase" \
+      --argjson ids "$brain_ids" \
+      --argjson organizer "$brain_organizer_json" \
+      '{
+        dataDir: "/srv/brain/data",
+        owner: {id: "owner", passphrase: $passphrase, allowedVaults: $ids},
+        vaults: [$ids[] | {id: ., root: ("/srv/brain/vaults/" + .)}],
+        organizer: $organizer
+      }'
+  fi
+}
+
+if [[ ${BRAIN_INSTALL_CONFIG_TEST_MODE:-} == 1 ]]; then
+  brain_install_test_root=${BRAIN_INSTALL_TEST_ROOT:-}
+  [[ ${NODE_ENV:-} == test && -d "$brain_install_test_root" \
+    && -f "$brain_install_test_root/.brain-install-config-test-root" ]] || {
+    echo "invalid installer config test root" >&2
+    exit 1
+  }
+  brain_install_test_root=$(cd -- "$brain_install_test_root" && pwd -P)
+  [[ "$brain_install_test_root" != / ]] || { echo "unsafe installer config test root" >&2; exit 1; }
+  brain_test_config="$brain_install_test_root/brain-mcp-config.json"
+  [[ -f "$brain_test_config" ]] || { echo "missing installer config test fixture" >&2; exit 1; }
+  brain_test_config_tmp=$(mktemp "$brain_install_test_root/brain-mcp-config.json.tmp.XXXXXX")
+  trap 'rm -f -- "$brain_test_config_tmp"' EXIT
+  brain_render_config "$brain_test_config" "unused-test-passphrase" '["brain"]' >"$brain_test_config_tmp"
+  mv -f -- "$brain_test_config_tmp" "$brain_test_config"
+  trap - EXIT
+  exit 0
+elif [[ -n ${BRAIN_INSTALL_CONFIG_TEST_MODE:-}${BRAIN_INSTALL_TEST_ROOT:-} ]]; then
+  echo "invalid installer config test mode" >&2
+  exit 1
+fi
+
 [[ $(id -u) -eq 0 ]] || { echo "run as root" >&2; exit 1; }
 : "${PUBLIC_HOST:?PUBLIC_HOST is required}"
 : "${RELEASE_DIR:?RELEASE_DIR is required}"
@@ -54,7 +101,7 @@ else
 fi
 
 install -d -o brain -g brain -m 0700 /srv/brain/data /srv/brain/backups /srv/brain/syncthing /srv/brain/vaults
-install -d -o brain -g brain -m 0700 /srv/brain/data/organizer /srv/brain/data/organizer/transactions
+install -d -o brain -g brain -m 0700 /srv/brain/data/organizer
 for brain_vault_id in "${brain_vault_ids[@]}"; do
   install -d -o brain -g brain -m 0700 \
     "/srv/brain/vaults/$brain_vault_id" \
@@ -99,26 +146,9 @@ fi
 chmod 600 /etc/brain-mcp.env
 
 brain_vault_json=$(printf '%s\n' "${brain_vault_ids[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')
-brain_organizer_json='{"enabledVaults":["brain"],"mode":"disabled","minStableSeconds":300,"autoApplyConfidence":0.9,"maxNotesPerRun":20,"maxNoteBytes":131072,"maxContextBytes":262144,"proposalTtlHours":24,"recoveryDays":30,"reportsDirectory":"60_Tools/61_Obsidian_MCP/90_Auto_Organizer_Reports"}'
 brain_config_tmp=$(mktemp /etc/brain-mcp-config.json.tmp.XXXXXX)
 trap 'rm -f -- "$brain_config_tmp"' EXIT
-if [[ -f /etc/brain-mcp-config.json ]]; then
-  jq \
-    --argjson organizer "$brain_organizer_json" \
-    '.organizer = $organizer' \
-    /etc/brain-mcp-config.json >"$brain_config_tmp"
-else
-  jq -n \
-    --arg passphrase "$brain_owner_passphrase" \
-    --argjson ids "$brain_vault_json" \
-    --argjson organizer "$brain_organizer_json" \
-    '{
-      dataDir: "/srv/brain/data",
-      owner: {id: "owner", passphrase: $passphrase, allowedVaults: $ids},
-      vaults: [$ids[] | {id: ., root: ("/srv/brain/vaults/" + .)}],
-      organizer: $organizer
-    }' >"$brain_config_tmp"
-fi
+brain_render_config /etc/brain-mcp-config.json "$brain_owner_passphrase" "$brain_vault_json" >"$brain_config_tmp"
 install -o brain -g brain -m 0600 "$brain_config_tmp" /etc/brain-mcp-config.json
 rm -f -- "$brain_config_tmp"
 trap - EXIT

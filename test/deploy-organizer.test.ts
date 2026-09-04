@@ -8,11 +8,13 @@ import {
   readdirSync,
   rmSync,
   statSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { prepareOrganizerStatePaths } from "../src/organizer/state-paths.js";
 
 const cleanupPaths: string[] = [];
 
@@ -73,6 +75,12 @@ function bashPath(filePath: string): string {
   return process.platform === "win32"
     ? filePath.replace(/^([A-Za-z]):/u, (_, drive: string) => `/${drive.toLowerCase()}`).replaceAll("\\", "/")
     : filePath;
+}
+
+function executable(name: string, contents: string, directory: string): void {
+  const filePath = join(directory, name);
+  writeFileSync(filePath, contents, "utf8");
+  chmodSync(filePath, 0o755);
 }
 
 function logicalShellLines(source: string): string[] {
@@ -244,8 +252,9 @@ describe("organizer deployment units", () => {
 
     expect(installCommands).toContainEqual([
       "install", "-d", "-o", "brain", "-g", "brain", "-m", "0700",
-      "/srv/brain/data/organizer", "/srv/brain/data/organizer/transactions",
+      "/srv/brain/data/organizer",
     ]);
+    expect(installCommands.some((tokens) => tokens.includes("/srv/brain/data/organizer/transactions"))).toBe(false);
     expect(installCommands).toContainEqual([
       "install", "-o", "root", "-g", "root", "-m", "0644",
       "deploy/brain-organizer.service", "/etc/systemd/system/",
@@ -268,6 +277,29 @@ describe("organizer deployment units", () => {
     ]);
   });
 
+  it("leaves the transaction target absent so runtime can migrate legacy recovery state", async () => {
+    const testTmp = resolve(".test-tmp");
+    mkdirSync(testTmp, { recursive: true });
+    const root = mkdtempSync(join(testTmp, "brain-organizer-legacy-install-"));
+    cleanupPaths.push(root);
+    const dataRoot = join(root, "srv/brain/data");
+    const legacyRecovery = join(dataRoot, "organizer-recovery");
+    mkdirSync(legacyRecovery, { recursive: true });
+    writeFileSync(join(legacyRecovery, "manifest.marker"), "legacy", "utf8");
+
+    const installCommands = commands(logicalShellLines(readFileSync("deploy/install.sh", "utf8")), "install");
+    const organizerInstall = installCommands.find((tokens) => tokens.includes("/srv/brain/data/organizer"));
+    expect(organizerInstall).toBeDefined();
+    for (const target of organizerInstall!.filter((token) => token.startsWith("/srv/brain/data/organizer"))) {
+      mkdirSync(join(dataRoot, ...target.slice("/srv/brain/data/".length).split("/")), { recursive: true });
+    }
+    expect(existsSync(join(dataRoot, "organizer/transactions"))).toBe(false);
+
+    const paths = await prepareOrganizerStatePaths(dataRoot);
+    expect(readFileSync(join(paths.recovery, "manifest.marker"), "utf8")).toBe("legacy");
+    expect(existsSync(legacyRecovery)).toBe(false);
+  });
+
   it("merges exact disabled organizer policy into existing MCP config and only enables its timer", async () => {
     const source = await readFile("deploy/install.sh", "utf8");
     const lines = logicalShellLines(source);
@@ -285,12 +317,12 @@ describe("organizer deployment units", () => {
       reportsDirectory: "60_Tools/61_Obsidian_MCP/90_Auto_Organizer_Reports",
     });
 
-    const existingConfig = conditionalBranches(lines, "if [[ -f /etc/brain-mcp-config.json ]]; then");
+    const existingConfig = conditionalBranches(lines, "if [[ -f \"$brain_config_file\" ]]; then");
     const merge = commands(existingConfig.whenTrue, "jq");
     expect(merge).toHaveLength(1);
     expect(merge[0]).toEqual(expect.arrayContaining([
       "--argjson", "organizer", "$brain_organizer_json", ".organizer = $organizer",
-      "/etc/brain-mcp-config.json",
+      "$brain_config_file",
     ]));
 
     const systemctl = commands(lines, "systemctl");
@@ -317,13 +349,84 @@ describe("organizer deployment units", () => {
     ]);
   });
 
+  it("merges organizer config twice without changing existing owner, auth, or custom fields", () => {
+    const testTmp = resolve(".test-tmp");
+    mkdirSync(testTmp, { recursive: true });
+    const root = mkdtempSync(join(testTmp, "brain-organizer-config-"));
+    cleanupPaths.push(root);
+    const relativeRoot = `.test-tmp/${basename(root)}`;
+    const fakeBin = join(root, "fake-bin");
+    const configPath = join(root, "brain-mcp-config.json");
+    mkdirSync(fakeBin);
+    writeFileSync(join(root, ".brain-install-config-test-root"), "test-only\n", "utf8");
+    writeFileSync(configPath, JSON.stringify({
+      dataDir: "/preserved/data",
+      owner: { id: "owner", passphrase: "fixture-passphrase-that-is-not-a-credential", allowedVaults: ["brain"] },
+      vaults: [{ id: "brain", root: "/preserved/vault" }],
+      authentication: { issuer: "preserved" },
+      customField: { keep: true },
+      organizer: { mode: "automatic", trialStartedAt: "must-be-removed" },
+    }), "utf8");
+    executable("jq", `#!/usr/bin/env node
+import { readFileSync } from "node:fs";
+const args = process.argv.slice(2);
+if (args.length !== 5 || args[0] !== "--argjson" || args[1] !== "organizer"
+  || args[3] !== ".organizer = $organizer") process.exit(64);
+const config = JSON.parse(readFileSync(args[4], "utf8"));
+config.organizer = JSON.parse(args[2]);
+process.stdout.write(JSON.stringify(config));
+`, fakeBin);
+
+    const script = resolve("deploy/install.sh");
+    const bash = process.platform === "win32" ? "C:\\Program Files\\Git\\bin\\bash.exe" : "bash";
+    const run = () => spawnSync(
+      bash,
+      ["-c", `export PATH='${relativeRoot}/fake-bin':"$PATH"; exec bash '${bashPath(script)}'`],
+      {
+        cwd: resolve("."),
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          NODE_ENV: "test",
+          BRAIN_INSTALL_CONFIG_TEST_MODE: "1",
+          BRAIN_INSTALL_TEST_ROOT: relativeRoot,
+        },
+      },
+    );
+
+    const first = run();
+    expect(first.status, first.stderr).toBe(0);
+    const once = readFileSync(configPath, "utf8");
+    expect(JSON.parse(once)).toEqual({
+      dataDir: "/preserved/data",
+      owner: { id: "owner", passphrase: "fixture-passphrase-that-is-not-a-credential", allowedVaults: ["brain"] },
+      vaults: [{ id: "brain", root: "/preserved/vault" }],
+      authentication: { issuer: "preserved" },
+      customField: { keep: true },
+      organizer: {
+        enabledVaults: ["brain"],
+        mode: "disabled",
+        minStableSeconds: 300,
+        autoApplyConfidence: 0.9,
+        maxNotesPerRun: 20,
+        maxNoteBytes: 131_072,
+        maxContextBytes: 262_144,
+        proposalTtlHours: 24,
+        recoveryDays: 30,
+        reportsDirectory: "60_Tools/61_Obsidian_MCP/90_Auto_Organizer_Reports",
+      },
+    });
+
+    const second = run();
+    expect(second.status, second.stderr).toBe(0);
+    expect(readFileSync(configPath, "utf8")).toBe(once);
+  }, 15_000);
+
   it("backs up organizer recovery state without copying the provider environment", () => {
     const backupSource = readFileSync("deploy/backup.sh", "utf8");
     const backupLines = logicalShellLines(backupSource);
-    expect(backupLines).toContain("brain_archive_root=${BRAIN_ARCHIVE_ROOT:-/srv/brain/backups}");
-    expect(backupLines).toContain("brain_vault_root=${BRAIN_VAULT_ROOT:-/srv/brain}");
-    expect(backupLines).toContain("brain_data_root=${BRAIN_DATA_ROOT:-/srv/brain/data}");
-    expect(backupLines).toContain("brain_config_file=${BRAIN_CONFIG_FILE:-/etc/brain-mcp-config.json}");
+    expect(backupLines).toContain("brain_archive_root=/srv/brain/backups");
+    expect(backupSource).not.toContain("BRAIN_ARCHIVE_ROOT");
     expect(commands(backupLines, "tar")).toContainEqual([
       "tar", "--xattrs", "--acls", "-C", "$brain_data_root", "-czf",
       "$brain_backup_dest/organizer-state.tgz", "organizer",
@@ -339,6 +442,7 @@ describe("organizer deployment units", () => {
     const configPath = join(root, "etc/brain-mcp-config.json");
     const providerEnvironmentPath = join(root, "etc/brain-organizer.env");
 
+    writeFileSync(join(root, ".brain-backup-test-root"), "test-only\n", "utf8");
     mkdirSync(join(brainRoot, "vaults/brain"), { recursive: true });
     mkdirSync(join(organizerRoot, "transactions/ORG-example"), { recursive: true });
     mkdirSync(join(root, "etc"), { recursive: true });
@@ -356,10 +460,9 @@ describe("organizer deployment units", () => {
       encoding: "utf8",
       env: {
         ...process.env,
-        BRAIN_ARCHIVE_ROOT: `${relativeRoot}/srv/brain/backups`,
-        BRAIN_VAULT_ROOT: `${relativeRoot}/srv/brain`,
-        BRAIN_DATA_ROOT: `${relativeRoot}/srv/brain/data`,
-        BRAIN_CONFIG_FILE: `${relativeRoot}/etc/brain-mcp-config.json`,
+        NODE_ENV: "test",
+        BRAIN_BACKUP_TEST_MODE: "1",
+        BRAIN_BACKUP_TEST_ROOT: relativeRoot,
       },
     });
     expect(result.status, result.stderr).toBe(0);
@@ -385,5 +488,42 @@ describe("organizer deployment units", () => {
     ]);
     expect(listed.stdout).not.toContain("brain-organizer.env");
     expect(readFileSync(providerEnvironmentPath, "utf8")).toContain("must-not-be-backed-up");
+  }, 15_000);
+
+  it("rejects an ungated broad backup override before retention can delete sibling directories", () => {
+    const testTmp = resolve(".test-tmp");
+    mkdirSync(testTmp, { recursive: true });
+    const root = mkdtempSync(join(testTmp, "brain-organizer-backup-unsafe-"));
+    cleanupPaths.push(root);
+    const relativeRoot = `.test-tmp/${basename(root)}`;
+    const brainRoot = join(root, "srv/brain");
+    const victim = join(root, "unrelated-old-directory");
+    mkdirSync(join(brainRoot, "vaults/brain"), { recursive: true });
+    mkdirSync(join(brainRoot, "data/organizer"), { recursive: true });
+    mkdirSync(join(root, "etc"), { recursive: true });
+    mkdirSync(victim);
+    writeFileSync(join(root, "etc/brain-mcp-config.json"), "{}", "utf8");
+    const old = new Date(Date.now() - 20 * 24 * 60 * 60 * 1_000);
+    utimesSync(victim, old, old);
+
+    const script = resolve("deploy/backup.sh");
+    const bash = process.platform === "win32" ? "C:\\Program Files\\Git\\bin\\bash.exe" : "bash";
+    const result = spawnSync(bash, ["-c", `exec bash '${bashPath(script)}'`], {
+      cwd: resolve("."),
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        NODE_ENV: "test",
+        BRAIN_BACKUP_TEST_MODE: "1",
+        BRAIN_BACKUP_TEST_ROOT: relativeRoot,
+        BRAIN_ARCHIVE_ROOT: relativeRoot,
+        BRAIN_VAULT_ROOT: `${relativeRoot}/srv/brain`,
+        BRAIN_DATA_ROOT: `${relativeRoot}/srv/brain/data`,
+        BRAIN_CONFIG_FILE: `${relativeRoot}/etc/brain-mcp-config.json`,
+      },
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(existsSync(victim)).toBe(true);
   }, 15_000);
 });
