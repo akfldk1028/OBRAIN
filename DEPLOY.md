@@ -385,6 +385,17 @@ change the Caddyfile.
 
 ### Oracle provider-disabled checks
 
+The Oracle installer enables `brain-organizer.timer` but deliberately does not start it. Immediately
+after installation it can therefore be `enabled` while still `inactive` until the next boot or a
+separately approved safe start; `systemctl status` may show `inactive (dead)`. This is expected.
+Starting a persistent timer can trigger an immediate catch-up run, so this rollout does not start
+the timer. Inspect state without changing it:
+
+```bash
+sudo systemctl is-enabled brain-organizer.timer
+sudo systemctl show --property=ActiveState --value brain-organizer.timer
+```
+
 Keep both gates disabled: `/etc/brain-organizer.env` must contain
 `ORGANIZER_PROVIDER=disabled`, and `/etc/brain-mcp-config.json` must retain
 `organizer.mode="disabled"`. These commands disclose no credential:
@@ -403,10 +414,13 @@ random delay and persistent missed-run handling. A one-time provider-disabled se
 
 ```bash
 sudo systemctl start brain-organizer.service
-sudo systemctl status brain-organizer.service --no-pager
+sudo systemctl show --property=Result --property=ExecMainStatus \
+  --property=ActiveState brain-organizer.service
 ```
 
-It must not call a provider or move a note, and it does not start the seven-day trial.
+It must not call a provider or move a note, and it does not start the seven-day trial. A successful
+oneshot normally returns to `inactive (dead)`; require `Result=success`, `ExecMainStatus=0`, and
+`ActiveState=inactive` rather than expecting it to remain active.
 `sudo systemctl edit --runtime brain-organizer.timer` is reserved for an approved trial schedule
 after the two HIGH fixes and independent re-review; do not run it or create a runtime override while
 the rollout gate is blocked. There is deliberately no command here to start, shorten, or bypass the
@@ -415,37 +429,56 @@ before any separate `automatic` approval.
 
 ### Emergency provider disable
 
-If a future independently approved trial has a problem, edit the protected file interactively and
-set `ORGANIZER_PROVIDER=disabled`. Do not copy or print any provider key. Restart only the process
-that consumes the environment; the timer can remain enabled because provider-disabled runs cannot
-organize notes.
+If a future independently approved trial has a problem, first stop both the timer and any active
+organizer service and verify that service is inactive. Only then edit the protected file
+interactively and set `ORGANIZER_PROVIDER=disabled`. Do not copy or print any provider key. Restart
+only the process that consumes the environment after the disabled value and file permissions pass
+their checks. Keep the timer enabled but inactive during this recovery session, so it cannot start a
+persistent catch-up run.
 
 ```bash
+set -euo pipefail
+sudo systemctl stop brain-organizer.timer brain-organizer.service
+sudo systemctl reset-failed brain-organizer.service
+sudo systemctl show --property=ActiveState --value brain-organizer.service | grep -qx inactive
 sudoedit /etc/brain-organizer.env
 sudo grep -qx 'ORGANIZER_PROVIDER=disabled' /etc/brain-organizer.env
 sudo chown root:brain /etc/brain-organizer.env
 sudo chmod 0640 /etc/brain-organizer.env
 sudo systemctl restart brain-mcp
-sudo systemctl reset-failed brain-organizer.service
-sudo systemctl is-active brain-mcp brain-organizer.timer
+sudo systemctl is-active brain-mcp
+sudo systemctl is-enabled brain-organizer.timer
+sudo systemctl show --property=ActiveState --value brain-organizer.timer | grep -qx inactive
+sudo systemctl show --property=ActiveState --value brain-organizer.service | grep -qx inactive
 ```
 
 ### Guarded CLI undo
 
-Undo only a known transaction. Stop the timer, MCP writer, and Syncthing first so the backup and
-operator recovery cannot race another writer, then take a fresh backup. Replace the visibly fake
-identifier below with the exact retained transaction ID; never guess one. Audit before restarting
-services.
+Undo only a known transaction. Stop the timer, any active organizer service, MCP writer, and
+Syncthing first so the backup and operator recovery cannot race another writer. Confirm the
+organizer is inactive, then take a fresh backup. Replace the visibly fake identifier below with the
+exact retained transaction ID; never guess one. Restart Syncthing and MCP only after the audit has no
+findings. Leave the enabled timer inactive in this recovery session to avoid a catch-up run.
 
 ```bash
-sudo systemctl stop brain-organizer.timer brain-mcp brain-syncthing
+set -euo pipefail
+sudo systemctl stop brain-organizer.timer brain-organizer.service brain-mcp brain-syncthing
+sudo systemctl reset-failed brain-organizer.service
+sudo systemctl show --property=ActiveState --value brain-organizer.service | grep -qx inactive
+sudo systemctl show --property=ActiveState --value brain-organizer.timer | grep -qx inactive
 sudo /usr/local/sbin/brain-mcp-backup
 sudo -u brain env MCP_CONFIG_FILE=/etc/brain-mcp-config.json \
   /usr/bin/node /opt/brain-mcp/dist/organizer-cli.js undo --vault brain \
   --transaction ORG-EXAMPLE-IDENTIFIER
-sudo -u brain env MCP_CONFIG_FILE=/etc/brain-mcp-config.json \
-  /usr/bin/node /opt/brain-mcp/dist/organizer-cli.js audit --vault brain
-sudo systemctl start brain-syncthing brain-mcp brain-organizer.timer
+brain_audit=$(
+  sudo -u brain env MCP_CONFIG_FILE=/etc/brain-mcp-config.json \
+    /usr/bin/node /opt/brain-mcp/dist/organizer-cli.js audit --vault brain
+)
+printf '%s\n' "$brain_audit" | jq -e '.findings | length == 0'
+sudo systemctl start brain-syncthing brain-mcp
+sudo systemctl is-active brain-syncthing brain-mcp
+sudo systemctl is-enabled brain-organizer.timer
+sudo systemctl show --property=ActiveState --value brain-organizer.timer | grep -qx inactive
 ```
 
 The CLI can perform this recovery with the provider disabled; it reads the non-secret config path
@@ -471,11 +504,12 @@ destination, reason, and confidence → `apply_organization`. Save the returned 
 `audit_vault` after apply and after recovery; it returns structural findings without note bodies.
 
 Run reports are stored in the Vault at
-`60_Tools/61_Obsidian_MCP/90_Auto_Organizer_Reports/<run-id>.json`. Private recovery snapshots are
-under `<dataDir>/organizer-recovery/<transaction-id>/`, and audit actions are in
-`<dataDir>/audit.jsonl`. Do not manually edit recovery snapshots while the service runs. Preserve
-the owner-controlled filesystem boundary: recovery never requires broader Vault access or another
-native dependency.
+`60_Tools/61_Obsidian_MCP/90_Auto_Organizer_Reports/<run-id>.md`. Current private transaction state
+and recovery snapshots are under `<dataDir>/organizer/transactions/<transaction-id>/`, and audit
+actions are in `<dataDir>/audit.jsonl`. `<dataDir>/organizer-recovery` is a legacy migration source
+only; startup moves it to the current transaction directory or fails closed on a conflict. Do not
+manually edit transaction snapshots while the service runs. Preserve the owner-controlled
+filesystem boundary: recovery never requires broader Vault access or another native dependency.
 
 For the generic non-Oracle unit shown earlier in this document, hiding organizer tools also requires
 setting the source configuration's `organizer.mode` to `disabled`:

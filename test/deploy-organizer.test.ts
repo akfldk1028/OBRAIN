@@ -106,6 +106,23 @@ function logicalShellLines(source: string): string[] {
   return lines;
 }
 
+function markdownShellBlocks(source: string): string[] {
+  return [...source.matchAll(/^```bash[ \t]*\r?\n([\s\S]*?)^```[ \t]*$/gmu)]
+    .map((match) => match[1]!);
+}
+
+function markdownShellBlock(source: string, marker: string): string[] {
+  const block = markdownShellBlocks(source).find((candidate) => candidate.includes(marker));
+  if (!block) throw new Error(`missing Markdown shell block containing: ${marker}`);
+  return logicalShellLines(block);
+}
+
+function commandPosition(lines: string[], fragment: string): number {
+  const index = lines.findIndex((line) => line.includes(fragment));
+  if (index < 0) throw new Error(`missing command fragment: ${fragment}`);
+  return index;
+}
+
 function shellWords(line: string): string[] {
   return [...line.matchAll(/"([^"]*)"|'([^']*)'|([^\s]+)/gu)]
     .map((match) => match[1] ?? match[2] ?? match[3]!);
@@ -392,6 +409,77 @@ describe("organizer deployment units", () => {
       "verification failed: thirteen MCP tools including organizer are available",
     );
   });
+
+  it.each(["deploy/README.md", "DEPLOY.md"])(
+    "stops and confirms the organizer inactive before emergency provider disable in %s",
+    async (documentPath) => {
+      const document = await readFile(documentPath, "utf8");
+      const lines = markdownShellBlock(document, "sudoedit /etc/brain-organizer.env");
+      const stop = commandPosition(lines, "systemctl stop");
+      const inactive = commandPosition(lines, "ActiveState --value brain-organizer.service");
+      const edit = commandPosition(lines, "sudoedit /etc/brain-organizer.env");
+      const disabled = commandPosition(lines, "ORGANIZER_PROVIDER=disabled");
+      const restart = commandPosition(lines, "systemctl restart brain-mcp");
+      const stopWords = shellWords(lines[stop]!);
+
+      expect(stopWords).toEqual(expect.arrayContaining([
+        "brain-organizer.timer",
+        "brain-organizer.service",
+      ]));
+      expect([stop, inactive, edit, disabled, restart]).toEqual(
+        [...[stop, inactive, edit, disabled, restart]].sort((left, right) => left - right),
+      );
+      expect(lines.some((line) => /systemctl (?:start|restart).*brain-organizer\.(?:timer|service)/u.test(line))).toBe(false);
+    },
+  );
+
+  it.each(["deploy/README.md", "DEPLOY.md"])(
+    "stops and confirms the organizer inactive before backup and guarded undo in %s",
+    async (documentPath) => {
+      const document = await readFile(documentPath, "utf8");
+      const lines = markdownShellBlock(document, "ORG-EXAMPLE-IDENTIFIER");
+      const stop = commandPosition(lines, "systemctl stop");
+      const inactive = commandPosition(lines, "ActiveState --value brain-organizer.service");
+      const backup = commandPosition(lines, "/usr/local/sbin/brain-mcp-backup");
+      const undo = commandPosition(lines, " undo --vault brain");
+      const audit = commandPosition(lines, " audit --vault brain");
+      const cleanAudit = commandPosition(lines, ".findings | length == 0");
+      const restart = commandPosition(lines, "systemctl start brain-syncthing brain-mcp");
+      const stopWords = shellWords(lines[stop]!);
+
+      expect(stopWords).toEqual(expect.arrayContaining([
+        "brain-organizer.timer",
+        "brain-organizer.service",
+        "brain-mcp",
+        "brain-syncthing",
+      ]));
+      expect([stop, inactive, backup, undo, audit, cleanAudit, restart]).toEqual(
+        [...[stop, inactive, backup, undo, audit, cleanAudit, restart]].sort((left, right) => left - right),
+      );
+      expect(lines.some((line) => /systemctl (?:start|restart).*brain-organizer\.(?:timer|service)/u.test(line))).toBe(false);
+    },
+  );
+
+  it("documents current organizer reports and transaction state without treating legacy recovery as live", async () => {
+    const document = await readFile("DEPLOY.md", "utf8");
+    expect(document).toContain("60_Tools/61_Obsidian_MCP/90_Auto_Organizer_Reports/<run-id>.md");
+    expect(document).toContain("<dataDir>/organizer/transactions/<transaction-id>/");
+    expect(document).toMatch(/`<dataDir>\/organizer-recovery`[^\n]*legacy migration source/u);
+    expect(document).not.toContain("90_Auto_Organizer_Reports/<run-id>.json");
+    expect(document).not.toContain("<dataDir>/organizer-recovery/<transaction-id>/");
+  });
+
+  it.each(["deploy/README.md", "DEPLOY.md"])(
+    "documents enabled-but-not-started timer state without a catch-up start command in %s",
+    async (documentPath) => {
+      const document = await readFile(documentPath, "utf8");
+      const shellLines = markdownShellBlocks(document).flatMap(logicalShellLines);
+      expect(shellLines.some((line) => line.includes("systemctl is-enabled brain-organizer.timer"))).toBe(true);
+      expect(shellLines.some((line) => line.includes("ActiveState --value brain-organizer.timer"))).toBe(true);
+      expect(document).toContain("inactive (dead)");
+      expect(shellLines.some((line) => /systemctl (?:enable --now|start|restart).*brain-organizer\.timer/u.test(line))).toBe(false);
+    },
+  );
 
   it("installs organizer state and units while preserving an existing provider environment", async () => {
     const source = await readFile("deploy/install.sh", "utf8");

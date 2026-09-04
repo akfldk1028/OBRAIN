@@ -28,6 +28,17 @@ sudo PUBLIC_HOST=203-0-113-10.sslip.io \
 
 처음에는 새 빈 Vault `brain` 하나만 만든다. 기존 로컬 Obsidian Vault는 읽거나 복사하지 않는다. 나중에 새 Vault를 더 만들고 싶을 때만 `BRAIN_VAULT_IDS=brain,work,research`처럼 추가한다. 설치기는 기존 로그인 비밀번호와 JWT 비밀값을 재사용하므로 다시 실행해도 인증 정보가 바뀌지 않는다.
 
+설치기는 `brain-organizer.timer`를 **enable만 하고 start하지 않는다**. 따라서 설치 직후에는
+`enabled`이지만 다음 부팅 또는 별도로 승인된 안전한 시작 전까지 `inactive`일 수 있으며,
+`systemctl status`에는 `inactive (dead)`로 보일 수 있다. 이는 정상 상태다. Timer를 시작하면
+`Persistent=true` 때문에 놓친 시간이 즉시 catch-up 실행될 수 있으므로 현재 배포 절차에서는
+timer를 시작하지 않는다. 상태만 확인한다.
+
+```bash
+sudo systemctl is-enabled brain-organizer.timer
+sudo systemctl show --property=ActiveState --value brain-organizer.timer
+```
+
 ## Oracle 인바운드 규칙
 
 다음 포트만 연다. `8384`와 `8787`은 외부에 열지 않는다.
@@ -79,10 +90,13 @@ sudo env DEPLOY_OWNER_PASSPHRASE_FILE=/root/brain-mcp-owner-passphrase.txt \
 
 예약된 service와 같은 provider-disabled 실행 경로를 한 번 확인할 때만 다음을 사용한다.
 이 실행은 7일 trial을 시작하지 않으며 provider를 호출하거나 노트를 이동하지 않아야 한다.
+Oneshot이 성공하면 계속 active로 남지 않고 보통 `inactive (dead)`로 돌아오는 것이 정상이다.
+`Result=success`, `ExecMainStatus=0`, `ActiveState=inactive`를 확인한다.
 
 ```bash
 sudo systemctl start brain-organizer.service
-sudo systemctl status brain-organizer.service --no-pager
+sudo systemctl show --property=Result --property=ExecMainStatus \
+  --property=ActiveState brain-organizer.service
 ```
 
 `sudo systemctl edit --runtime brain-organizer.timer`는 수정 사항과 독립 재검토가 모두 끝난
@@ -92,36 +106,58 @@ override를 만들지 않는다. `DEPLOY_EXPECT_ORGANIZER=1`도 13개 tool 배�
 
 ### 긴급 비활성화
 
-향후 승인된 trial 중 문제가 생기면 protected environment를 열어
-`ORGANIZER_PROVIDER=disabled`로 바꾼 뒤 MCP만 재시작한다. key 값은 명령줄, 로그, 문서에
-복사하지 않는다. Timer는 켜 두어도 provider가 없으므로 실제 정리를 수행하지 않는다.
+향후 승인된 trial 중 문제가 생기면 먼저 timer와 실행 중인 organizer service를 모두
+멈추고 service가 inactive인지 확인한다. 그 다음 protected environment를 열어
+`ORGANIZER_PROVIDER=disabled`로 바꾸고 검증한 뒤 MCP만 재시작한다. Key 값은 명령줄, 로그,
+문서에 복사하지 않는다. Timer는 enabled 상태를 유지하되 이 복구 세션에서는 inactive로
+남겨 catch-up 실행을 만들지 않는다.
 
 ```bash
+set -euo pipefail
+sudo systemctl stop brain-organizer.timer brain-organizer.service
+sudo systemctl reset-failed brain-organizer.service
+sudo systemctl show --property=ActiveState --value brain-organizer.service | grep -qx inactive
 sudoedit /etc/brain-organizer.env
 sudo grep -qx 'ORGANIZER_PROVIDER=disabled' /etc/brain-organizer.env
 sudo chown root:brain /etc/brain-organizer.env
 sudo chmod 0640 /etc/brain-organizer.env
 sudo systemctl restart brain-mcp
-sudo systemctl reset-failed brain-organizer.service
-sudo systemctl is-active brain-mcp brain-organizer.timer
+sudo systemctl is-active brain-mcp
+sudo systemctl is-enabled brain-organizer.timer
+sudo systemctl show --property=ActiveState --value brain-organizer.timer | grep -qx inactive
+sudo systemctl show --property=ActiveState --value brain-organizer.service | grep -qx inactive
 ```
 
 ### Guarded undo
 
-기존 transaction을 복구할 때만 writer와 동기화를 먼저 멈추고 새 백업을 만든 뒤 정확한
-transaction ID를 사용한다. 아래 `ORG-EXAMPLE-IDENTIFIER`는 예시이며 실제 ID가 아니므로
-그대로 실행하면 안 된다. Undo 후 audit이 끝나기 전에는 서비스를 다시 열지 않는다.
+기존 transaction을 복구할 때만 timer, 실행 중인 organizer service, writer와 동기화를 모두
+먼저 멈춘다. Organizer가 inactive인지 확인하고 새 백업을 만든 뒤 정확한 transaction ID를
+사용한다. 아래 `ORG-EXAMPLE-IDENTIFIER`는 예시이며 실제 ID가 아니므로 그대로 실행하면 안
+된다. Undo 후 audit 결과가 깨끗한지 확인하기 전에는 서비스를 다시 열지 않는다.
 
 ```bash
-sudo systemctl stop brain-organizer.timer brain-mcp brain-syncthing
+set -euo pipefail
+sudo systemctl stop brain-organizer.timer brain-organizer.service brain-mcp brain-syncthing
+sudo systemctl reset-failed brain-organizer.service
+sudo systemctl show --property=ActiveState --value brain-organizer.service | grep -qx inactive
+sudo systemctl show --property=ActiveState --value brain-organizer.timer | grep -qx inactive
 sudo /usr/local/sbin/brain-mcp-backup
 sudo -u brain env MCP_CONFIG_FILE=/etc/brain-mcp-config.json \
   /usr/bin/node /opt/brain-mcp/dist/organizer-cli.js undo --vault brain \
   --transaction ORG-EXAMPLE-IDENTIFIER
-sudo -u brain env MCP_CONFIG_FILE=/etc/brain-mcp-config.json \
-  /usr/bin/node /opt/brain-mcp/dist/organizer-cli.js audit --vault brain
-sudo systemctl start brain-syncthing brain-mcp brain-organizer.timer
+brain_audit=$(
+  sudo -u brain env MCP_CONFIG_FILE=/etc/brain-mcp-config.json \
+    /usr/bin/node /opt/brain-mcp/dist/organizer-cli.js audit --vault brain
+)
+printf '%s\n' "$brain_audit" | jq -e '.findings | length == 0'
+sudo systemctl start brain-syncthing brain-mcp
+sudo systemctl is-active brain-syncthing brain-mcp
+sudo systemctl is-enabled brain-organizer.timer
+sudo systemctl show --property=ActiveState --value brain-organizer.timer | grep -qx inactive
 ```
+
+모든 앞 단계가 성공한 뒤에만 Syncthing과 MCP를 다시 시작한다. Timer는 enable 상태만
+확인하고 이 세션에서는 시작하지 않는다.
 
 ## PC와 서버 연결
 
