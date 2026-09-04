@@ -81,7 +81,11 @@ export async function assembleRuntime(input: {
       auditLogger: new AuditLogger(path.join(loaded.dataDir, "audit.jsonl")),
       lockPath: path.join(loaded.dataDir, "organizer.lock"),
     });
-    const attachedKnowledge = await assembleKnowledge(loaded.dataDir, loaded.registry, organizer);
+    const attachedKnowledge = await assembleKnowledge(
+      loaded.dataDir,
+      loaded.registry,
+      loaded.organizer.mode === "disabled" ? undefined : organizer,
+    );
     knowledge = attachedKnowledge;
     let closed = false;
     return {

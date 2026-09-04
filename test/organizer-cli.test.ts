@@ -1,9 +1,35 @@
 import { writeFile } from "node:fs/promises";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { parseOrganizerArgs, runOrganizerCli, runOrganizerCliEntrypoint } from "../src/organizer-cli.js";
 import { assembleRuntime } from "../src/runtime.js";
+import { createKnowledgeMcpServer } from "../src/server-factory.js";
 import { makeTempVaultSet } from "./helpers/temp-vaults.js";
+
+const sixTools = [
+  "create_inbox_note", "get_note_links", "list_notes", "list_vaults", "read_note", "search_notes",
+];
+const thirteenTools = [
+  "apply_organization", "audit_vault", "create_inbox_note", "get_note_links",
+  "get_vault_policy", "list_inbox_notes", "list_notes", "list_vaults",
+  "organize_now", "propose_organization", "read_note", "search_notes", "undo_organization",
+];
+
+async function registeredToolNames(runtime: Awaited<ReturnType<typeof assembleRuntime>>) {
+  const server = createKnowledgeMcpServer(runtime.knowledge);
+  const client = new Client({ name: "runtime-organizer-tools-test", version: "1.0.0" });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  try {
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    return (await client.listTools()).tools.map((tool) => tool.name).sort();
+  } finally {
+    await client.close();
+    await server.close();
+  }
+}
 
 describe("parseOrganizerArgs", () => {
   it("parses a bounded dry-run command", () => {
@@ -51,7 +77,7 @@ describe("assembleRuntime", () => {
     }
   });
 
-  it("attaches a configured organizer to the shared knowledge base", async () => {
+  it("keeps a disabled organizer available to the CLI but out of MCP tools", async () => {
     const fx = await makeTempVaultSet(["brain"]);
     const configFile = path.join(fx.root, "config.json");
     await writeFile(configFile, JSON.stringify({
@@ -65,7 +91,32 @@ describe("assembleRuntime", () => {
       const runtime = await assembleRuntime({ configFile, environment: { ORGANIZER_PROVIDER: "dashscope" } });
       try {
         expect(runtime.organizer).toBeDefined();
+        expect(runtime.knowledge.hasOrganizer()).toBe(false);
+        expect(await registeredToolNames(runtime)).toEqual(sixTools);
+      } finally {
+        await runtime.close();
+      }
+    } finally {
+      await fx.cleanup();
+    }
+  });
+
+  it("exposes organizer MCP tools for a real enabled organizer configuration", async () => {
+    const fx = await makeTempVaultSet(["brain"]);
+    const configFile = path.join(fx.root, "config.json");
+    await writeFile(configFile, JSON.stringify({
+      dataDir: path.join(fx.root, "data"),
+      owner: { id: "owner", passphrase: "a-long-test-passphrase", allowedVaults: ["brain"] },
+      vaults: fx.vaults,
+      organizer: { enabledVaults: ["brain"], mode: "dry-run" },
+    }), { mode: 0o600 });
+
+    try {
+      const runtime = await assembleRuntime({ configFile, environment: {} });
+      try {
+        expect(runtime.organizer).toBeDefined();
         expect(runtime.knowledge.hasOrganizer()).toBe(true);
+        expect(await registeredToolNames(runtime)).toEqual(thirteenTools);
       } finally {
         await runtime.close();
       }
