@@ -1,6 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { constants } from "node:fs";
-import { lstat, mkdir, open, readFile, readdir, realpath, unlink } from "node:fs/promises";
+import { lstat, mkdir, readFile, readdir, realpath } from "node:fs/promises";
 import path from "node:path";
 import { AuditLogger } from "../audit.js";
 import { BRAIN_FOUNDATION_POLICY, areaMocPath } from "../foundation/policy.js";
@@ -14,7 +13,7 @@ import { renderOrganizedNote } from "./render-note.js";
 import { scanStableInbox, type InboxCandidate } from "./scanner.js";
 import { detectSensitiveContent } from "./secrets.js";
 import { OrganizerStore, organizerIds } from "./store.js";
-import { OrganizerTransactionEngine } from "./transaction.js";
+import { OrganizerTransactionEngine, type CreateOnlyVaultArtifactEvent } from "./transaction.js";
 import type { InboxListResult, OrganizerConfig, OrganizerMode, OrganizerServiceApi, RunSummary, StoredProposal, TransactionRecord, VaultPolicyView } from "./types.js";
 
 const DAY = 86_400_000;
@@ -30,6 +29,7 @@ export interface OrganizerServiceOptions {
   lockPath: string;
   maxRunDurationMs?: number;
   onBeforeReportOpen?: () => void | Promise<void>;
+  onReportPublicationEvent?: (event: CreateOnlyVaultArtifactEvent) => void | Promise<void>;
 }
 
 function sha(content: string): string { return createHash("sha256").update(content, "utf8").digest("hex"); }
@@ -217,7 +217,7 @@ export class OrganizerService implements OrganizerServiceApi {
   private provider(): OrganizerProvider { if (this.providerDisabled()) throw new Error("organizer_unavailable"); if (!this.providerInstance) this.providerInstance = typeof this.options.provider === "function" ? this.options.provider({ maxContextBytes: this.options.config.maxContextBytes }) : this.options.provider!; return this.providerInstance; }
   private runMode(requested: OrganizerMode | undefined): OrganizerMode { if (this.providerDisabled()) return "disabled"; const trial = this.options.store.getOrStartTrial(this.now()); if (trial.active) return "dry-run"; if (this.options.config.mode === "dry-run" || requested === "dry-run") return "dry-run"; return "automatic"; }
   private authorize(vault: string) { if (!this.options.config.enabledVaults.includes(vault)) throw new Error("vault_not_enabled"); return this.options.registry.get(vault); }
-  private async writeReport(vault: string, summary: RunSummary, paths: ReportPath[]): Promise<void> { const fs = this.authorize(vault); const boundRoot = await realpath(fs.rootPath); await this.reportDirectory(boundRoot); await this.options.onBeforeReportOpen?.(); const directory = await this.reportDirectory(boundRoot); const file = path.join(directory, `${summary.runId}.json`); const directoryStat = await lstat(directory); if (directoryStat.isSymbolicLink() || !directoryStat.isDirectory()) throw new Error("report_directory_unsafe"); const flags = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0); const handle = await open(file, flags, 0o600); let trusted = false; try { const canonical = await realpath(file); if (outside(boundRoot, canonical)) throw new Error("report_directory_unsafe"); trusted = true; const ordered = [...paths].sort((left, right) => compare(left.path, right.path) || compare(left.reasonCode, right.reasonCode)); await handle.writeFile(JSON.stringify({ runId: summary.runId, mode: summary.mode, paths: ordered, counts: { discovered: summary.discovered, proposed: summary.proposed, applied: summary.applied, review: summary.review, skipped: summary.skipped, failed: summary.failed }, reasonCodes: [...new Set(ordered.map((item) => item.reasonCode))].sort(compare) }), "utf8"); } finally { await handle.close(); if (!trusted) await unlink(file).catch(() => undefined); } }
+  private async writeReport(vault: string, summary: RunSummary, paths: ReportPath[]): Promise<void> { const fs = this.authorize(vault); const boundRoot = await realpath(fs.rootPath); await this.reportDirectory(boundRoot); await this.options.onBeforeReportOpen?.(); await this.reportDirectory(boundRoot); const ordered = [...paths].sort((left, right) => compare(left.path, right.path) || compare(left.reasonCode, right.reasonCode)); const content = JSON.stringify({ runId: summary.runId, mode: summary.mode, paths: ordered, counts: { discovered: summary.discovered, proposed: summary.proposed, applied: summary.applied, review: summary.review, skipped: summary.skipped, failed: summary.failed }, reasonCodes: [...new Set(ordered.map((item) => item.reasonCode))].sort(compare) }); await this.options.transaction.publishCreateOnlyArtifact({ vaultRoot: boundRoot, relativePath: `${this.options.config.reportsDirectory}/${summary.runId}.json`, owner: summary.runId, content, onEvent: this.options.onReportPublicationEvent }); }
   private async reportDirectory(root: string): Promise<string> { const boundRoot = await realpath(root); let current = boundRoot; for (const segment of this.options.config.reportsDirectory.split("/")) { const next = path.join(current, segment); try { await mkdir(next, { mode: 0o700 }); } catch (error: unknown) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; } const before = await lstat(next); if (before.isSymbolicLink() || !before.isDirectory()) throw new Error("report_directory_unsafe"); const canonical = await realpath(next); const after = await lstat(next); if (after.isSymbolicLink() || !after.isDirectory() || outside(boundRoot, canonical)) throw new Error("report_directory_unsafe"); current = canonical; } return current; }
   private async record(action: "organizer_propose" | "organizer_apply" | "organizer_undo" | "organizer_run" | "organizer_audit", outcome: "allowed" | "denied", vault: string, path?: string, reason?: string): Promise<void> { await this.options.auditLogger?.record({ action, outcome, vault, path, reason }); }
 }

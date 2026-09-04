@@ -193,6 +193,16 @@ export interface OrganizerTransactionEngineOptions {
   onEvent?: (event: TransactionEvent) => void | Promise<void>;
 }
 
+export type CreateOnlyVaultArtifactEvent = "after_parent_bound" | "before_cleanup";
+
+export interface CreateOnlyVaultArtifactPlan {
+  vaultRoot: string;
+  relativePath: string;
+  owner: string;
+  content: string | Buffer;
+  onEvent?: (event: CreateOnlyVaultArtifactEvent) => void | Promise<void>;
+}
+
 class StaleSourceError extends Error {}
 class TransactionConflictError extends Error {}
 class TransactionValidationError extends Error {}
@@ -1048,6 +1058,115 @@ async function publishCreateOnly(
   }
 }
 
+async function publishCreateOnlyVaultArtifact(plan: CreateOnlyVaultArtifactPlan): Promise<void> {
+  validateRelativePath(plan.relativePath);
+  if (!/^RUN-[A-Za-z0-9_-]+$/u.test(plan.owner) || Buffer.byteLength(plan.owner, "utf8") > ID_BYTES) {
+    throw new TransactionValidationError("create-only artifact owner is invalid");
+  }
+  if (Buffer.byteLength(plan.content) > MAX_ARTIFACT_BYTES) {
+    throw new TransactionValidationError("create-only artifact exceeds the byte limit");
+  }
+  const root = await bindRoot(plan.vaultRoot);
+  const segments = plan.relativePath.split("/");
+  const filename = segments.pop()!;
+  const parent = await bindDirectory(root, segments.join("/"));
+  const target = path.join(parent.canonicalPath, filename);
+  const temp = path.join(parent.canonicalPath, `.brain-organizer-${plan.owner}-report.tmp`);
+  let handle: FileHandle | undefined;
+  let ownedStat: BigIntStats | undefined;
+  let cleanupTemp: string | undefined;
+  let cleanupTarget: string | undefined;
+  let wroteContent = false;
+  try {
+    await assertDestinationAbsent(parent, filename);
+    await revalidateDirectory(parent);
+    await plan.onEvent?.("after_parent_bound");
+
+    handle = await open(temp, constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600);
+    ownedStat = await handle.stat({ bigint: true });
+    if (!ownedStat.isFile()) throw new TransactionValidationError("create-only artifact staging object is unsafe");
+    const canonicalTemp = await realpath(temp);
+    const [tempStat, canonicalStat] = await Promise.all([
+      lstat(temp, { bigint: true }),
+      lstat(canonicalTemp, { bigint: true }),
+    ]);
+    if (canonicalStat.isFile() && provableIdentity(ownedStat, canonicalStat)) cleanupTemp = canonicalTemp;
+    if (
+      canonicalTemp !== temp || isOutside(root.canonicalPath, canonicalTemp)
+      || tempStat.isSymbolicLink() || !tempStat.isFile()
+      || !provableIdentity(ownedStat, tempStat) || !provableIdentity(ownedStat, canonicalStat)
+    ) throw new TransactionValidationError("create-only artifact staging object escaped its bound parent");
+    await revalidateDirectory(parent);
+
+    await handle.writeFile(plan.content);
+    await handle.sync();
+    await handle.chmod(0o600);
+    wroteContent = true;
+    const written = await handle.stat({ bigint: true });
+    const writtenPath = await lstat(canonicalTemp, { bigint: true });
+    if (!written.isFile() || !provableIdentity(ownedStat, written) || !provableIdentity(written, writtenPath)) {
+      throw new TransactionValidationError("create-only artifact staging object changed identity");
+    }
+
+    await revalidateDirectory(parent);
+    await assertDestinationAbsent(parent, filename);
+    const beforeLink = await lstat(canonicalTemp, { bigint: true });
+    if (!provableIdentity(written, beforeLink)) throw new TransactionValidationError("create-only artifact staging object changed before publication");
+    await link(canonicalTemp, target);
+    const canonicalTarget = await realpath(target);
+    const [targetStat, targetCanonicalStat] = await Promise.all([
+      lstat(target, { bigint: true }),
+      lstat(canonicalTarget, { bigint: true }),
+    ]);
+    if (targetCanonicalStat.isFile() && provableIdentity(written, targetCanonicalStat)) cleanupTarget = canonicalTarget;
+    if (
+      canonicalTarget !== target || isOutside(root.canonicalPath, canonicalTarget)
+      || targetStat.isSymbolicLink() || !targetStat.isFile()
+      || !provableIdentity(written, targetStat) || !provableIdentity(written, targetCanonicalStat)
+    ) throw new TransactionValidationError("create-only artifact publication ownership could not be proven");
+    await syncDirectory(parent.canonicalPath);
+    await revalidateDirectory(parent);
+    const proof = await lstat(canonicalTemp, { bigint: true });
+    if (!provableIdentity(written, proof)) throw new TransactionValidationError("create-only artifact proof changed before cleanup");
+    await handle.close();
+    handle = undefined;
+    await unlink(canonicalTemp);
+    cleanupTemp = undefined;
+    await syncDirectory(parent.canonicalPath);
+  } catch (error: unknown) {
+    let cleanupError: unknown;
+    if (handle && wroteContent) {
+      try {
+        await handle.truncate(0);
+        await handle.sync();
+        ownedStat = await handle.stat({ bigint: true });
+      } catch (next) {
+        cleanupError = next;
+      }
+    }
+    try { await plan.onEvent?.("before_cleanup"); }
+    catch (next) { cleanupError ??= next; }
+    try { await handle?.close(); }
+    catch (next) { cleanupError ??= next; }
+    handle = undefined;
+    for (const candidate of new Set([cleanupTarget, cleanupTemp].filter((item): item is string => item !== undefined))) {
+      try {
+        const current = await lstat(candidate, { bigint: true });
+        if (!ownedStat || !current.isFile() || !provableIdentity(ownedStat, current)) {
+          throw new TransactionValidationError("create-only artifact cleanup target changed identity");
+        }
+        await unlink(candidate);
+      } catch (next: unknown) {
+        if ((next as NodeJS.ErrnoException).code !== "ENOENT") cleanupError ??= next;
+      }
+    }
+    if (cleanupError) throw new AggregateError([error, cleanupError], "create-only artifact publication and cleanup failed");
+    throw error;
+  } finally {
+    await handle?.close();
+  }
+}
+
 function transactionTemp(file: BoundFile | BoundDirectory, id: string, role: string, index?: number): string {
   identifier.parse(id);
   if (!/^[a-z-]+$/u.test(role)) throw new TransactionValidationError("temporary file role is invalid");
@@ -1590,6 +1709,10 @@ export class OrganizerTransactionEngine {
       throw new TransactionValidationError("transaction engine options are invalid");
     }
     this.options = options;
+  }
+
+  public async publishCreateOnlyArtifact(plan: CreateOnlyVaultArtifactPlan): Promise<void> {
+    await publishCreateOnlyVaultArtifact(plan);
   }
 
   public async apply(plan: TransactionPlan): Promise<TransactionRecord> {

@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, symlink, unlink, utimes, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, unlink, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -37,7 +37,9 @@ class FakeProvider implements OrganizerProvider {
   }
 }
 
-async function fixture(content = "# Inbox\n\nordinary note"): Promise<{ root: string; source: string; service: (provider?: OrganizerProvider | ((options: { maxContextBytes: number }) => OrganizerProvider), config?: Partial<OrganizerConfig>, timestamp?: string, onBeforeReportOpen?: () => void | Promise<void>) => OrganizerService }> {
+type ReportPublicationEvent = "after_parent_bound" | "before_cleanup";
+
+async function fixture(content = "# Inbox\n\nordinary note"): Promise<{ root: string; source: string; service: (provider?: OrganizerProvider | ((options: { maxContextBytes: number }) => OrganizerProvider), config?: Partial<OrganizerConfig>, timestamp?: string, onBeforeReportOpen?: () => void | Promise<void>, onReportPublicationEvent?: (event: ReportPublicationEvent) => void | Promise<void>) => OrganizerService }> {
   const root = await mkdtemp(path.join(os.tmpdir(), "brain-organizer-service-"));
   roots.push(root);
   const source = path.join(root, "Agent-Inbox", "note.md");
@@ -59,10 +61,10 @@ async function fixture(content = "# Inbox\n\nordinary note"): Promise<{ root: st
   };
   return {
     root, source,
-    service: (provider, config = {}, timestamp = now, onBeforeReportOpen) => new OrganizerService({
+    service: (provider, config = {}, timestamp = now, onBeforeReportOpen, onReportPublicationEvent) => new OrganizerService({
       registry, store, config: { ...base, ...config }, provider,
       transaction: new OrganizerTransactionEngine({ store, recoveryRoot: path.join(path.dirname(root), `${path.basename(root)}-recovery`), now: () => timestamp }),
-      now: () => timestamp, lockPath: path.join(root, "organizer.lock"), onBeforeReportOpen,
+      now: () => timestamp, lockPath: path.join(root, "organizer.lock"), onBeforeReportOpen, onReportPublicationEvent,
     }),
   };
 }
@@ -189,6 +191,7 @@ describe("OrganizerService", () => {
     resolve();
     await waitFor(() => provider.calls.length === 1);
     await waitFor(async () => (await readFile(path.join(fx.root, "60_Tools", "61_Obsidian_MCP", "90_Auto_Organizer_Reports", `${first.runId}.json`), "utf8").catch(() => undefined)) !== undefined);
+    await waitFor(async () => (await lstat(path.join(fx.root, "organizer.lock")).catch(() => undefined)) === undefined);
   });
 
   it("reports already_running for a second service blocked by the filesystem lock", async () => {
@@ -202,6 +205,7 @@ describe("OrganizerService", () => {
     resolve();
     await waitFor(() => provider.calls.length === 1);
     await waitFor(async () => (await readFile(path.join(fx.root, "60_Tools", "61_Obsidian_MCP", "90_Auto_Organizer_Reports", `${first.runId}.json`), "utf8").catch(() => undefined)) !== undefined);
+    await waitFor(async () => (await lstat(path.join(fx.root, "organizer.lock")).catch(() => undefined)) === undefined);
   });
 
   it("writes per-note report paths and stable codes without provider error text", async () => {
@@ -249,5 +253,45 @@ describe("OrganizerService", () => {
     }).runToCompletion({ vault: "brain" });
     expect(summary.status).toBe("failed");
     expect(await readFile(path.join(outside, "61_Obsidian_MCP", "90_Auto_Organizer_Reports", `${summary.runId}.json`), "utf8").catch(() => undefined)).toBeUndefined();
+  });
+
+  it("fails before publishing a final report when the bound parent is swapped after the last check", async () => {
+    const fx = await fixture(); const outside = await mkdtemp(path.join(os.tmpdir(), "brain-organizer-report-final-race-")); roots.push(outside);
+    const reportDirectory = path.join(fx.root, "60_Tools", "61_Obsidian_MCP", "90_Auto_Organizer_Reports");
+    const heldDirectory = `${reportDirectory}-held`;
+    let finalNameObserved = false;
+    const summary = await fx.service(undefined, { mode: "disabled" }, now, undefined, async (event) => {
+      if (event === "after_parent_bound") {
+        await rename(reportDirectory, heldDirectory);
+        await symlink(outside, reportDirectory, "junction");
+      } else {
+        finalNameObserved = (await readdir(outside)).some((name) => name.endsWith(".json"));
+      }
+    }).runToCompletion({ vault: "brain" });
+
+    expect(summary.status).toBe("failed");
+    expect(finalNameObserved).toBe(false);
+    expect((await readdir(outside)).filter((name) => name.endsWith(".json"))).toEqual([]);
+  });
+
+  it("cleans the exact untrusted temporary object when its parent path is swapped before cleanup", async () => {
+    const fx = await fixture(); const outside = await mkdtemp(path.join(os.tmpdir(), "brain-organizer-report-cleanup-race-")); roots.push(outside);
+    const reportDirectory = path.join(fx.root, "60_Tools", "61_Obsidian_MCP", "90_Auto_Organizer_Reports");
+    const heldDirectory = `${reportDirectory}-held`;
+    let cleanupObserved = false;
+    const summary = await fx.service(undefined, { mode: "disabled" }, now, undefined, async (event) => {
+      if (event === "after_parent_bound") {
+        await rename(reportDirectory, heldDirectory);
+        await symlink(outside, reportDirectory, "junction");
+      } else {
+        cleanupObserved = true;
+        await unlink(reportDirectory);
+        await rename(heldDirectory, reportDirectory);
+      }
+    }).runToCompletion({ vault: "brain" });
+
+    expect(cleanupObserved).toBe(true);
+    expect(summary.status).toBe("failed");
+    expect(await readdir(outside)).toEqual([]);
   });
 });

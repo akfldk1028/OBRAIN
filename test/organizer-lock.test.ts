@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -56,13 +56,14 @@ describe("organizer lock", () => {
     let observed = 0; let releaseBarrier!: () => void;
     const barrier = new Promise<void>((resolve) => { releaseBarrier = resolve; });
     const contender = () => acquireOrganizerLock({
-      path: file, maxRunDurationMs: 1, isProcessAlive: () => false,
+      path: file, maxRunDurationMs: 1, isProcessAlive: (pid) => pid === process.pid,
       onStaleObserved: async () => { observed += 1; if (observed === 2) releaseBarrier(); await barrier; },
     });
     const locks = await Promise.all([contender(), contender()]);
     expect(observed).toBe(2);
     expect(locks.filter(Boolean)).toHaveLength(1);
     await locks[0]?.release(); await locks[1]?.release();
+    expect((await readdir(path.dirname(file))).filter((name) => name.includes("takeover") || name.includes("claim"))).toEqual([]);
   });
 
   it("recovers a stale crash-leftover takeover guard", async () => {
@@ -81,7 +82,7 @@ describe("organizer lock", () => {
     await expect(acquireOrganizerLock({ path: file, maxRunDurationMs: 1, isProcessAlive: (pid) => pid === 456 })).resolves.toBeUndefined();
   });
 
-  it("fails closed when a stale guard is replaced before its reclaim claim", async () => {
+  it("preserves a live ABA replacement instead of renaming it into an orphan claim", async () => {
     const file = await lockPath();
     await writeFile(file, JSON.stringify({ pid: 123, startedAt: "2020-01-01T00:00:00.000Z", owner: "stale-lock" }), "utf8");
     await writeFile(`${file}.takeover`, JSON.stringify({ pid: 456, startedAt: "2020-01-01T00:00:00.000Z", owner: "stale" }), "utf8");
@@ -91,8 +92,53 @@ describe("organizer lock", () => {
     } });
     expect(hooked).toBe(true);
     expect(lock).toBeUndefined();
-    const claim = (await readdir(path.dirname(file))).find((name) => name.startsWith("organizer.lock.takeover.claim-"));
-    expect(claim).toBeDefined();
-    expect(JSON.parse(await readFile(path.join(path.dirname(file), claim!), "utf8")).owner).toBe("live");
+    expect(JSON.parse(await readFile(`${file}.takeover`, "utf8")).owner).toBe("live");
+    expect((await readdir(path.dirname(file))).filter((name) => name.includes("claim"))).toEqual([]);
+  });
+
+  it("does not overwrite a live primary-lock replacement during stale ownership transfer", async () => {
+    const file = await lockPath();
+    const stale = JSON.stringify({ pid: 123, startedAt: "2020-01-01T00:00:00.000Z", owner: "stale-lock" });
+    const live = JSON.stringify({ pid: process.pid, startedAt: "2026-09-04T12:00:00.000Z", owner: "live-lock" });
+    const moved = `${file}.moved`;
+    await writeFile(file, stale, "utf8");
+    let hooked = false;
+    const options = {
+      path: file,
+      maxRunDurationMs: 1,
+      now: () => new Date("2026-09-04T12:00:00.000Z"),
+      isProcessAlive: (pid: number) => pid === process.pid,
+      onBeforeStaleTransfer: async () => {
+        hooked = true;
+        await rename(file, moved);
+        await writeFile(file, live, "utf8");
+      },
+    };
+
+    await expect(acquireOrganizerLock(options)).resolves.toBeUndefined();
+    expect(hooked).toBe(true);
+    expect(await readFile(file, "utf8")).toBe(live);
+    expect(await readFile(moved, "utf8")).toBe(stale);
+  });
+
+  it("recovers a crashed owner without leaving takeover or claim files", async () => {
+    const file = await lockPath();
+    const crashed = await acquireOrganizerLock({
+      path: file,
+      maxRunDurationMs: 1,
+      now: () => new Date("2020-01-01T00:00:00.000Z"),
+    });
+    expect(crashed).toBeDefined();
+
+    const recovered = await acquireOrganizerLock({
+      path: file,
+      maxRunDurationMs: 1,
+      now: () => new Date("2026-09-04T12:00:00.000Z"),
+      isProcessAlive: () => false,
+    });
+
+    expect(recovered).toBeDefined();
+    expect((await readdir(path.dirname(file))).filter((name) => name.includes("takeover") || name.includes("claim"))).toEqual([]);
+    await recovered?.release();
   });
 });
