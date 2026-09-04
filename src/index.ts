@@ -1,12 +1,8 @@
-import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { AuditLogger } from "./audit.js";
 import { loadKnowledgeConfig } from "./config.js";
 import type { HttpRuntime, HttpUser } from "./http.js";
-import { IndexCoordinator } from "./index-coordinator.js";
-import { KnowledgeBase } from "./knowledge-base.js";
-import { SearchIndex } from "./search-index.js";
+import { assembleKnowledge, assembleRuntime } from "./runtime.js";
 import { createMcpServer } from "./server-factory.js";
 import { VaultFS } from "./vault.js";
 import { VaultRegistry } from "./vault-registry.js";
@@ -41,31 +37,17 @@ function parseArgs(argv: string[]): Args {
   return out;
 }
 
-async function assembleKnowledge(registry: VaultRegistry, dataDir: string): Promise<KnowledgeBase> {
-  await mkdir(dataDir, { recursive: true, mode: 0o700 });
-  const index = SearchIndex.openWithRecovery(path.join(dataDir, "index.sqlite"));
-  const coordinator = new IndexCoordinator(registry, index);
-  const knowledge = new KnowledgeBase(
-    registry,
-    index,
-    coordinator,
-    new AuditLogger(path.join(dataDir, "audit.jsonl")),
-  );
-  await knowledge.initialize();
-  return knowledge;
-}
-
-async function buildKnowledgeHttpUser(args: Args): Promise<HttpUser> {
+async function buildKnowledgeHttpUser(args: Args): Promise<{ user: HttpUser; close(): Promise<void> }> {
   const configFile = process.env.MCP_CONFIG_FILE;
   if (configFile && process.env.MCP_USERS_FILE) {
     throw new Error("Set MCP_CONFIG_FILE only; MCP_USERS_FILE cannot be combined");
   }
   if (configFile) {
     const loaded = await loadKnowledgeConfig(configFile);
+    const runtime = await assembleRuntime({ configFile, environment: process.env });
     return {
-      id: loaded.owner.id,
-      passphrase: loaded.owner.passphrase,
-      knowledge: await assembleKnowledge(loaded.registry, loaded.dataDir),
+      user: { id: loaded.owner.id, passphrase: loaded.owner.passphrase, knowledge: runtime.knowledge },
+      close: () => runtime.close(),
     };
   }
   if (process.env.MCP_USERS_FILE) {
@@ -74,10 +56,10 @@ async function buildKnowledgeHttpUser(args: Args): Promise<HttpUser> {
   if (!args.root) throw new Error("HTTP mode requires MCP_CONFIG_FILE or a vault root");
   const registry = await VaultRegistry.create([{ id: "default", root: args.root }]);
   const dataDir = process.env.MCP_DATA_DIR ?? path.join(args.root, ".obsidian-mcp-data");
+  const knowledge = await assembleKnowledge(dataDir, registry);
   return {
-    id: "default",
-    passphrase: process.env.MCP_AUTH_PASSPHRASE ?? "",
-    knowledge: await assembleKnowledge(registry, dataDir),
+    user: { id: "default", passphrase: process.env.MCP_AUTH_PASSPHRASE ?? "", knowledge },
+    close: () => knowledge.close(),
   };
 }
 
@@ -85,14 +67,20 @@ async function main(): Promise<void> {
   const args = parseArgs(process.argv);
   if (args.http) {
     const { startHttp } = await import("./http.js");
-    const user = await buildKnowledgeHttpUser(args);
-    const runtime: HttpRuntime = await startHttp([user], { port: args.port, host: args.host });
+    const assembled = await buildKnowledgeHttpUser(args);
+    let runtime: HttpRuntime;
+    try {
+      runtime = await startHttp([assembled.user], { port: args.port, host: args.host });
+    } catch (error) {
+      await assembled.close();
+      throw error;
+    }
     let closing = false;
     const shutdown = async () => {
       if (closing) return;
       closing = true;
       await runtime.close();
-      await user.knowledge.close();
+      await assembled.close();
     };
     process.once("SIGTERM", () => void shutdown());
     process.once("SIGINT", () => void shutdown());

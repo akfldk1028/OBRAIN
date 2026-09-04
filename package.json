@@ -33,6 +33,8 @@
     "typecheck": "tsc --noEmit",
     "foundation:preview": "node dist/foundation-cli.js",
     "foundation:apply": "node dist/foundation-cli.js --apply",
+    "organizer:run": "node dist/organizer-cli.js run",
+    "organizer:audit": "node dist/organizer-cli.js audit",
     "smoke": "node scripts/smoke.mjs",
     "smoke:http": "node scripts/smoke-http.mjs",
     "inspect": "npx @modelcontextprotocol/inspector node dist/index.js",

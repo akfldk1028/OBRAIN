@@ -65,6 +65,38 @@ function sameIdentity(left: BigStat, right: BigStat): boolean {
     && left.dev === right.dev && left.ino === right.ino;
 }
 
+async function supportsStableRuntimeIdentity(directory: string, lockName: string): Promise<boolean> {
+  const probePath = path.join(directory, `.${lockName}.${randomUUID()}.identity-probe`);
+  let handle: FileHandle | undefined;
+  let expected: BigStat | undefined;
+  try {
+    handle = await open(probePath, "wx", 0o600);
+    await handle.writeFile("identity-probe", "utf8");
+    await handle.sync();
+    const first = await handle.stat({ bigint: true });
+    const second = await handle.stat({ bigint: true });
+    if (!sameIdentity(first, second)) return false;
+    expected = second;
+  } catch {
+    return false;
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+
+  try {
+    const before = await lstat(probePath, { bigint: true });
+    const canonical = await realpath(probePath);
+    const after = await lstat(probePath, { bigint: true });
+    const canonicalStat = await lstat(canonical, { bigint: true });
+    if (canonical !== probePath || !before.isFile() || !after.isFile() || !canonicalStat.isFile()
+      || !sameIdentity(expected!, before) || !sameIdentity(expected!, after) || !sameIdentity(expected!, canonicalStat)) return false;
+    await unlink(probePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function legacyGuardBlocks(
   options: AcquireOrganizerLockOptions,
   at: Date,
@@ -183,7 +215,9 @@ export async function acquireOrganizerLock(options: AcquireOrganizerLockOptions)
   const at = (options.now ?? (() => new Date()))();
   if (!Number.isFinite(at.getTime())) throw new Error("organizer lock timestamp is invalid");
   const alive = options.isProcessAlive ?? processAlive;
-  await mkdir(path.dirname(options.path), { recursive: true, mode: 0o700 });
+  const runtimeDirectory = path.dirname(options.path);
+  await mkdir(runtimeDirectory, { recursive: true, mode: 0o700 });
+  if (!(await supportsStableRuntimeIdentity(runtimeDirectory, path.basename(options.path)))) return undefined;
 
   let observed: string | undefined;
   try { observed = await readFile(options.path, "utf8"); }
