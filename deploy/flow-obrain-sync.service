@@ -1,0 +1,17 @@
+[Unit]
+Description=Sync OBRAIN notes into FLOW
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=brain
+Group=brain
+ExecStart=/usr/local/sbin/flow-obrain-sync
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+
+[Install]
+WantedBy=multi-user.target

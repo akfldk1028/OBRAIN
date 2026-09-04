@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+
+. /etc/flow-obrain-sync.env
+
+exec /usr/bin/curl \
+  --proto '=https' \
+  --tlsv1.2 \
+  --fail \
+  --silent \
+  --show-error \
+  --retry 2 \
+  --max-time 60 \
+  --request POST \
+  --header "Authorization: Bearer ${OBRAIN_SYNC_SECRET}" \
+  "${FLOW_SYNC_URL}" \
+  >/dev/null

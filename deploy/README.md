@@ -122,6 +122,20 @@ OBRAIN_SYNC_MAX_STALE_SECONDS=900
 cursor와 생성·수정·삭제 개수만 반환한다. FLOW client에는 Markdown 쓰기·삭제·organizer
 tool이 노출되지 않는다.
 
+운영 서버에서는 `deploy/flow-obrain-sync.service`와 `deploy/flow-obrain-sync.timer`를 설치해
+Oracle이 5분마다 FLOW의 보호된 HTTPS sync route를 호출할 수 있다. 실제
+`/etc/flow-obrain-sync.env`는 `root:brain`, 권한 `0640`으로 만들고 다음 이름만 설정한다.
+
+```dotenv
+FLOW_SYNC_URL=https://flow.example.com/api/brain/sync
+OBRAIN_SYNC_SECRET=<protected scheduler secret>
+```
+
+Wrapper와 unit을 각각 `/usr/local/sbin/flow-obrain-sync`와 `/etc/systemd/system/`에 설치한 뒤
+`systemctl enable --now flow-obrain-sync.timer`를 실행한다. 최초 확인은
+`systemctl start flow-obrain-sync.service` 후 `Result=success`, `ExecMainStatus=0`, timer가
+`active`인지 확인한다. Secret 값이나 Authorization header는 로그에 출력하지 않는다.
+
 Secret을 교체할 때는 새 client ID(예: `flow-next`)와 새 hash를 기존 항목 옆에 먼저 추가하고,
 FLOW의 ID와 secret을 바꿔 동기화를 확인한 뒤 이전 `flow` 항목을 제거한다. 같은 client ID를
 중복해서 넣으면 서버가 시작을 거부한다. 긴급 차단은 해당 항목의 `enabled`를 `false`로 바꾸고
