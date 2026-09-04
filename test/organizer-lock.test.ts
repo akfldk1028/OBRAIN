@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -79,5 +79,20 @@ describe("organizer lock", () => {
     await writeFile(file, JSON.stringify({ pid: 123, startedAt: "2020-01-01T00:00:00.000Z", owner: "stale-lock" }), "utf8");
     await writeFile(`${file}.takeover`, JSON.stringify({ pid: 456, startedAt: "2020-01-01T00:00:00.000Z", owner: "live" }), "utf8");
     await expect(acquireOrganizerLock({ path: file, maxRunDurationMs: 1, isProcessAlive: (pid) => pid === 456 })).resolves.toBeUndefined();
+  });
+
+  it("fails closed when a stale guard is replaced before its reclaim claim", async () => {
+    const file = await lockPath();
+    await writeFile(file, JSON.stringify({ pid: 123, startedAt: "2020-01-01T00:00:00.000Z", owner: "stale-lock" }), "utf8");
+    await writeFile(`${file}.takeover`, JSON.stringify({ pid: 456, startedAt: "2020-01-01T00:00:00.000Z", owner: "stale" }), "utf8");
+    let hooked = false;
+    const lock = await acquireOrganizerLock({ path: file, maxRunDurationMs: 1, isProcessAlive: () => false, onBeforeGuardClaim: async () => {
+      hooked = true; await rm(`${file}.takeover`, { force: true }); await writeFile(`${file}.takeover`, JSON.stringify({ pid: 789, startedAt: "2026-09-04T12:00:00.000Z", owner: "live" }), "utf8");
+    } });
+    expect(hooked).toBe(true);
+    expect(lock).toBeUndefined();
+    const claim = (await readdir(path.dirname(file))).find((name) => name.startsWith("organizer.lock.takeover.claim-"));
+    expect(claim).toBeDefined();
+    expect(JSON.parse(await readFile(path.join(path.dirname(file), claim!), "utf8")).owner).toBe("live");
   });
 });

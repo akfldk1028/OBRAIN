@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, open, readFile, unlink } from "node:fs/promises";
+import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import path from "node:path";
 
 interface LockRecord {
@@ -19,6 +19,8 @@ export interface AcquireOrganizerLockOptions {
   isProcessAlive?: (pid: number) => boolean;
   /** Test/diagnostic hook invoked after a stale lock is observed and before takeover arbitration. */
   onStaleObserved?: () => void | Promise<void>;
+  /** Test/diagnostic hook immediately before atomically claiming a stale takeover guard. */
+  onBeforeGuardClaim?: () => void | Promise<void>;
 }
 
 function processAlive(pid: number): boolean {
@@ -85,7 +87,7 @@ export async function acquireOrganizerLock(options: AcquireOrganizerLockOptions)
       const age = existing ? now().getTime() - Date.parse(existing.startedAt) : Number.NEGATIVE_INFINITY;
       if (!existing || alive(existing.pid) || age <= options.maxRunDurationMs) return undefined;
       await options.onStaleObserved?.();
-      let takeover: Awaited<ReturnType<typeof open>>;
+      let takeover: Awaited<ReturnType<typeof open>>; let ownedTakeoverPath = takeoverPath; let keepClaim = false;
       try { takeover = await open(takeoverPath, "wx", 0o600); } catch (takeoverError: unknown) {
         if ((takeoverError as NodeJS.ErrnoException).code !== "EEXIST") throw takeoverError;
         let guardText: string;
@@ -93,10 +95,13 @@ export async function acquireOrganizerLock(options: AcquireOrganizerLockOptions)
         const guard = parseLock(guardText);
         const guardAge = guard ? now().getTime() - Date.parse(guard.startedAt) : Number.NEGATIVE_INFINITY;
         if (!guard || alive(guard.pid) || guardAge <= options.maxRunDurationMs) return undefined;
-        const currentGuard = await readFile(takeoverPath, "utf8").catch(() => undefined);
-        if (currentGuard !== guardText) return undefined;
-        await unlink(takeoverPath).catch(() => undefined);
-        try { takeover = await open(takeoverPath, "wx", 0o600); } catch { return undefined; }
+        await options.onBeforeGuardClaim?.();
+        const claimPath = `${takeoverPath}.claim-${record.owner}`;
+        try { await rename(takeoverPath, claimPath); } catch { return undefined; }
+        const claimed = await readFile(claimPath, "utf8").catch(() => undefined);
+        if (claimed !== guardText) { keepClaim = true; return undefined; }
+        ownedTakeoverPath = claimPath;
+        try { takeover = await open(ownedTakeoverPath, "r+"); } catch { return undefined; }
       }
       try {
         await takeover.writeFile(content, "utf8");
@@ -110,7 +115,8 @@ export async function acquireOrganizerLock(options: AcquireOrganizerLockOptions)
         await unlink(options.path);
       } finally {
         await takeover.close();
-        await unlink(takeoverPath).catch((unlinkError: unknown) => {
+        if (keepClaim) return;
+        await unlink(ownedTakeoverPath).catch((unlinkError: unknown) => {
           if ((unlinkError as NodeJS.ErrnoException).code !== "ENOENT") throw unlinkError;
         });
       }
