@@ -205,7 +205,37 @@ The stdio/ssh path for Claude Desktop is unchanged and runs independently.
 | `MCP_USERS_FILE` | one of | Per-user `{id, passphrase, vault}` map (see below) — for multiple people/vaults. |
 | `MCP_AUTH_PASSPHRASE` | one of | Single-user shortcut: the login passphrase for the one vault given as the CLI arg. Use this **or** `MCP_USERS_FILE`. |
 | `MCP_CLIENTS_FILE` | no | Where DCR client registrations persist (default: next to `index.js`). |
+| `MCP_SERVICE_CLIENTS_FILE` | no | Root-managed JSON registry for non-interactive, read-only machine clients. Raw client secrets are never stored here. |
 | `MCP_NO_AUTH` | no | Set to `1` to disable auth — **local testing only**, never public. |
+
+### Read-only machine clients
+
+Cloud jobs such as FLOW use OAuth `client_credentials` rather than a browser login. Each enabled
+machine client receives only the `notes:read` scope and an explicit `allowedVaults` list. Its MCP
+session exposes `list_vaults`, `list_notes`, `read_note`, `search_notes`, and the incremental
+`list_note_changes` feed; write and organizer tools are absent.
+
+`MCP_SERVICE_CLIENTS_FILE` points to a strict JSON document shaped like this. Store only the scrypt
+hash produced by `scripts/hash-service-secret.mjs`; keep the raw secret exclusively in the calling
+service's protected environment.
+
+```json
+{
+  "clients": [
+    {
+      "clientId": "flow",
+      "secretHash": "scrypt$16384$8$1$<salt>$<derived-key>",
+      "ownerId": "owner",
+      "scopes": ["notes:read"],
+      "allowedVaults": ["brain"],
+      "enabled": true
+    }
+  ]
+}
+```
+
+The server validates the file, its Vault and owner references, and mode `0600` or `0640` before it
+starts. See [`deploy/README.md`](deploy/README.md) for secret hashing, rotation, and FLOW settings.
 
 ### Multiple people, multiple vaults
 

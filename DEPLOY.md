@@ -112,6 +112,7 @@ cat > /etc/obsidian-multivault-mcp.env <<EOF
 MCP_PUBLIC_URL=https://203-0-113-10.sslip.io
 MCP_JWT_SECRET=$(openssl rand -hex 32)
 MCP_CLIENTS_FILE=/home/youruser/obsidian-multivault-mcp/oauth-clients.json
+# MCP_SERVICE_CLIENTS_FILE is supplied through a systemd credential below.
 EOF
 chmod 600 /etc/obsidian-multivault-mcp.env
 ```
@@ -119,6 +120,8 @@ chmod 600 /etc/obsidian-multivault-mcp.env
 - `MCP_PUBLIC_URL` — public origin; used as the OAuth issuer and token audience. No trailing slash.
 - `MCP_JWT_SECRET` — signs access/refresh tokens. Rotating it + restarting revokes all tokens.
 - `MCP_CLIENTS_FILE` — where Dynamic Client Registrations persist across restarts.
+- `MCP_SERVICE_CLIENTS_FILE` — optional read-only machine-client registry. The systemd example below
+  supplies it as a private credential instead of a world-readable environment value.
 
 Do not set `MCP_USERS_FILE`; current HTTP startup rejects that legacy variable. The systemd unit in
 step 4 sets `MCP_CONFIG_FILE` to a private credential copy of the owner configuration below.
@@ -174,6 +177,39 @@ only one Vault, remove the other entry from all three arrays: `owner.allowedVaul
 deployment deliberately uses `organizer.mode: "disabled"`, so it needs no provider and exposes only
 the six knowledge tools.
 
+**Optional read-only FLOW client** — first run `npm run build` as the application user. Save a new
+32+ character client secret in FLOW's protected environment, then enter that same value at the
+hidden prompt below. Only its scrypt hash is written on this server or printed by the helper.
+
+```bash
+install -o root -g root -m 600 /dev/null /etc/obsidian-multivault-mcp-service-clients.json
+read -rsp 'FLOW client secret: ' flow_client_secret
+echo
+flow_secret_hash=$(
+  MCP_SERVICE_CLIENT_SECRET="$flow_client_secret" \
+    <NODE_BIN> /home/youruser/obsidian-multivault-mcp/scripts/hash-service-secret.mjs
+)
+unset flow_client_secret
+service_clients_tmp=$(mktemp)
+jq -n --arg hash "$flow_secret_hash" '{
+  clients: [{
+    clientId: "flow",
+    secretHash: $hash,
+    ownerId: "owner",
+    scopes: ["notes:read"],
+    allowedVaults: ["personal", "work"],
+    enabled: true
+  }]
+}' >"$service_clients_tmp"
+install -o root -g root -m 600 "$service_clients_tmp" \
+  /etc/obsidian-multivault-mcp-service-clients.json
+rm -f "$service_clients_tmp"
+unset flow_secret_hash
+```
+
+Replace `<NODE_BIN>` with the concrete path from step 1. Use only the Vault IDs FLOW is allowed to
+read. The raw secret belongs in FLOW variables, never in this JSON file, a repository, or a note.
+
 ### Organizer provider file
 
 Keep provider settings in a separate root-owned file. Create the file without putting a sample or
@@ -222,7 +258,9 @@ WorkingDirectory=/home/youruser/obsidian-multivault-mcp
 EnvironmentFile=/etc/obsidian-multivault-mcp.env
 EnvironmentFile=-/etc/brain-organizer.env
 LoadCredential=knowledge-config.json:/etc/obsidian-multivault-mcp.json
+LoadCredential=service-clients.json:/etc/obsidian-multivault-mcp-service-clients.json
 Environment=MCP_CONFIG_FILE=%d/knowledge-config.json
+Environment=MCP_SERVICE_CLIENTS_FILE=%d/service-clients.json
 ExecStart=<NODE_BIN> /home/youruser/obsidian-multivault-mcp/dist/index.js --http --port 8787 --host 127.0.0.1
 Restart=on-failure
 RestartSec=2

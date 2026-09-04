@@ -513,6 +513,32 @@ describe("organizer deployment units", () => {
     ]);
   });
 
+  it("provisions a private service-client registry and wires it into MCP startup", async () => {
+    const source = await readFile("deploy/install.sh", "utf8");
+    const lines = logicalShellLines(source);
+    const registry = conditionalBranches(
+      lines,
+      "if [[ ! -f /etc/brain-mcp-service-clients.json ]]; then",
+    );
+
+    expect(commands(registry.whenTrue, "install")).toEqual([[
+      "install", "-o", "root", "-g", "brain", "-m", "0640", "/dev/null",
+      "/etc/brain-mcp-service-clients.json",
+    ]]);
+    expect(registry.whenTrue).toContain(
+      "printf '%s\\n' '{\"clients\":[]}' >/etc/brain-mcp-service-clients.json",
+    );
+    expect(commands(registry.whenFalse, "chown")).toEqual([[
+      "chown", "root:brain", "/etc/brain-mcp-service-clients.json",
+    ]]);
+    expect(commands(registry.whenFalse, "chmod")).toEqual([[
+      "chmod", "0640", "/etc/brain-mcp-service-clients.json",
+    ]]);
+    expect(source).toContain(
+      "MCP_SERVICE_CLIENTS_FILE=/etc/brain-mcp-service-clients.json",
+    );
+  });
+
   it("leaves the transaction target absent so runtime can migrate legacy recovery state", async () => {
     const testTmp = resolve(".test-tmp");
     mkdirSync(testTmp, { recursive: true });

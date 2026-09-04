@@ -116,6 +116,14 @@ else
   chmod 0640 /etc/brain-organizer.env
 fi
 
+if [[ ! -f /etc/brain-mcp-service-clients.json ]]; then
+  install -o root -g brain -m 0640 /dev/null /etc/brain-mcp-service-clients.json
+  printf '%s\n' '{"clients":[]}' >/etc/brain-mcp-service-clients.json
+else
+  chown root:brain /etc/brain-mcp-service-clients.json
+  chmod 0640 /etc/brain-mcp-service-clients.json
+fi
+
 if [[ -f /etc/brain-mcp.env ]]; then
   brain_jwt_secret=$(sed -n 's/^MCP_JWT_SECRET=//p' /etc/brain-mcp.env)
 else
@@ -141,6 +149,7 @@ fi
   printf 'MCP_PUBLIC_URL=https://%s\n' "$PUBLIC_HOST"
   printf 'MCP_JWT_SECRET=%s\n' "$brain_jwt_secret"
   printf '%s\n' 'MCP_CLIENTS_FILE=/opt/brain-mcp/oauth-clients.json'
+  printf '%s\n' 'MCP_SERVICE_CLIENTS_FILE=/etc/brain-mcp-service-clients.json'
   printf '%s\n' 'MCP_CONFIG_FILE=/etc/brain-mcp-config.json' 'NODE_ENV=production'
 } >/etc/brain-mcp.env
 chmod 600 /etc/brain-mcp.env

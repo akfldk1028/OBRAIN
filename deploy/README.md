@@ -66,6 +66,67 @@ curl -i -X POST "https://${PUBLIC_HOST}/mcp" \
 
 세 서비스는 `active`, 두 health 요청은 `200`, 로그인하지 않은 MCP 요청은 `401`이어야 한다.
 
+## FLOW 읽기 전용 연결
+
+설치기는 `/etc/brain-mcp-service-clients.json`을 `root:brain`, 권한 `0640`으로 만들고
+`/etc/brain-mcp.env`의 `MCP_SERVICE_CLIENTS_FILE`에 연결한다. 초기 내용은 빈 client 목록이라
+FLOW 권한은 아직 없다.
+
+먼저 32자 이상의 새 secret을 FLOW 배포 환경의 `OBRAIN_MCP_CLIENT_SECRET`에 안전하게
+저장한다. 같은 값을 아래 숨김 입력에 한 번 넣는다. helper는 scrypt hash만 반환하며 raw
+secret을 파일이나 출력에 남기지 않는다.
+
+```bash
+cd /opt/brain-mcp
+read -rsp 'FLOW client secret: ' flow_client_secret
+echo
+flow_secret_hash=$(
+  MCP_SERVICE_CLIENT_SECRET="$flow_client_secret" \
+    /usr/bin/node scripts/hash-service-secret.mjs
+)
+unset flow_client_secret
+service_clients_tmp=$(mktemp /etc/brain-mcp-service-clients.json.tmp.XXXXXX)
+jq -n --arg hash "$flow_secret_hash" '{
+  clients: [{
+    clientId: "flow",
+    secretHash: $hash,
+    ownerId: "owner",
+    scopes: ["notes:read"],
+    allowedVaults: ["brain"],
+    enabled: true
+  }]
+}' >"$service_clients_tmp"
+install -o root -g brain -m 0640 "$service_clients_tmp" \
+  /etc/brain-mcp-service-clients.json
+rm -f "$service_clients_tmp"
+unset flow_secret_hash
+systemctl restart brain-mcp
+systemctl is-active brain-mcp
+```
+
+FLOW 또는 Railway에는 다음 변수명만 설정한다. Secret 값은 로그, GitHub, Obsidian 노트,
+이 문서에 복사하지 않는다.
+
+```dotenv
+BRAIN_PROVIDER=obrain-mcp
+OBRAIN_MCP_URL=https://144-24-67-37.sslip.io/mcp
+OBRAIN_MCP_CLIENT_ID=flow
+OBRAIN_MCP_CLIENT_SECRET=<protected secret>
+OBRAIN_MCP_VAULTS=brain
+OBRAIN_SYNC_SECRET=<separate protected scheduler secret>
+OBRAIN_SYNC_MAX_STALE_SECONDS=900
+```
+
+초기 동기화는 FLOW에서 `npm run brain:sync`를 한 번 실행하거나, 보호된
+`POST /api/brain/sync`에 `Authorization: Bearer <OBRAIN_SYNC_SECRET>`를 보내 시작한다. 응답은
+cursor와 생성·수정·삭제 개수만 반환한다. FLOW client에는 Markdown 쓰기·삭제·organizer
+tool이 노출되지 않는다.
+
+Secret을 교체할 때는 새 client ID(예: `flow-next`)와 새 hash를 기존 항목 옆에 먼저 추가하고,
+FLOW의 ID와 secret을 바꿔 동기화를 확인한 뒤 이전 `flow` 항목을 제거한다. 같은 client ID를
+중복해서 넣으면 서버가 시작을 거부한다. 긴급 차단은 해당 항목의 `enabled`를 `false`로 바꾸고
+`brain-mcp`를 재시작한다.
+
 ## Organizer 운영 확인 — provider-disabled 전용
 
 현재 허용된 상태에서는 `/etc/brain-organizer.env`의
