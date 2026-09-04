@@ -1,6 +1,6 @@
 import type { AuditLogger } from "./audit.js";
 import type { IndexCoordinator } from "./index-coordinator.js";
-import type { SearchIndex } from "./search-index.js";
+import type { NoteChangePage, SearchIndex } from "./search-index.js";
 import type { VaultRegistry } from "./vault-registry.js";
 import { VaultError } from "./vault.js";
 import type { OrganizerServiceApi } from "./organizer/types.js";
@@ -75,6 +75,14 @@ export class KnowledgeBase {
       outgoing: this.index.outgoingLinks(input.vault, input.path),
       backlinks: this.index.backlinks(input.vault, input.path),
     };
+  }
+
+  listNoteChanges(input: {
+    allowedVaults: string[];
+    after: number;
+    limit: number;
+  }): NoteChangePage {
+    return this.index.listChanges(input);
   }
 
   async createInboxNote(input: CreateInboxRequest): Promise<{ vault: string; path: string }> {

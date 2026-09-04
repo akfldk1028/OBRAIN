@@ -1,6 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { KnowledgeBase } from "./knowledge-base.js";
+import { KnowledgeView, type KnowledgeAccessPolicy } from "./knowledge-view.js";
 import { VaultError } from "./vault.js";
 import { registerOrganizerTools } from "./organizer/tools.js";
 
@@ -22,7 +23,12 @@ const wrap = (handler: (input: any) => Promise<ToolResult>) => async (input: any
   }
 };
 
-export function registerKnowledgeTools(server: McpServer, knowledge: KnowledgeBase): void {
+export function registerKnowledgeTools(
+  server: McpServer,
+  knowledge: KnowledgeBase,
+  policy: KnowledgeAccessPolicy,
+): void {
+  const view = new KnowledgeView(knowledge, policy);
   const vaultId = z.string().regex(/^[a-z0-9][a-z0-9_-]{0,63}$/);
   const notePath = z.string().min(1).max(1024);
   const frontmatterValue = z.union([
@@ -41,7 +47,7 @@ export function registerKnowledgeTools(server: McpServer, knowledge: KnowledgeBa
       description: "List authorized Obsidian vaults.",
       inputSchema: {},
     },
-    async () => json(knowledge.listVaults()),
+    async () => json(view.listVaults()),
   );
   server.registerTool(
     "list_notes",
@@ -55,7 +61,7 @@ export function registerKnowledgeTools(server: McpServer, knowledge: KnowledgeBa
         cursor: z.number().int().min(0).optional(),
       },
     },
-    wrap(async (input) => json(await knowledge.listNotes(input))),
+    wrap(async (input) => json(await view.listNotes(input))),
   );
   server.registerTool(
     "read_note",
@@ -64,7 +70,7 @@ export function registerKnowledgeTools(server: McpServer, knowledge: KnowledgeBa
       description: "Read one Markdown note.",
       inputSchema: { vault: vaultId, path: notePath },
     },
-    wrap(async (input) => json(await knowledge.readNote(input))),
+    wrap(async (input) => json(await view.readNote(input))),
   );
   server.registerTool(
     "search_notes",
@@ -77,7 +83,7 @@ export function registerKnowledgeTools(server: McpServer, knowledge: KnowledgeBa
         limit: z.number().int().min(1).max(200).optional(),
       },
     },
-    wrap(async (input) => json(await knowledge.searchNotes(input))),
+    wrap(async (input) => json(await view.searchNotes(input))),
   );
   server.registerTool(
     "get_note_links",
@@ -86,21 +92,38 @@ export function registerKnowledgeTools(server: McpServer, knowledge: KnowledgeBa
       description: "Return outgoing links and backlinks for one note.",
       inputSchema: { vault: vaultId, path: notePath },
     },
-    wrap(async (input) => json(await knowledge.getNoteLinks(input))),
+    wrap(async (input) => json(await view.getNoteLinks(input))),
   );
-  server.registerTool(
-    "create_inbox_note",
-    {
-      title: "Create inbox note",
-      description: "Create a new note only in the selected vault's Agent-Inbox.",
-      inputSchema: {
-        vault: vaultId,
-        title: z.string().min(1).max(200),
-        content: z.string().max(1_048_576),
-        frontmatter: frontmatter.optional(),
+  if (policy.changeFeed) {
+    server.registerTool(
+      "list_note_changes",
+      {
+        title: "List note changes",
+        description: "List authorized note changes after a durable cursor.",
+        inputSchema: {
+          vaults: z.array(vaultId).max(64).optional(),
+          after: z.number().int().min(0).optional(),
+          limit: z.number().int().min(1).max(200).optional(),
+        },
       },
-    },
-    wrap(async (input) => json(await knowledge.createInboxNote(input))),
-  );
-  registerOrganizerTools(server, knowledge);
+      wrap(async (input) => json(await view.listNoteChanges(input))),
+    );
+  }
+  if (policy.inboxWrite) {
+    server.registerTool(
+      "create_inbox_note",
+      {
+        title: "Create inbox note",
+        description: "Create a new note only in the selected vault's Agent-Inbox.",
+        inputSchema: {
+          vault: vaultId,
+          title: z.string().min(1).max(200),
+          content: z.string().max(1_048_576),
+          frontmatter: frontmatter.optional(),
+        },
+      },
+      wrap(async (input) => json(await view.createInboxNote(input))),
+    );
+  }
+  if (policy.organizer) registerOrganizerTools(server, knowledge);
 }
