@@ -26,7 +26,8 @@
 - Railway deployment: `280c5868-433c-443a-bada-724c0b0aa60f`
 - Runtime: Node.js `22.23.2`
 - 자동 증분 동기화: `flow-obrain-sync.timer`, 5분 간격, active/enabled
-- 운영 검증: provider connected, search 8건, graph 40 nodes / 244 edges
+- 운영 검증: provider connected, OBRAIN search 8건, handoff 검색 4건, graph 42 nodes / 269 edges
+- 로컬 Syncthing: `idle`, 대기 0, local/global 66/66
 
 > [!note] 비밀정보 위치
 > 비밀번호·토큰·원문 비밀값은 이 문서와 Git 저장소에 기록하지 않는다. Oracle은 단방향 scrypt 해시만 보관하고, FLOW는 배포 환경의 비밀 저장소를 사용한다.
