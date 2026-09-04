@@ -54,12 +54,20 @@ else
 fi
 
 install -d -o brain -g brain -m 0700 /srv/brain/data /srv/brain/backups /srv/brain/syncthing /srv/brain/vaults
+install -d -o brain -g brain -m 0700 /srv/brain/data/organizer /srv/brain/data/organizer/transactions
 for brain_vault_id in "${brain_vault_ids[@]}"; do
   install -d -o brain -g brain -m 0700 \
     "/srv/brain/vaults/$brain_vault_id" \
     "/srv/brain/vaults/$brain_vault_id/Agent-Inbox" \
     "/srv/brain/vaults/$brain_vault_id/.stfolder"
 done
+
+if [[ ! -f /etc/brain-organizer.env ]]; then
+  install -o root -g brain -m 0640 deploy/brain-organizer.env.example /etc/brain-organizer.env
+else
+  chown root:brain /etc/brain-organizer.env
+  chmod 0640 /etc/brain-organizer.env
+fi
 
 if [[ -f /etc/brain-mcp.env ]]; then
   brain_jwt_secret=$(sed -n 's/^MCP_JWT_SECRET=//p' /etc/brain-mcp.env)
@@ -68,15 +76,19 @@ else
 fi
 if [[ -f /root/brain-mcp-owner-passphrase.txt ]]; then
   brain_owner_passphrase=$(tr -d '\r\n' </root/brain-mcp-owner-passphrase.txt)
+elif [[ -f /etc/brain-mcp-config.json ]]; then
+  brain_owner_passphrase=$(jq -r '.owner.passphrase // empty' /etc/brain-mcp-config.json)
 else
   brain_owner_passphrase=$(openssl rand -base64 36 | tr -d '\r\n')
-  printf '%s\n' "$brain_owner_passphrase" >/root/brain-mcp-owner-passphrase.txt
-  chmod 600 /root/brain-mcp-owner-passphrase.txt
 fi
 [[ ${#brain_jwt_secret} -eq 64 && ${#brain_owner_passphrase} -ge 32 ]] || {
   echo "invalid retained secret" >&2
   exit 1
 }
+if [[ ! -f /root/brain-mcp-owner-passphrase.txt ]]; then
+  printf '%s\n' "$brain_owner_passphrase" >/root/brain-mcp-owner-passphrase.txt
+  chmod 600 /root/brain-mcp-owner-passphrase.txt
+fi
 
 {
   printf 'MCP_PUBLIC_URL=https://%s\n' "$PUBLIC_HOST"
@@ -87,19 +99,36 @@ fi
 chmod 600 /etc/brain-mcp.env
 
 brain_vault_json=$(printf '%s\n' "${brain_vault_ids[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')
-jq -n \
-  --arg passphrase "$brain_owner_passphrase" \
-  --argjson ids "$brain_vault_json" \
-  '{
-    dataDir: "/srv/brain/data",
-    owner: {id: "owner", passphrase: $passphrase, allowedVaults: $ids},
-    vaults: [$ids[] | {id: ., root: ("/srv/brain/vaults/" + .)}]
-  }' >/etc/brain-mcp-config.json
+brain_organizer_json='{"enabledVaults":["brain"],"mode":"disabled","minStableSeconds":300,"autoApplyConfidence":0.9,"maxNotesPerRun":20,"maxNoteBytes":131072,"maxContextBytes":262144,"proposalTtlHours":24,"recoveryDays":30,"reportsDirectory":"60_Tools/61_Obsidian_MCP/90_Auto_Organizer_Reports"}'
+brain_config_tmp=$(mktemp /etc/brain-mcp-config.json.tmp.XXXXXX)
+trap 'rm -f -- "$brain_config_tmp"' EXIT
+if [[ -f /etc/brain-mcp-config.json ]]; then
+  jq \
+    --argjson organizer "$brain_organizer_json" \
+    '.organizer = $organizer' \
+    /etc/brain-mcp-config.json >"$brain_config_tmp"
+else
+  jq -n \
+    --arg passphrase "$brain_owner_passphrase" \
+    --argjson ids "$brain_vault_json" \
+    --argjson organizer "$brain_organizer_json" \
+    '{
+      dataDir: "/srv/brain/data",
+      owner: {id: "owner", passphrase: $passphrase, allowedVaults: $ids},
+      vaults: [$ids[] | {id: ., root: ("/srv/brain/vaults/" + .)}],
+      organizer: $organizer
+    }' >"$brain_config_tmp"
+fi
+install -o brain -g brain -m 0600 "$brain_config_tmp" /etc/brain-mcp-config.json
+rm -f -- "$brain_config_tmp"
+trap - EXIT
 chown brain:brain /etc/brain-mcp-config.json
 chmod 600 /etc/brain-mcp-config.json
 
 install -o root -g root -m 0644 deploy/brain-mcp.service /etc/systemd/system/brain-mcp.service
 install -o root -g root -m 0644 deploy/brain-syncthing.service /etc/systemd/system/brain-syncthing.service
+install -o root -g root -m 0644 deploy/brain-organizer.service /etc/systemd/system/
+install -o root -g root -m 0644 deploy/brain-organizer.timer /etc/systemd/system/
 sed "s/__PUBLIC_HOST__/$PUBLIC_HOST/g" deploy/Caddyfile >/etc/caddy/Caddyfile
 chown root:caddy /etc/caddy/Caddyfile
 chmod 640 /etc/caddy/Caddyfile
@@ -120,7 +149,7 @@ systemctl daemon-reload
 systemctl enable --now brain-syncthing
 BRAIN_VAULT_IDS="$brain_vault_csv" /usr/local/sbin/brain-syncthing-configure
 caddy validate --config /etc/caddy/Caddyfile
-systemctl enable brain-mcp caddy brain-mcp-backup.timer
+systemctl enable brain-mcp caddy brain-mcp-backup.timer brain-organizer.timer
 systemctl restart brain-mcp caddy
 systemctl start brain-mcp-backup.timer
 

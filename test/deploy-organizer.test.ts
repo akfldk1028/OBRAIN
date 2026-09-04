@@ -1,5 +1,26 @@
+import { spawnSync } from "node:child_process";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { readFile } from "node:fs/promises";
-import { describe, expect, it } from "vitest";
+import { basename, join, resolve } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+
+const cleanupPaths: string[] = [];
+
+afterEach(() => {
+  for (const cleanupPath of cleanupPaths.splice(0)) {
+    rmSync(cleanupPath, { force: true, recursive: true });
+  }
+});
 
 type UnitFile = Map<string, Map<string, string[]>>;
 
@@ -46,6 +67,83 @@ function parseEnvironmentFile(source: string): Map<string, string> {
     environment.set(line.slice(0, separator), line.slice(separator + 1));
   }
   return environment;
+}
+
+function bashPath(filePath: string): string {
+  return process.platform === "win32"
+    ? filePath.replace(/^([A-Za-z]):/u, (_, drive: string) => `/${drive.toLowerCase()}`).replaceAll("\\", "/")
+    : filePath;
+}
+
+function logicalShellLines(source: string): string[] {
+  const lines: string[] = [];
+  let continued = "";
+  for (const rawLine of source.split(/\r?\n/u)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    if (line.endsWith("\\")) {
+      continued += `${line.slice(0, -1).trim()} `;
+      continue;
+    }
+    lines.push(`${continued}${line}`.trim());
+    continued = "";
+  }
+  if (continued) throw new Error("unterminated shell continuation");
+  return lines;
+}
+
+function shellWords(line: string): string[] {
+  return [...line.matchAll(/"([^"]*)"|'([^']*)'|([^\s]+)/gu)]
+    .map((match) => match[1] ?? match[2] ?? match[3]!);
+}
+
+function commands(lines: string[], name: string): string[][] {
+  return lines.map(shellWords).filter((tokens) => tokens[0] === name);
+}
+
+function conditionalBranches(lines: string[], opening: string): { whenTrue: string[]; whenFalse: string[] } {
+  const start = lines.indexOf(opening);
+  if (start < 0) throw new Error(`missing conditional: ${opening}`);
+  const whenTrue: string[] = [];
+  const whenFalse: string[] = [];
+  let branch = whenTrue;
+  let depth = 1;
+  for (const line of lines.slice(start + 1)) {
+    if (/^if\b.*;\s*then$/u.test(line)) depth += 1;
+    if (line === "fi") {
+      depth -= 1;
+      if (depth === 0) return { whenTrue, whenFalse };
+    }
+    if (depth === 1 && line === "else") {
+      branch = whenFalse;
+      continue;
+    }
+    if (depth === 1) branch.push(line);
+  }
+  throw new Error(`unterminated conditional: ${opening}`);
+}
+
+function conditionalArm(lines: string[], opening: string): string[] {
+  const start = lines.indexOf(opening);
+  if (start < 0) throw new Error(`missing conditional arm: ${opening}`);
+  const arm: string[] = [];
+  let depth = 1;
+  for (const line of lines.slice(start + 1)) {
+    if (/^if\b.*;\s*then$/u.test(line)) depth += 1;
+    if (line === "fi") {
+      depth -= 1;
+      if (depth === 0) return arm;
+    }
+    if (depth === 1 && (/^elif\b.*;\s*then$/u.test(line) || line === "else")) return arm;
+    if (depth === 1) arm.push(line);
+  }
+  throw new Error(`unterminated conditional arm: ${opening}`);
+}
+
+function jsonAssignment(source: string, name: string): unknown {
+  const match = new RegExp(`^${name}='([^']+)'$`, "mu").exec(source);
+  if (!match) throw new Error(`missing JSON assignment: ${name}`);
+  return JSON.parse(match[1]!);
 }
 
 describe("organizer deployment units", () => {
@@ -138,4 +236,154 @@ describe("organizer deployment units", () => {
       "-/etc/brain-organizer.env",
     ]);
   });
+
+  it("installs organizer state and units while preserving an existing provider environment", async () => {
+    const source = await readFile("deploy/install.sh", "utf8");
+    const lines = logicalShellLines(source);
+    const installCommands = commands(lines, "install");
+
+    expect(installCommands).toContainEqual([
+      "install", "-d", "-o", "brain", "-g", "brain", "-m", "0700",
+      "/srv/brain/data/organizer", "/srv/brain/data/organizer/transactions",
+    ]);
+    expect(installCommands).toContainEqual([
+      "install", "-o", "root", "-g", "root", "-m", "0644",
+      "deploy/brain-organizer.service", "/etc/systemd/system/",
+    ]);
+    expect(installCommands).toContainEqual([
+      "install", "-o", "root", "-g", "root", "-m", "0644",
+      "deploy/brain-organizer.timer", "/etc/systemd/system/",
+    ]);
+
+    const environment = conditionalBranches(lines, "if [[ ! -f /etc/brain-organizer.env ]]; then");
+    expect(commands(environment.whenTrue, "install")).toEqual([[
+      "install", "-o", "root", "-g", "brain", "-m", "0640",
+      "deploy/brain-organizer.env.example", "/etc/brain-organizer.env",
+    ]]);
+    expect(commands(environment.whenFalse, "chown")).toEqual([
+      ["chown", "root:brain", "/etc/brain-organizer.env"],
+    ]);
+    expect(commands(environment.whenFalse, "chmod")).toEqual([
+      ["chmod", "0640", "/etc/brain-organizer.env"],
+    ]);
+  });
+
+  it("merges exact disabled organizer policy into existing MCP config and only enables its timer", async () => {
+    const source = await readFile("deploy/install.sh", "utf8");
+    const lines = logicalShellLines(source);
+
+    expect(jsonAssignment(source, "brain_organizer_json")).toEqual({
+      enabledVaults: ["brain"],
+      mode: "disabled",
+      minStableSeconds: 300,
+      autoApplyConfidence: 0.9,
+      maxNotesPerRun: 20,
+      maxNoteBytes: 131_072,
+      maxContextBytes: 262_144,
+      proposalTtlHours: 24,
+      recoveryDays: 30,
+      reportsDirectory: "60_Tools/61_Obsidian_MCP/90_Auto_Organizer_Reports",
+    });
+
+    const existingConfig = conditionalBranches(lines, "if [[ -f /etc/brain-mcp-config.json ]]; then");
+    const merge = commands(existingConfig.whenTrue, "jq");
+    expect(merge).toHaveLength(1);
+    expect(merge[0]).toEqual(expect.arrayContaining([
+      "--argjson", "organizer", "$brain_organizer_json", ".organizer = $organizer",
+      "/etc/brain-mcp-config.json",
+    ]));
+
+    const systemctl = commands(lines, "systemctl");
+    expect(systemctl).toContainEqual([
+      "systemctl", "enable", "brain-mcp", "caddy", "brain-mcp-backup.timer", "brain-organizer.timer",
+    ]);
+    expect(systemctl.some((tokens) => tokens.includes("brain-organizer.service"))).toBe(false);
+  });
+
+  it("recovers the existing owner passphrase from MCP config when its root copy is absent", async () => {
+    const lines = logicalShellLines(await readFile("deploy/install.sh", "utf8"));
+    const recovered = conditionalArm(lines, "elif [[ -f /etc/brain-mcp-config.json ]]; then");
+
+    expect(recovered).toEqual([
+      "brain_owner_passphrase=$(jq -r '.owner.passphrase // empty' /etc/brain-mcp-config.json)",
+    ]);
+    const validation = lines.indexOf("[[ ${#brain_jwt_secret} -eq 64 && ${#brain_owner_passphrase} -ge 32 ]] || {");
+    const persistenceStart = lines.indexOf("if [[ ! -f /root/brain-mcp-owner-passphrase.txt ]]; then");
+    expect(validation).toBeGreaterThan(-1);
+    expect(persistenceStart).toBeGreaterThan(validation);
+    expect(conditionalBranches(lines, "if [[ ! -f /root/brain-mcp-owner-passphrase.txt ]]; then").whenTrue).toEqual([
+      "printf '%s\\n' \"$brain_owner_passphrase\" >/root/brain-mcp-owner-passphrase.txt",
+      "chmod 600 /root/brain-mcp-owner-passphrase.txt",
+    ]);
+  });
+
+  it("backs up organizer recovery state without copying the provider environment", () => {
+    const backupSource = readFileSync("deploy/backup.sh", "utf8");
+    const backupLines = logicalShellLines(backupSource);
+    expect(backupLines).toContain("brain_archive_root=${BRAIN_ARCHIVE_ROOT:-/srv/brain/backups}");
+    expect(backupLines).toContain("brain_vault_root=${BRAIN_VAULT_ROOT:-/srv/brain}");
+    expect(backupLines).toContain("brain_data_root=${BRAIN_DATA_ROOT:-/srv/brain/data}");
+    expect(backupLines).toContain("brain_config_file=${BRAIN_CONFIG_FILE:-/etc/brain-mcp-config.json}");
+    expect(commands(backupLines, "tar")).toContainEqual([
+      "tar", "--xattrs", "--acls", "-C", "$brain_data_root", "-czf",
+      "$brain_backup_dest/organizer-state.tgz", "organizer",
+    ]);
+
+    const testTmp = resolve(".test-tmp");
+    mkdirSync(testTmp, { recursive: true });
+    const root = mkdtempSync(join(testTmp, "brain-organizer-backup-"));
+    cleanupPaths.push(root);
+    const relativeRoot = `.test-tmp/${basename(root)}`;
+    const brainRoot = join(root, "srv/brain");
+    const organizerRoot = join(brainRoot, "data/organizer");
+    const configPath = join(root, "etc/brain-mcp-config.json");
+    const providerEnvironmentPath = join(root, "etc/brain-organizer.env");
+
+    mkdirSync(join(brainRoot, "vaults/brain"), { recursive: true });
+    mkdirSync(join(organizerRoot, "transactions/ORG-example"), { recursive: true });
+    mkdirSync(join(root, "etc"), { recursive: true });
+    writeFileSync(join(brainRoot, "vaults/brain/note.md"), "safe fixture", "utf8");
+    writeFileSync(join(organizerRoot, "organizer.sqlite"), "state", "utf8");
+    writeFileSync(join(organizerRoot, "transactions/ORG-example/manifest.json"), "{}", "utf8");
+    writeFileSync(configPath, "{}", "utf8");
+    writeFileSync(providerEnvironmentPath, "DASHSCOPE_API_KEY=must-not-be-backed-up\n", "utf8");
+    chmodSync(configPath, 0o600);
+
+    const script = resolve("deploy/backup.sh");
+    const bash = process.platform === "win32" ? "C:\\Program Files\\Git\\bin\\bash.exe" : "bash";
+    const result = spawnSync(bash, ["-c", `exec bash '${bashPath(script)}'`], {
+      cwd: resolve("."),
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        BRAIN_ARCHIVE_ROOT: `${relativeRoot}/srv/brain/backups`,
+        BRAIN_VAULT_ROOT: `${relativeRoot}/srv/brain`,
+        BRAIN_DATA_ROOT: `${relativeRoot}/srv/brain/data`,
+        BRAIN_CONFIG_FILE: `${relativeRoot}/etc/brain-mcp-config.json`,
+      },
+    });
+    expect(result.status, result.stderr).toBe(0);
+
+    const backupRoot = join(brainRoot, "backups");
+    const [stamp] = readdirSync(backupRoot);
+    expect(stamp).toMatch(/^\d{8}T\d{6}Z$/u);
+    const destination = join(backupRoot, stamp!);
+    expect(statSync(join(destination, "organizer-state.tgz")).isFile()).toBe(true);
+    expect(existsSync(join(destination, "brain-organizer.env"))).toBe(false);
+
+    const listed = spawnSync(bash, ["-c", `tar -tzf '${bashPath(join(destination, "organizer-state.tgz"))}'`], {
+      cwd: resolve("."),
+      encoding: "utf8",
+    });
+    expect(listed.status, listed.stderr).toBe(0);
+    expect(listed.stdout.split(/\r?\n/u).filter(Boolean).sort()).toEqual([
+      "organizer/",
+      "organizer/organizer.sqlite",
+      "organizer/transactions/",
+      "organizer/transactions/ORG-example/",
+      "organizer/transactions/ORG-example/manifest.json",
+    ]);
+    expect(listed.stdout).not.toContain("brain-organizer.env");
+    expect(readFileSync(providerEnvironmentPath, "utf8")).toContain("must-not-be-backed-up");
+  }, 15_000);
 });
