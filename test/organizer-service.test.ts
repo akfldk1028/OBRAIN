@@ -37,7 +37,7 @@ class FakeProvider implements OrganizerProvider {
   }
 }
 
-type ReportPublicationEvent = "after_parent_bound" | "before_cleanup";
+type ReportPublicationEvent = "after_parent_bound" | "after_content_write" | "before_cleanup";
 
 async function fixture(content = "# Inbox\n\nordinary note"): Promise<{ root: string; source: string; service: (provider?: OrganizerProvider | ((options: { maxContextBytes: number }) => OrganizerProvider), config?: Partial<OrganizerConfig>, timestamp?: string, onBeforeReportOpen?: () => void | Promise<void>, onReportPublicationEvent?: (event: ReportPublicationEvent) => void | Promise<void>) => OrganizerService }> {
   const root = await mkdtemp(path.join(os.tmpdir(), "brain-organizer-service-"));

@@ -1,7 +1,7 @@
-import { mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, open, readFile, readdir, rename, rm, writeFile, type FileHandle } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { acquireOrganizerLock } from "../src/organizer/lock.js";
 
 const roots: string[] = [];
@@ -13,8 +13,18 @@ async function lockPath(): Promise<string> {
 }
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
+
+async function fileHandlePrototype(file: string): Promise<FileHandle> {
+  const probePath = `${file}.prototype-probe`;
+  const probe = await open(probePath, "w+");
+  const prototype = Object.getPrototypeOf(probe) as FileHandle;
+  await probe.close();
+  await rm(probePath, { force: true });
+  return prototype;
+}
 
 describe("organizer lock", () => {
   it("refuses a second acquisition, then allows a release and reacquisition", async () => {
@@ -48,6 +58,72 @@ describe("organizer lock", () => {
     });
     expect(lock).toBeDefined();
     await lock?.release();
+  });
+
+  it("refuses stale ownership transfer when filesystem identity is unavailable", async () => {
+    const file = await lockPath();
+    const stale = JSON.stringify({ pid: 123, startedAt: "2020-01-01T00:00:00.000Z", owner: "stale-lock" });
+    await writeFile(file, stale, "utf8");
+    const prototype = await fileHandlePrototype(file);
+    const originalStat = prototype.stat;
+    let unavailableIdentityObserved = false;
+
+    const acquired = await acquireOrganizerLock({
+      path: file,
+      maxRunDurationMs: 1,
+      now: () => new Date("2026-09-04T12:00:00.000Z"),
+      isProcessAlive: () => false,
+      onBeforeStaleTransfer: () => {
+        vi.spyOn(prototype, "stat").mockImplementationOnce(async function (this: FileHandle, options) {
+          const actual = await Reflect.apply(originalStat, this, [options]);
+          unavailableIdentityObserved = true;
+          return new Proxy(actual, {
+            get(target, property) {
+              if (property === "dev" || property === "ino") return 0n;
+              const value = Reflect.get(target, property, target);
+              return typeof value === "function" ? value.bind(target) : value;
+            },
+          });
+        });
+      },
+    });
+
+    expect(unavailableIdentityObserved).toBe(true);
+    expect(acquired).toBeUndefined();
+    expect(await readFile(file, "utf8")).toBe(stale);
+  });
+
+  it.each([
+    ["empty", ""],
+    ["partial", '{"pid":777'],
+  ] as const)("does not overwrite a live legacy process's %s primary after coordinator transfer", async (_kind, legacyPrimary) => {
+    const file = await lockPath();
+    const displaced = `${file}.crashed`;
+    const crashed = await acquireOrganizerLock({
+      path: file,
+      maxRunDurationMs: 1,
+      now: () => new Date("2020-01-01T00:00:00.000Z"),
+    });
+    expect(crashed).toBeDefined();
+    const crashedPrimary = await readFile(file, "utf8");
+    let coordinatorTransferred = false;
+
+    const acquired = await acquireOrganizerLock({
+      path: file,
+      maxRunDurationMs: 1,
+      now: () => new Date("2026-09-04T12:00:00.000Z"),
+      isProcessAlive: (pid) => pid === 777,
+      onCoordinatorClaimed: async () => {
+        coordinatorTransferred = true;
+        await rename(file, displaced);
+        await writeFile(file, legacyPrimary, "utf8");
+      },
+    });
+
+    expect(coordinatorTransferred).toBe(true);
+    expect(acquired).toBeUndefined();
+    expect(await readFile(file, "utf8")).toBe(legacyPrimary);
+    expect(await readFile(displaced, "utf8")).toBe(crashedPrimary);
   });
 
   it("allows only one contender to take over the same stale lock", async () => {

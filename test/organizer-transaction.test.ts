@@ -1,9 +1,9 @@
 import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
-import { chmod, link, lstat, mkdir, mkdtemp, readFile, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, link, lstat, mkdir, mkdtemp, open, readFile, rename, rm, stat, symlink, writeFile, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { renderAreaCanvas } from "../src/foundation/canvas.js";
 import { BRAIN_FOUNDATION_POLICY, areaCanvasPath, areaMocPath } from "../src/foundation/policy.js";
 import { renderManagedAreaCanvas } from "../src/organizer/managed-canvas.js";
@@ -51,6 +51,7 @@ interface Fixture {
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
+  vi.restoreAllMocks();
   while (cleanups.length) await cleanups.pop()!();
 });
 
@@ -101,6 +102,24 @@ async function fixture(): Promise<Fixture> {
   };
   cleanups.push(cleanup);
   return { root, vault, recovery, database, store, proposal, plan, cleanup };
+}
+
+async function fileHandlePrototype(input: Fixture): Promise<FileHandle> {
+  const probePath = path.join(input.root, "file-handle-prototype-probe");
+  const probe = await open(probePath, "w+");
+  const prototype = Object.getPrototypeOf(probe) as FileHandle;
+  await probe.close();
+  await rm(probePath, { force: true });
+  return prototype;
+}
+
+async function readTextOrUndefined(file: string): Promise<string | undefined> {
+  try {
+    return await readFile(file, "utf8");
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
 }
 
 function engine(
@@ -164,6 +183,91 @@ async function replaceProposalSource(input: Fixture, nextSourcePath: string): Pr
 }
 
 describe("organizer transaction engine", () => {
+  it.each(["partial-write", "sync", "chmod"] as const)(
+    "scrubs the exact report object and durably removes its Vault name after a %s failure",
+    async (failure) => {
+      const input = await fixture();
+      const reportDirectory = path.join(input.vault, "reports");
+      await mkdir(reportDirectory);
+      const owner = `RUN-${failure}`;
+      const report = path.join(reportDirectory, `${failure}.json`);
+      const temp = path.join(reportDirectory, `.brain-organizer-${owner}-report.tmp`);
+      const outsideLink = path.join(input.root, `${failure}-outside.json`);
+      const reportContent = Buffer.from("REPORT-CONTENT-MUST-NOT-SURVIVE", "utf8");
+      const prototype = await fileHandlePrototype(input);
+      const originalSync = prototype.sync;
+      let failedSync = false;
+      let cleanupDirectorySyncs = 0;
+
+      vi.spyOn(prototype, "sync").mockImplementation(async function (this: FileHandle) {
+        const info = await this.stat();
+        if (info.isDirectory()) cleanupDirectorySyncs += 1;
+        if (failure === "sync" && info.isFile() && !failedSync) {
+          failedSync = true;
+          throw new Error("deterministic report sync failure");
+        }
+        return originalSync.call(this);
+      });
+      if (failure === "partial-write") {
+        vi.spyOn(prototype, "writeFile").mockImplementationOnce(async function (this: FileHandle, data) {
+          const bytes = Buffer.from(data as Uint8Array);
+          const partial = bytes.subarray(0, 7);
+          await this.write(partial, 0, partial.length, 0);
+          throw new Error("deterministic partial report write failure");
+        });
+      }
+      if (failure === "chmod") {
+        vi.spyOn(prototype, "chmod").mockRejectedValueOnce(new Error("deterministic report chmod failure"));
+      }
+
+      await expect(engine(input).publishCreateOnlyArtifact({
+        vaultRoot: input.vault,
+        relativePath: `reports/${failure}.json`,
+        owner,
+        content: reportContent,
+        onEvent: async (event) => {
+          if (event === "before_cleanup") await link(temp, outsideLink);
+        },
+      })).rejects.toThrow(/partial report write|report sync|report chmod/i);
+
+      expect(await readTextOrUndefined(report)).toBeUndefined();
+      expect(await readTextOrUndefined(temp)).toBeUndefined();
+      expect(await readTextOrUndefined(outsideLink)).toBe("");
+      expect(cleanupDirectorySyncs).toBeGreaterThan(0);
+    },
+  );
+
+  it("scrubs the exact report object when its namespace becomes untrustworthy after writing", async () => {
+    const input = await fixture();
+    const reportDirectory = path.join(input.vault, "reports");
+    const outsideDirectory = path.join(input.root, "outside");
+    await mkdir(reportDirectory);
+    await mkdir(outsideDirectory);
+    const owner = "RUN-namespace-uncertain";
+    const tempName = `.brain-organizer-${owner}-report.tmp`;
+    const temp = path.join(reportDirectory, tempName);
+    const outsideObject = path.join(outsideDirectory, "leaked-report.json");
+    const reportContent = "REPORT-CONTENT-MUST-NOT-SURVIVE";
+    let namespaceChanged = false;
+
+    await expect(engine(input).publishCreateOnlyArtifact({
+      vaultRoot: input.vault,
+      relativePath: "reports/namespace.json",
+      owner,
+      content: reportContent,
+      onEvent: async (event) => {
+        if (event !== "after_content_write") return;
+        namespaceChanged = true;
+        await rename(temp, outsideObject);
+      },
+    })).rejects.toThrow(/identity|escaped|exist|path|directory/i);
+
+    expect(namespaceChanged).toBe(true);
+    expect(await readTextOrUndefined(path.join(outsideDirectory, "namespace.json"))).toBeUndefined();
+    expect(await readTextOrUndefined(outsideObject)).toBe("");
+    expect(await readTextOrUndefined(temp)).toBeUndefined();
+  });
+
   it("durably snapshots before applying and records database state last", async () => {
     const input = await fixture();
     const events: TransactionEvent[] = [];

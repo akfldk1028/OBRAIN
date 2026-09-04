@@ -193,7 +193,7 @@ export interface OrganizerTransactionEngineOptions {
   onEvent?: (event: TransactionEvent) => void | Promise<void>;
 }
 
-export type CreateOnlyVaultArtifactEvent = "after_parent_bound" | "before_cleanup";
+export type CreateOnlyVaultArtifactEvent = "after_parent_bound" | "after_content_write" | "before_cleanup";
 
 export interface CreateOnlyVaultArtifactPlan {
   vaultRoot: string;
@@ -1076,7 +1076,7 @@ async function publishCreateOnlyVaultArtifact(plan: CreateOnlyVaultArtifactPlan)
   let ownedStat: BigIntStats | undefined;
   let cleanupTemp: string | undefined;
   let cleanupTarget: string | undefined;
-  let wroteContent = false;
+  let contentWriteStarted = false;
   try {
     await assertDestinationAbsent(parent, filename);
     await revalidateDirectory(parent);
@@ -1098,10 +1098,11 @@ async function publishCreateOnlyVaultArtifact(plan: CreateOnlyVaultArtifactPlan)
     ) throw new TransactionValidationError("create-only artifact staging object escaped its bound parent");
     await revalidateDirectory(parent);
 
+    contentWriteStarted = true;
     await handle.writeFile(plan.content);
+    await plan.onEvent?.("after_content_write");
     await handle.sync();
     await handle.chmod(0o600);
-    wroteContent = true;
     const written = await handle.stat({ bigint: true });
     const writtenPath = await lstat(canonicalTemp, { bigint: true });
     if (!written.isFile() || !provableIdentity(ownedStat, written) || !provableIdentity(written, writtenPath)) {
@@ -1135,7 +1136,7 @@ async function publishCreateOnlyVaultArtifact(plan: CreateOnlyVaultArtifactPlan)
     await syncDirectory(parent.canonicalPath);
   } catch (error: unknown) {
     let cleanupError: unknown;
-    if (handle && wroteContent) {
+    if (handle && contentWriteStarted) {
       try {
         await handle.truncate(0);
         await handle.sync();
@@ -1156,6 +1157,7 @@ async function publishCreateOnlyVaultArtifact(plan: CreateOnlyVaultArtifactPlan)
           throw new TransactionValidationError("create-only artifact cleanup target changed identity");
         }
         await unlink(candidate);
+        await syncDirectory(path.dirname(candidate));
       } catch (next: unknown) {
         if ((next as NodeJS.ErrnoException).code !== "ENOENT") cleanupError ??= next;
       }

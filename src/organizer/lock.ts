@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, mkdir, open, readFile, realpath, unlink, type FileHandle } from "node:fs/promises";
 import path from "node:path";
-import { claimLockCoordinator, releaseLockCoordinator, type LockCoordinatorLease } from "./lock-coordinator.js";
+import { claimLockCoordinator, releaseLockCoordinator } from "./lock-coordinator.js";
 
 interface LockRecord {
   pid: number;
@@ -26,6 +26,8 @@ export interface AcquireOrganizerLockOptions {
   onBeforeGuardClaim?: () => void | Promise<void>;
   /** Test/diagnostic hook after the stale primary object is opened and before ownership transfer. */
   onBeforeStaleTransfer?: () => void | Promise<void>;
+  /** Test/diagnostic hook after coordinator ownership changes and before the primary is opened. */
+  onCoordinatorClaimed?: () => void | Promise<void>;
 }
 
 function processAlive(pid: number): boolean {
@@ -59,8 +61,8 @@ function stale(record: LockRecord, at: Date, maxRunDurationMs: number, alive: (p
 type BigStat = Awaited<ReturnType<FileHandle["stat"]>>;
 
 function sameIdentity(left: BigStat, right: BigStat): boolean {
-  if ((left.dev === 0n && left.ino === 0n) || (right.dev === 0n && right.ino === 0n)) return true;
-  return left.dev === right.dev && left.ino === right.ino;
+  return !(left.dev === 0n && left.ino === 0n) && !(right.dev === 0n && right.ino === 0n)
+    && left.dev === right.dev && left.ino === right.ino;
 }
 
 async function legacyGuardBlocks(
@@ -127,7 +129,6 @@ async function primaryPathStillNames(lockPath: string, opened: BigStat): Promise
 async function acquirePrimary(
   options: AcquireOrganizerLockOptions,
   content: string,
-  lease: LockCoordinatorLease,
   at: Date,
   alive: (pid: number) => boolean,
 ): Promise<boolean> {
@@ -151,11 +152,7 @@ async function acquirePrimary(
     const opened = await readHandle(handle);
     original = opened.content;
     const current = parseLock(original);
-    if (current) {
-      if (!stale(current, at, options.maxRunDurationMs, alive)) return false;
-    } else if (!lease.previousWasStale) {
-      return false;
-    }
+    if (!current || !stale(current, at, options.maxRunDurationMs, alive)) return false;
     await options.onBeforeStaleTransfer?.();
     mutated = true;
     await replaceHandleContent(handle, content);
@@ -208,7 +205,8 @@ export async function acquireOrganizerLock(options: AcquireOrganizerLockOptions)
   const content = JSON.stringify(record);
   let acquired = false;
   try {
-    acquired = await acquirePrimary(options, content, lease, at, alive);
+    await options.onCoordinatorClaimed?.();
+    acquired = await acquirePrimary(options, content, at, alive);
     if (!acquired) return undefined;
   } finally {
     if (!acquired) await releaseLockCoordinator(options.path, { ...record, generation: record.generation! });
