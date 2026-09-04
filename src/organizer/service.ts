@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, mkdir, open, readFile, readdir, realpath } from "node:fs/promises";
+import { lstat, mkdir, open, readFile, readdir, realpath, unlink } from "node:fs/promises";
 import path from "node:path";
 import { AuditLogger } from "../audit.js";
 import { BRAIN_FOUNDATION_POLICY, areaMocPath } from "../foundation/policy.js";
@@ -29,12 +29,13 @@ export interface OrganizerServiceOptions {
   now?: () => string;
   lockPath: string;
   maxRunDurationMs?: number;
+  onBeforeReportOpen?: () => void | Promise<void>;
 }
 
 function sha(content: string): string { return createHash("sha256").update(content, "utf8").digest("hex"); }
 function compare(left: string, right: string): number { return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8")); }
 function expiry(now: string, hours: number): string { return new Date(Date.parse(now) + hours * 3_600_000).toISOString(); }
-function safeReason(error: unknown): string { return error instanceof Error && /^[a-z_]{3,64}$/u.test(error.message) ? error.message : "processing_failed"; }
+function safeReason(_error: unknown): "processing_failed" { return "processing_failed"; }
 function outside(root: string, candidate: string): boolean { const relative = path.relative(root, candidate); return relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative); }
 type ReportPath = { path: string; reasonCode: string };
 
@@ -216,7 +217,7 @@ export class OrganizerService implements OrganizerServiceApi {
   private provider(): OrganizerProvider { if (this.providerDisabled()) throw new Error("organizer_unavailable"); if (!this.providerInstance) this.providerInstance = typeof this.options.provider === "function" ? this.options.provider({ maxContextBytes: this.options.config.maxContextBytes }) : this.options.provider!; return this.providerInstance; }
   private runMode(requested: OrganizerMode | undefined): OrganizerMode { if (this.providerDisabled()) return "disabled"; const trial = this.options.store.getOrStartTrial(this.now()); if (trial.active) return "dry-run"; if (this.options.config.mode === "dry-run" || requested === "dry-run") return "dry-run"; return "automatic"; }
   private authorize(vault: string) { if (!this.options.config.enabledVaults.includes(vault)) throw new Error("vault_not_enabled"); return this.options.registry.get(vault); }
-  private async writeReport(vault: string, summary: RunSummary, paths: ReportPath[]): Promise<void> { const fs = this.authorize(vault); const directory = await this.reportDirectory(fs.rootPath); const file = path.join(directory, `${summary.runId}.json`); const directoryStat = await lstat(directory); if (directoryStat.isSymbolicLink() || !directoryStat.isDirectory()) throw new Error("report_directory_unsafe"); const flags = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0); const handle = await open(file, flags, 0o600); try { const ordered = [...paths].sort((left, right) => compare(left.path, right.path) || compare(left.reasonCode, right.reasonCode)); await handle.writeFile(JSON.stringify({ runId: summary.runId, mode: summary.mode, paths: ordered, counts: { discovered: summary.discovered, proposed: summary.proposed, applied: summary.applied, review: summary.review, skipped: summary.skipped, failed: summary.failed }, reasonCodes: [...new Set(ordered.map((item) => item.reasonCode))].sort(compare) }), "utf8"); } finally { await handle.close(); } }
+  private async writeReport(vault: string, summary: RunSummary, paths: ReportPath[]): Promise<void> { const fs = this.authorize(vault); const boundRoot = await realpath(fs.rootPath); const directory = await this.reportDirectory(boundRoot); const file = path.join(directory, `${summary.runId}.json`); const directoryStat = await lstat(directory); if (directoryStat.isSymbolicLink() || !directoryStat.isDirectory()) throw new Error("report_directory_unsafe"); await this.options.onBeforeReportOpen?.(); const flags = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0); const handle = await open(file, flags, 0o600); let trusted = false; try { const canonical = await realpath(file); if (outside(boundRoot, canonical)) throw new Error("report_directory_unsafe"); trusted = true; const ordered = [...paths].sort((left, right) => compare(left.path, right.path) || compare(left.reasonCode, right.reasonCode)); await handle.writeFile(JSON.stringify({ runId: summary.runId, mode: summary.mode, paths: ordered, counts: { discovered: summary.discovered, proposed: summary.proposed, applied: summary.applied, review: summary.review, skipped: summary.skipped, failed: summary.failed }, reasonCodes: [...new Set(ordered.map((item) => item.reasonCode))].sort(compare) }), "utf8"); } finally { await handle.close(); if (!trusted) await unlink(file).catch(() => undefined); } }
   private async reportDirectory(root: string): Promise<string> { const boundRoot = await realpath(root); let current = boundRoot; for (const segment of this.options.config.reportsDirectory.split("/")) { const next = path.join(current, segment); try { await mkdir(next, { mode: 0o700 }); } catch (error: unknown) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; } const before = await lstat(next); if (before.isSymbolicLink() || !before.isDirectory()) throw new Error("report_directory_unsafe"); const canonical = await realpath(next); const after = await lstat(next); if (after.isSymbolicLink() || !after.isDirectory() || outside(boundRoot, canonical)) throw new Error("report_directory_unsafe"); current = canonical; } return current; }
   private async record(action: "organizer_propose" | "organizer_apply" | "organizer_undo" | "organizer_run" | "organizer_audit", outcome: "allowed" | "denied", vault: string, path?: string, reason?: string): Promise<void> { await this.options.auditLogger?.record({ action, outcome, vault, path, reason }); }
 }

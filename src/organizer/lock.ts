@@ -87,10 +87,20 @@ export async function acquireOrganizerLock(options: AcquireOrganizerLockOptions)
       await options.onStaleObserved?.();
       let takeover: Awaited<ReturnType<typeof open>>;
       try { takeover = await open(takeoverPath, "wx", 0o600); } catch (takeoverError: unknown) {
-        if ((takeoverError as NodeJS.ErrnoException).code === "EEXIST") return undefined;
-        throw takeoverError;
+        if ((takeoverError as NodeJS.ErrnoException).code !== "EEXIST") throw takeoverError;
+        let guardText: string;
+        try { guardText = await readFile(takeoverPath, "utf8"); } catch { return undefined; }
+        const guard = parseLock(guardText);
+        const guardAge = guard ? now().getTime() - Date.parse(guard.startedAt) : Number.NEGATIVE_INFINITY;
+        if (!guard || alive(guard.pid) || guardAge <= options.maxRunDurationMs) return undefined;
+        const currentGuard = await readFile(takeoverPath, "utf8").catch(() => undefined);
+        if (currentGuard !== guardText) return undefined;
+        await unlink(takeoverPath).catch(() => undefined);
+        try { takeover = await open(takeoverPath, "wx", 0o600); } catch { return undefined; }
       }
       try {
+        await takeover.writeFile(content, "utf8");
+        await takeover.sync();
         const current = await readFile(options.path, "utf8").catch((readError: unknown) => (
           (readError as NodeJS.ErrnoException).code === "ENOENT" ? undefined : Promise.reject(readError)
         ));

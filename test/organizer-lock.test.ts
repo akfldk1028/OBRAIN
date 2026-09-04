@@ -64,4 +64,20 @@ describe("organizer lock", () => {
     expect(locks.filter(Boolean)).toHaveLength(1);
     await locks[0]?.release(); await locks[1]?.release();
   });
+
+  it("recovers a stale crash-leftover takeover guard", async () => {
+    const file = await lockPath();
+    await writeFile(file, JSON.stringify({ pid: 123, startedAt: "2020-01-01T00:00:00.000Z", owner: "stale-lock" }), "utf8");
+    await writeFile(`${file}.takeover`, JSON.stringify({ pid: 456, startedAt: "2020-01-01T00:00:00.000Z", owner: "crashed" }), "utf8");
+    const lock = await acquireOrganizerLock({ path: file, maxRunDurationMs: 1, isProcessAlive: () => false });
+    expect(lock).toBeDefined();
+    await lock?.release();
+  });
+
+  it("refuses to remove a takeover guard owned by a live process", async () => {
+    const file = await lockPath();
+    await writeFile(file, JSON.stringify({ pid: 123, startedAt: "2020-01-01T00:00:00.000Z", owner: "stale-lock" }), "utf8");
+    await writeFile(`${file}.takeover`, JSON.stringify({ pid: 456, startedAt: "2020-01-01T00:00:00.000Z", owner: "live" }), "utf8");
+    await expect(acquireOrganizerLock({ path: file, maxRunDurationMs: 1, isProcessAlive: (pid) => pid === 456 })).resolves.toBeUndefined();
+  });
 });

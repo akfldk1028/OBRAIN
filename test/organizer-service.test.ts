@@ -37,7 +37,7 @@ class FakeProvider implements OrganizerProvider {
   }
 }
 
-async function fixture(content = "# Inbox\n\nordinary note"): Promise<{ root: string; source: string; service: (provider?: OrganizerProvider | ((options: { maxContextBytes: number }) => OrganizerProvider), config?: Partial<OrganizerConfig>, timestamp?: string) => OrganizerService }> {
+async function fixture(content = "# Inbox\n\nordinary note"): Promise<{ root: string; source: string; service: (provider?: OrganizerProvider | ((options: { maxContextBytes: number }) => OrganizerProvider), config?: Partial<OrganizerConfig>, timestamp?: string, onBeforeReportOpen?: () => void | Promise<void>) => OrganizerService }> {
   const root = await mkdtemp(path.join(os.tmpdir(), "brain-organizer-service-"));
   roots.push(root);
   const source = path.join(root, "Agent-Inbox", "note.md");
@@ -59,10 +59,10 @@ async function fixture(content = "# Inbox\n\nordinary note"): Promise<{ root: st
   };
   return {
     root, source,
-    service: (provider, config = {}, timestamp = now) => new OrganizerService({
+    service: (provider, config = {}, timestamp = now, onBeforeReportOpen) => new OrganizerService({
       registry, store, config: { ...base, ...config }, provider,
       transaction: new OrganizerTransactionEngine({ store, recoveryRoot: path.join(path.dirname(root), `${path.basename(root)}-recovery`), now: () => timestamp }),
-      now: () => timestamp, lockPath: path.join(root, "organizer.lock"),
+      now: () => timestamp, lockPath: path.join(root, "organizer.lock"), onBeforeReportOpen,
     }),
   };
 }
@@ -213,6 +213,15 @@ describe("OrganizerService", () => {
     expect(JSON.stringify(report)).not.toContain("Sequential decisions");
   });
 
+  it("maps identifier-shaped provider errors to a fixed report code", async () => {
+    const fx = await fixture(); const provider = new FakeProvider();
+    provider.propose = async () => { throw new Error("customer_secret_abc"); };
+    const summary = await fx.service(provider).runToCompletion({ vault: "brain", requestedMode: "dry-run" });
+    const text = await readFile(path.join(fx.root, "60_Tools", "61_Obsidian_MCP", "90_Auto_Organizer_Reports", `${summary.runId}.json`), "utf8");
+    expect(text).toContain("processing_failed");
+    expect(text).not.toContain("customer_secret_abc");
+  });
+
   it("refuses an approved-directory symlink that escapes the vault", async () => {
     const fx = await fixture(); const outside = await mkdtemp(path.join(os.tmpdir(), "brain-organizer-outside-")); roots.push(outside);
     await mkdir(path.join(outside, "escaped"));
@@ -227,6 +236,17 @@ describe("OrganizerService", () => {
     await rm(path.join(fx.root, "60_Tools"), { recursive: true, force: true });
     try { await symlink(outside, path.join(fx.root, "60_Tools"), "junction"); } catch { return; }
     const summary = await fx.service(undefined, { mode: "disabled" }).runToCompletion({ vault: "brain" });
+    expect(summary.status).toBe("failed");
+    expect(await readFile(path.join(outside, "61_Obsidian_MCP", "90_Auto_Organizer_Reports", `${summary.runId}.json`), "utf8").catch(() => undefined)).toBeUndefined();
+  });
+
+  it("removes and fails closed on a report parent replaced after binding", async () => {
+    const fx = await fixture(); const outside = await mkdtemp(path.join(os.tmpdir(), "brain-organizer-report-race-")); roots.push(outside);
+    await mkdir(path.join(outside, "61_Obsidian_MCP", "90_Auto_Organizer_Reports"), { recursive: true });
+    const summary = await fx.service(undefined, { mode: "disabled" }, now, async () => {
+      await rm(path.join(fx.root, "60_Tools"), { recursive: true, force: true });
+      await symlink(outside, path.join(fx.root, "60_Tools"), "junction");
+    }).runToCompletion({ vault: "brain" });
     expect(summary.status).toBe("failed");
     expect(await readFile(path.join(outside, "61_Obsidian_MCP", "90_Auto_Organizer_Reports", `${summary.runId}.json`), "utf8").catch(() => undefined)).toBeUndefined();
   });
